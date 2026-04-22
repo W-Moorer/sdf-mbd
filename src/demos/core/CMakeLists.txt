@@ -14,10 +14,11 @@ set(DEMOS
   demo_CH_EulerAngles
   demo_CH_filesystem
   demo_CH_baseline_contact
+  demo_CH_sdf_point_contact
 )
 
 # OpenVDB probe demo is built separately below if OpenVDB is found
-list(APPEND DEMOS_WITH_OPENVDB demo_CH_openvdb_probe)
+list(APPEND DEMOS_WITH_OPENVDB demo_CH_openvdb_probe demo_CH_sdf_point_contact_openvdb)
 
 #--------------------------------------------------------------
 
