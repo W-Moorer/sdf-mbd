@@ -1,0 +1,106 @@
+#=============================================================================
+# CMake configuration file for demos of various Chrono::Vehicle terrain models.
+#=============================================================================
+
+if(NOT CH_ENABLE_MODULE_VSG)
+  return()
+endif()
+
+#--------------------------------------------------------------
+# List all demos
+
+set(DEMOS ${DEMOS}
+    demo_VEH_RigidTerrain_WheeledVehicle
+    demo_VEH_RigidSCMTerrain_MixedPatches
+    demo_VEH_SCMTerrain_WheeledVehicle
+    demo_VEH_SCMTerrain_RigidTire
+    demo_VEH_SCMTerrain_TrackedVehicle
+    demo_VEH_RigidTerrain_MovingPatch
+)
+ 
+if(CH_USE_OPENCRG) 
+      set(DEMOS ${DEMOS}
+          demo_VEH_CRGTerrain_VSG
+    )
+endif()
+
+if(CH_ENABLE_MODULE_MULTICORE)
+    set(DEMOS ${DEMOS}
+        demo_VEH_GranularTerrain_RigidTire
+        demo_VEH_GranularTerrain_MovingPatch
+    )
+endif()
+
+if(CH_ENABLE_MODULE_FSI_SPH)
+    set(DEMOS ${DEMOS}
+        demo_VEH_CRMTerrain_WheeledVehicle
+        demo_VEH_CRMTerrain_TrackedVehicle
+        demo_VEH_CRMTerrain_MovingPatch
+    )
+endif()
+
+if(CH_ENABLE_MODULE_PARDISO_MKL)
+    set(DEMOS ${DEMOS}
+        demo_VEH_SCMTerrain_FEATire
+    )
+endif()
+
+#--------------------------------------------------------------
+
+set(UTILS "../../SetChronoSolver.h")
+
+#--------------------------------------------------------------
+# Include directories, compiler flags, libraries
+
+list(APPEND LIBS "Chrono_vehicle")
+list(APPEND LIBS "ChronoModels_vehicle")
+list(APPEND LIBS "ChronoModels_robot")
+
+if(CH_ENABLE_MODULE_MULTICORE)
+    list(APPEND LIBS "Chrono_multicore")
+endif()
+
+if(CH_ENABLE_MODULE_FSI_SPH)
+    list(APPEND LIBS "Chrono_fsisph")
+endif()
+
+if(CH_ENABLE_MODULE_PARDISO_MKL)
+    list(APPEND LIBS "Chrono_pardisomkl")
+endif()
+
+if(CH_ENABLE_MODULE_MUMPS)
+    include_directories(${CH_MUMPS_INCLUDES})
+    list(APPEND LIBS "Chrono_mumps")
+endif()
+
+if(CH_ENABLE_MODULE_POSTPROCESS)
+    list(APPEND LIBS "Chrono_postprocess")
+endif()
+
+if(CH_ENABLE_MODULE_VSG)
+    list(APPEND LIBS "Chrono_vehicle_vsg")
+    if(CH_ENABLE_MODULE_FSI_SPH)
+      list(APPEND LIBS "Chrono_fsisph_vsg")
+    endif()
+endif()
+
+#--------------------------------------------------------------
+# Create the executables
+
+foreach(PROGRAM ${DEMOS})
+    # MESSAGE(STATUS "...add ${PROGRAM}")
+
+    add_executable(${PROGRAM} ${PROGRAM}.cpp ${UTILS})
+    source_group("" FILES ${PROGRAM}.cpp ${UTILS})
+
+    if(APPLE)
+      set_target_properties(${PROGRAM} PROPERTIES MACOSX_BUNDLE_INFO_PLIST ${MACOSX_BUNDLE_INFO_PLIST})
+    endif()
+    if(MSVC)
+      set_target_properties(${PROGRAM} PROPERTIES MSVC_RUNTIME_LIBRARY ${CH_MSVC_RUNTIME_LIBRARY})
+    endif()
+    set_property(TARGET ${PROGRAM} PROPERTY VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_DIR:${PROGRAM}>")
+    target_link_libraries(${PROGRAM} ${LIBS})
+
+    install(TARGETS ${PROGRAM} CONFIGURATIONS Release DESTINATION ${CH_INSTALL_DEMO})
+endforeach()

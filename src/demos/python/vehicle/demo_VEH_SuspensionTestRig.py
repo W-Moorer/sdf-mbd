@@ -1,0 +1,137 @@
+# =============================================================================
+# PROJECT CHRONO - http://projectchrono.org
+#
+# Copyright (c) 2022 projectchrono.org
+# All rights reserved.
+#
+# Use of this source code is governed by a BSD-style license that can be found
+# in the LICENSE file at the top level of the distribution and at
+# http://projectchrono.org/license-chrono.txt.
+#
+# =============================================================================
+# Authors: Radu Serban
+# =============================================================================
+#
+# Demonstration program for a suspension test rig.
+#
+# Driver inputs for a suspension test rig include left/right post displacements
+# and steering input (the latter being ignored if the tested suspension is not
+# attached to a steering mechanism).  These driver inputs can be obtained from
+# an interactive driver system of type ChSuspensionTestRigInteractiveDriver or
+# from a data file using a driver system of type ChSuspensionTestRigDataDriver.
+#
+# See the description of ChSuspensionTestRig::PlotOutput for details on data
+# collected (if output is enabled).
+#
+# =============================================================================
+
+import pychrono as chrono
+import pychrono.vehicle as veh
+import pychrono.irrlicht as irr
+import errno
+import os
+import math as m
+
+# =============================================================================
+
+def main() : 
+    #print("Copyright (c) 2017 projectchrono.org\nChrono version: ", CHRONO_VERSION , "\n\n")
+
+    # Create the rig from a JSON specification file
+    rig = veh.ChSuspensionTestRigPushrod(str_file)
+
+    # Create and initialize the tires
+    # (not needed if the vehicle's suspension JSON specification files include tire data)
+    
+    for ia in test_axles:
+        axle = rig.GetVehicle().GetAxle(ia)
+        for wheel in axle.GetWheels():
+            tire = veh.ReadTireJSON(tire_file)
+            rig.GetVehicle().InitializeTire(tire, wheel, chrono.VisualizationType_NONE)
+
+    # Optional rig settings
+    rig.SetSuspensionVisualizationType(chrono.VisualizationType_PRIMITIVES)
+    rig.SetSteeringVisualizationType(chrono.VisualizationType_PRIMITIVES)
+    rig.SetSubchassisVisualizationType(chrono.VisualizationType_PRIMITIVES)
+    rig.SetWheelVisualizationType(chrono.VisualizationType_NONE)
+    rig.SetTireVisualizationType(chrono.VisualizationType_MESH)
+    
+    # Create and attach an STR driver
+    driver = veh.ChSuspensionTestRigDataDriver(driver_file)
+    rig.SetDriver(driver)
+    
+    # Initialize suspension test rig
+    rig.Initialize()
+
+    # Create the test rig Irrlicht application
+    cam_loc = (rig.GetSpindlePos(0, veh.LEFT) + rig.GetSpindlePos(0, veh.RIGHT)) * 0.5
+    vis = veh.ChSuspensionTestRigVisualSystemIRR()
+    vis.SetWindowTitle('Suspension Test Rig')
+    vis.SetWindowSize(1280, 1024)
+    vis.AttachSTR(rig)
+    vis.Initialize()
+
+    vis.BindAll()
+
+    # Set output
+    try:
+        os.mkdir(out_dir)
+    except OSError as exc:
+        if exc.errno != errno.EEXIST:
+           print("Error creating output directory " )
+    
+    if output:
+        rig.SetOutput(chrono.ChOutput.Type_ASCII, chrono.ChOutput.Mode_FRAMES, out_dir, 'output', out_step_size)
+    if plot:
+        rig.SetPlotOutput(out_step_size)
+
+    # Simulation loop
+    while vis.Run() :
+        time = rig.GetVehicle().GetChTime()
+
+        # Render scene
+        vis.BeginScene()
+        vis.Render()
+        vis.EndScene()
+
+        # Advance simulation of the rig 
+        rig.Advance(step_size)
+
+        # Update visualization app
+        driver_inputs = veh.DriverInputs()
+        driver_inputs.m_steering = rig.GetSteeringInput()
+        driver_inputs.m_throttle = 0.0
+        driver_inputs.m_braking = 0.0
+
+        if rig.DriverEnded():
+            break
+
+    rig.PlotOutput(out_dir, 'output_plot')
+
+# =============================================================================
+
+# JSON file for suspension test rig
+str_file = veh.GetVehicleDataFile('mtv/suspensionTest/MTV_ST_rear.json')
+
+# JSON file for tire
+tire_file = veh.GetVehicleDataFile('mtv/tire/FMTV_TMeasyTire.json')
+
+# Driver data file
+driver_file = veh.GetVehicleDataFile('mtv/suspensionTest/ST_inputs.dat')
+
+# Vehicle axles included in test rig
+test_axles = [1, 2]
+
+# Simulation step size
+step_size = 1e-3
+
+# Set output root directory
+chrono.SetChronoOutputPath("../DEMO_OUTPUT/")
+
+# Output collection
+output = True
+plot = True
+out_dir =  chrono.GetChronoOutputPath() + "Suspension_Test_Rig/"
+out_step_size = 1e-2
+
+main()

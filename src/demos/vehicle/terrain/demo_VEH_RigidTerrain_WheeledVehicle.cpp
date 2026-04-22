@@ -1,0 +1,209 @@
+// =============================================================================
+// PROJECT CHRONO - http://projectchrono.org
+//
+// Copyright (c) 2014 projectchrono.org
+// All rights reserved.
+//
+// Use of this source code is governed by a BSD-style license that can be found
+// in the LICENSE file at the top level of the distribution and at
+// http://projectchrono.org/license-chrono.txt.
+//
+// =============================================================================
+// Authors: Radu Serban
+// =============================================================================
+//
+// Demonstration of using a RigidTerrain constructed from different patches.
+//
+// The vehicle reference frame has Z up, X towards the front of the vehicle, and
+// Y pointing to the left.
+//
+// =============================================================================
+
+#include "chrono/input_output/ChWriterCSV.h"
+#include "chrono/utils/ChUtils.h"
+
+#include "chrono_vehicle/ChConfigVehicle.h"
+#include "chrono_vehicle/ChVehicleDataPath.h"
+#include "chrono_vehicle/ChWorldFrame.h"
+#include "chrono_vehicle/driver/ChInteractiveDriver.h"
+#include "chrono_vehicle/terrain/RigidTerrain.h"
+
+#include "chrono_models/vehicle/hmmwv/HMMWV.h"
+
+#include "chrono_vehicle/wheeled_vehicle/ChWheeledVehicleVisualSystemVSG.h"
+
+using namespace chrono;
+using namespace chrono::vehicle;
+using namespace chrono::vehicle::hmmwv;
+
+// =============================================================================
+
+int main(int argc, char* argv[]) {
+    std::cout << "Copyright (c) 2017 projectchrono.org\nChrono version: " << CHRONO_VERSION << std::endl;
+
+    // Select terrain type
+    std::string input;
+    int type = 1;
+    std::cout << "Options:\n";
+    std::cout << "  1. Terrain with multiple patches [DEFAULT]" << std::endl;
+    std::cout << "  2. Terrain with multiple layers" << std::endl;
+    std::cout << "  3. Terrain from JSON specification" << std::endl;
+    std::cout << "\nSelect type: ";
+    std::getline(std::cin, input);
+    if (!input.empty()) {
+        std::istringstream stream(input);
+        stream >> type;
+        ChClampValue(type, 1, 3);
+    }
+
+    // --------------
+    // Create systems
+    // --------------
+
+    // Simulation step sizes
+    double step_size = 3e-3;
+    double tire_step_size = 1e-3;
+
+    // Create the HMMWV vehicle, set parameters, and initialize
+    HMMWV_Reduced hmmwv;
+    hmmwv.SetCollisionSystemType(ChCollisionSystem::Type::BULLET);
+    hmmwv.SetContactMethod(ChContactMethod::NSC);
+    hmmwv.SetChassisFixed(false);
+    hmmwv.SetChassisCollisionType(CollisionType::NONE);
+    hmmwv.SetInitPosition(ChCoordsys<>(ChVector3d(-10, 0, 1), ChQuaternion<>(1, 0, 0, 0)));
+    hmmwv.SetEngineType(EngineModelType::SIMPLE);
+    hmmwv.SetTransmissionType(TransmissionModelType::AUTOMATIC_SIMPLE_MAP);
+    hmmwv.SetDriveType(DrivelineTypeWV::RWD);
+    hmmwv.SetBrakeType(BrakeType::SHAFTS);
+    hmmwv.SetTireType(TireModelType::TMEASY);
+    hmmwv.SetTireStepSize(tire_step_size);
+    hmmwv.Initialize();
+
+    hmmwv.SetChassisVisualizationType(VisualizationType::NONE);
+    hmmwv.SetSuspensionVisualizationType(VisualizationType::PRIMITIVES);
+    hmmwv.SetSteeringVisualizationType(VisualizationType::PRIMITIVES);
+    hmmwv.SetWheelVisualizationType(VisualizationType::MESH);
+    hmmwv.SetTireVisualizationType(VisualizationType::MESH);
+
+    // Create the terrain patches programatically
+    RigidTerrain terrain(hmmwv.GetSystem());
+
+    switch (type) {
+        case 1: {
+            auto patch1_mat = chrono_types::make_shared<ChContactMaterialNSC>();
+            patch1_mat->SetFriction(0.9f);
+            patch1_mat->SetRestitution(0.01f);
+            auto patch1 = terrain.AddPatch(patch1_mat, ChCoordsys<>(ChVector3d(-16, 0, 0.08), QUNIT), 32, 20);
+            patch1->SetColor(ChColor(0.8f, 0.8f, 0.5f));
+            patch1->SetTexture(GetVehicleDataFile("terrain/textures/tile4.jpg"), 20, 20);
+
+            auto patch2_mat = chrono_types::make_shared<ChContactMaterialNSC>();
+            patch2_mat->SetFriction(0.9f);
+            patch2_mat->SetRestitution(0.01f);
+            auto patch2 = terrain.AddPatch(patch1_mat, ChCoordsys<>(ChVector3d(16, 0, 0.08), QUNIT), 32, 20);
+            patch2->SetColor(ChColor(1.0f, 0.5f, 0.5f));
+            patch2->SetTexture(GetVehicleDataFile("terrain/textures/concrete.jpg"), 20, 20);
+
+            auto patch3_mat = chrono_types::make_shared<ChContactMaterialNSC>();
+            patch3_mat->SetFriction(0.9f);
+            patch3_mat->SetRestitution(0.01f);
+            auto patch3 = terrain.AddPatch(patch3_mat, ChCoordsys<>(ChVector3d(0, -42, 0), QUNIT),
+                                           GetVehicleDataFile("terrain/meshes/bump.obj"));
+            patch3->SetColor(ChColor(0.5f, 0.5f, 0.8f));
+            patch3->SetTexture(GetVehicleDataFile("terrain/textures/dirt.jpg"), 6.0f, 6.0f);
+
+            auto patch4_mat = chrono_types::make_shared<ChContactMaterialNSC>();
+            patch4_mat->SetFriction(0.9f);
+            patch4_mat->SetRestitution(0.01f);
+            auto patch4 =
+                terrain.AddPatch(patch4_mat, ChCoordsys<>(ChVector3d(0, 42, 0), QuatFromAngleZ(CH_PI_2)),
+                                 GetVehicleDataFile("terrain/height_maps/convex64.bmp"), 64.0, 64.0, 0.0, 3.0);
+            patch4->SetTexture(GetVehicleDataFile("terrain/textures/grass.jpg"), 6.0f, 6.0f);
+
+            break;
+        }
+        case 2: {
+            auto patch_mat = chrono_types::make_shared<ChContactMaterialNSC>();
+            patch_mat->SetFriction(0.9f);
+            patch_mat->SetRestitution(0.01f);
+            auto patch = terrain.AddPatch(patch_mat, ChCoordsys<>(ChVector3d(0, 0, 10), QUNIT),
+                                          GetVehicleDataFile("terrain/multilayer/multilayer-terrain.obj"));
+
+            break;
+        }
+        case 3: {
+            terrain = RigidTerrain(hmmwv.GetSystem(), GetVehicleDataFile("terrain/RigidPatches.json"));
+            break;
+        }
+    }
+
+    terrain.Initialize();
+
+    // Set the time response for steering and throttle keyboard inputs.
+    double render_step_size = 1.0 / 50;  // FPS = 50
+    double steering_time = 1.0;          // time to go from 0 to +1 (or from 0 to -1)
+    double throttle_time = 1.0;          // time to go from 0 to +1
+    double braking_time = 0.3;           // time to go from 0 to +1
+
+    // Create an interactive driver
+    ChInteractiveDriver driver(hmmwv.GetVehicle());
+    driver.SetSteeringDelta(render_step_size / steering_time);
+    driver.SetThrottleDelta(render_step_size / throttle_time);
+    driver.SetBrakingDelta(render_step_size / braking_time);
+    driver.Initialize();
+
+    // Create the vehicle run-time visualization interface
+    auto vis = chrono_types::make_shared<ChWheeledVehicleVisualSystemVSG>();
+    vis->SetWindowTitle("Rigid Terrain Demo");
+    vis->SetWindowSize(1280, 800);
+    vis->SetChaseCamera(ChVector3d(0.0, 0.0, .75), 8.0, 0.75);
+    vis->AttachVehicle(&hmmwv.GetVehicle());
+    vis->AttachDriver(&driver);
+    vis->AttachTerrain(&terrain);
+    vis->SetLightDirection(1.5 * CH_PI_2, CH_PI_4);
+    vis->EnableShadows();
+    vis->EnableSkyTexture(SkyMode::DOME);
+    vis->Initialize();
+
+    ////ChWriterCSV out(" ");
+    ////for (int ix = 0; ix < 20; ix++) {
+    ////    double x = ix * 1.0;
+    ////    for (int iy = 0; iy < 100; iy++) {
+    ////        double y = iy * 1.0;
+    ////        double z = terrain.CalcHeight(x, y);
+    ////        out << x << y << z << std::endl;
+    ////    }
+    ////}
+    ////out.WriteToFile("terrain.out");
+
+    // ---------------
+    // Simulation loop
+    // ---------------
+
+    hmmwv.GetVehicle().EnableRealtime(true);
+    while (vis->Run()) {
+        double time = hmmwv.GetSystem()->GetChTime();
+
+        // Render scene
+        vis->BeginScene();
+        vis->Render();
+        vis->EndScene();
+
+        // Get driver inputs
+        DriverInputs driver_inputs = driver.GetInputs();
+
+        // Update modules (process inputs from other modules)
+        driver.Synchronize(time);
+        terrain.Synchronize(time);
+        hmmwv.Synchronize(time, driver_inputs, terrain);
+        vis->Synchronize(time, driver_inputs);
+
+        // Advance simulation for one timestep for all modules
+        driver.Advance(step_size);
+        terrain.Advance(step_size);
+        hmmwv.Advance(step_size);
+        vis->Advance(step_size);
+    }
+
+    return 0;
+}
