@@ -176,7 +176,8 @@ struct PersistentPatchTrack {
 enum class CarryOverStrategy {
     Fixed,      // alpha = constant
     Adaptive,   // alpha = f(theta, match_quality, topology)
-    AdaptiveV1  // V1: geometry-consistent transfer with return mapping
+    AdaptiveV1,  // V1: geometry-consistent transfer with return mapping
+    AdaptiveV21  // V2.1: transported elastic state + validity gate
 };
 
 // =============================================================================
@@ -195,6 +196,7 @@ struct TransportConfig {
     double adaptive_alpha_base;    // Base alpha when theta=0
     double adaptive_theta_scale;   // Theta scale for decay (radians)
     double adaptive_match_scale;   // Match distance scale for decay (meters)
+    double adaptive_slip_risk_scale; // V2.1: slip risk scale for weak correction (0=disabled)
 };
 
 // =============================================================================
@@ -581,9 +583,144 @@ struct TangentialHistoryState {
     ChVector3d t2_prev;
     double match_quality_prev;
     double area_prev;
+    int topology_state_prev;    // V2.1: 0=stable, 1=split/merge, 2=newborn/death
     int age;
     bool valid;
 };
+
+// =============================================================================
+// V2.1 Transport operator: project elastic state to current tangent plane
+// =============================================================================
+
+ChVector3d TransportElasticStateToCurrentTangent(
+    const ChVector3d& xi_elastic_world_prev,
+    const ChVector3d& n_cur
+) {
+    double normal_component = xi_elastic_world_prev.Dot(n_cur);
+    ChVector3d xi_transport = xi_elastic_world_prev - normal_component * n_cur;
+    return xi_transport;
+}
+
+// =============================================================================
+// V2.1 Validity gate: compute history retention weight w ∈ [0, 1]
+// =============================================================================
+
+double ValidityGateV21(
+    double theta,
+    double match_distance,
+    int topology_event,
+    double slip_risk,
+    const TransportConfig& config
+) {
+    double w_theta = std::exp(-theta / config.adaptive_theta_scale);
+    double w_match = std::exp(-match_distance / config.adaptive_match_scale);
+    
+    double w_topo;
+    if (topology_event == 1) {
+        w_topo = 0.0;
+    } else if (topology_event == 2) {
+        w_topo = 0.3;
+    } else {
+        w_topo = 1.0;
+    }
+    
+    double w_slip = 1.0;
+    if (config.adaptive_slip_risk_scale > 1e-12) {
+        double lambda = 0.15;
+        double excess = std::max(0.0, slip_risk - 1.0);
+        w_slip = 1.0 / (1.0 + lambda * excess);
+    }
+    
+    double w = w_theta * w_match * w_topo * w_slip;
+    return std::max(0.0, std::min(1.0, w));
+}
+
+// =============================================================================
+// V2.1: Transported elastic state + validity gate + unchanged return mapping
+// =============================================================================
+
+TransportResult TransportWithCarryOverV21(
+    double xi1_old, double xi2_old,
+    const ChVector3d& t1_old, const ChVector3d& t2_old, const ChVector3d& n_old,
+    const ChVector3d& t1_new, const ChVector3d& t2_new, const ChVector3d& n_new,
+    double match_distance,
+    int topology_event,
+    double vt1, double vt2,
+    double time_step,
+    double tangential_stiffness,
+    double tangential_damping,
+    double friction_coefficient,
+    double fn_magnitude,
+    bool is_newborn,
+    const TangentialHistoryState* history_state,
+    const TransportConfig& config
+) {
+    TransportResult result;
+    result.raw_transport_norm = 0.0;
+    result.limited_transport_norm = 0.0;
+    result.transport_attenuation = 1.0;
+    result.carry_over_factor = 1.0;
+    result.transport_clamp_hit = 0;
+    result.frame_rotation_angle = 0.0;
+    result.adaptive_alpha = 0.0;
+    result.xi1_new = 0.0;
+    result.xi2_new = 0.0;
+
+    if (history_state == nullptr || !history_state->valid || is_newborn) {
+        result.xi1_new = vt1 * time_step;
+        result.xi2_new = vt2 * time_step;
+        result.limited_transport_norm = std::sqrt(result.xi1_new * result.xi1_new + result.xi2_new * result.xi2_new);
+        return result;
+    }
+
+    // Step 1: Read old xi_elastic from persistent patch
+    ChVector3d xi_elastic_world_prev = history_state->xi_elastic_world;
+
+    // Step 2: Transport xi_elastic to current tangent plane
+    ChVector3d xi_transport = TransportElasticStateToCurrentTangent(
+        xi_elastic_world_prev, n_new
+    );
+    result.raw_transport_norm = xi_transport.Length();
+    result.frame_rotation_angle = std::acos(std::max(-1.0, std::min(1.0, history_state->normal_prev.Dot(n_new))));
+
+    // Step 3: Validity gate
+    double theta = result.frame_rotation_angle;
+    double delta_xi1 = vt1 * time_step;
+    double delta_xi2 = vt2 * time_step;
+    ChVector3d xi_trial_estimate = xi_transport + delta_xi1 * t1_new + delta_xi2 * t2_new;
+    ChVector3d tau_trial_estimate = tangential_stiffness * xi_trial_estimate + tangential_damping * (vt1 * t1_new + vt2 * t2_new);
+    double tau_trial_mag_estimate = tau_trial_estimate.Length();
+    double friction_limit_estimate = friction_coefficient * fn_magnitude;
+    double slip_risk = (friction_limit_estimate > 1e-12) ? (tau_trial_mag_estimate / friction_limit_estimate) : 0.0;
+
+    double w = ValidityGateV21(theta, match_distance, topology_event, slip_risk, config);
+    result.adaptive_alpha = w;
+    result.carry_over_factor = w;
+
+    ChVector3d xi_valid = xi_transport * w;
+
+    // Step 4: Add current step increment
+    ChVector3d delta_xi = delta_xi1 * t1_new + delta_xi2 * t2_new;
+    ChVector3d xi_trial = xi_valid + delta_xi;
+
+    // Step 5: Coulomb return mapping (UNCHANGED)
+    ChVector3d tau_trial = tangential_stiffness * xi_trial + tangential_damping * (vt1 * t1_new + vt2 * t2_new);
+    double tau_trial_mag = tau_trial.Length();
+    double friction_limit = friction_coefficient * fn_magnitude;
+
+    if (tau_trial_mag <= friction_limit) {
+        result.xi1_new = xi_trial.Dot(t1_new);
+        result.xi2_new = xi_trial.Dot(t2_new);
+    } else {
+        ChVector3d tau_new = tau_trial * (friction_limit / tau_trial_mag);
+        ChVector3d xi_elastic_new = tau_new / tangential_stiffness;
+        result.xi1_new = xi_elastic_new.Dot(t1_new);
+        result.xi2_new = xi_elastic_new.Dot(t2_new);
+    }
+
+    result.limited_transport_norm = std::sqrt(result.xi1_new * result.xi1_new + result.xi2_new * result.xi2_new);
+    return result;
+}
 
 // =============================================================================
 // V1: Geometry-consistent tangential history transfer with return mapping
@@ -1219,7 +1356,7 @@ RunResult RunCaseWithConfig(
 
             // Find V1 history state
             const TangentialHistoryState* v1_history = nullptr;
-            if (transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV1 && patch.matched_persistent_id >= 0) {
+            if ((transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV1 || transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV21) && patch.matched_persistent_id >= 0) {
                 auto it = tangential_history.find(patch.matched_persistent_id);
                 if (it != tangential_history.end() && it->second.valid) {
                     v1_history = &it->second;
@@ -1238,23 +1375,41 @@ RunResult RunCaseWithConfig(
 
                 match_dist = center_drift;
 
-                if (transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV1) {
-                    // V1: geometry-consistent transfer with return mapping
-                    TransportResult trans = TransportWithCarryOverV1(
-                        prev_track->xi1, prev_track->xi2,
-                        prev_track->tangent_t1, prev_track->tangent_t2, prev_track->normal,
-                        patch.tangent_t1, patch.tangent_t2, patch.normal,
-                        match_dist, topology_event,
-                        vt1, vt2,
-                        config.time_step,
-                        config.tangential_stiffness,
-                        config.tangential_damping,
-                        config.friction_coefficient,
-                        F_n.Length(),
-                        is_newborn,
-                        v1_history,
-                        transport_cfg
-                    );
+                if (transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV1 || transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV21) {
+                    TransportResult trans;
+                    if (transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV21) {
+                        trans = TransportWithCarryOverV21(
+                            prev_track->xi1, prev_track->xi2,
+                            prev_track->tangent_t1, prev_track->tangent_t2, prev_track->normal,
+                            patch.tangent_t1, patch.tangent_t2, patch.normal,
+                            match_dist, topology_event,
+                            vt1, vt2,
+                            config.time_step,
+                            config.tangential_stiffness,
+                            config.tangential_damping,
+                            config.friction_coefficient,
+                            F_n.Length(),
+                            is_newborn,
+                            v1_history,
+                            transport_cfg
+                        );
+                    } else {
+                        trans = TransportWithCarryOverV1(
+                            prev_track->xi1, prev_track->xi2,
+                            prev_track->tangent_t1, prev_track->tangent_t2, prev_track->normal,
+                            patch.tangent_t1, patch.tangent_t2, patch.normal,
+                            match_dist, topology_event,
+                            vt1, vt2,
+                            config.time_step,
+                            config.tangential_stiffness,
+                            config.tangential_damping,
+                            config.friction_coefficient,
+                            F_n.Length(),
+                            is_newborn,
+                            v1_history,
+                            transport_cfg
+                        );
+                    }
                     xi1 = trans.xi1_new;
                     xi2 = trans.xi2_new;
                     raw_trans_norm = trans.raw_transport_norm;
@@ -1481,8 +1636,8 @@ RunResult RunCaseWithConfig(
                 }
             }
 
-            // Update V1 tangential history state
-            if (transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV1 && patch.matched_persistent_id >= 0) {
+            // Update V1/V2.1 tangential history state
+            if ((transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV1 || transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV21) && patch.matched_persistent_id >= 0) {
                 ChVector3d xi_elastic_world_new = xi1 * patch.tangent_t1 + xi2 * patch.tangent_t2;
                 TangentialHistoryState new_hist;
                 new_hist.persistent_id = patch.matched_persistent_id;
@@ -1492,6 +1647,7 @@ RunResult RunCaseWithConfig(
                 new_hist.t2_prev = patch.tangent_t2;
                 new_hist.match_quality_prev = std::exp(-match_dist / (config.dyn_body_type == 0 ? config.dyn_body_radius : config.dyn_body_size));
                 new_hist.area_prev = patch.total_area;
+                new_hist.topology_state_prev = 0;
                 new_hist.age = (prev_track != nullptr) ? prev_track->age_in_steps : 0;
                 new_hist.valid = true;
                 tangential_history[patch.matched_persistent_id] = new_hist;
@@ -1504,7 +1660,8 @@ RunResult RunCaseWithConfig(
             theta_values.push_back(frame_rot_angle);
             match_distance_values.push_back(match_dist);
             if (transport_cfg.carry_strategy == CarryOverStrategy::Adaptive || 
-                transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV1) {
+                transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV1 ||
+                transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV21) {
                 adaptive_alpha_values.push_back(adaptive_alpha);
             }
 
@@ -1855,13 +2012,14 @@ int main(int argc, char* argv[]) {
     double adaptive_theta_scale = 0.3;     // Theta decay scale (radians)
     double adaptive_match_scale = 0.05;    // Match distance decay scale (meters)
 
-    TransportConfig cfg_A = {"A-only", true, false, CarryOverStrategy::Fixed, 0.01, 5.0, 0.0, adaptive_alpha_base, adaptive_theta_scale, adaptive_match_scale};
-    TransportConfig cfg_C_fixed = {"C-fixed", false, false, CarryOverStrategy::Fixed, 0.01, 5.0, 0.5, adaptive_alpha_base, adaptive_theta_scale, adaptive_match_scale};
-    TransportConfig cfg_C_adaptive_v1 = {"C-adaptive-v1", false, false, CarryOverStrategy::AdaptiveV1, 0.01, 5.0, 0.0, adaptive_alpha_base, adaptive_theta_scale, adaptive_match_scale};
-    TransportConfig cfg_A_C_adaptive_v1 = {"A+C-adaptive-v1", true, false, CarryOverStrategy::AdaptiveV1, 0.01, 5.0, 0.0, adaptive_alpha_base, adaptive_theta_scale, adaptive_match_scale};
-    TransportConfig cfg_A_C_fixed = {"A+C-fixed", true, false, CarryOverStrategy::Fixed, 0.01, 5.0, 0.5, adaptive_alpha_base, adaptive_theta_scale, adaptive_match_scale};
+    TransportConfig cfg_A = {"A-only", true, false, CarryOverStrategy::Fixed, 0.01, 5.0, 0.0, adaptive_alpha_base, adaptive_theta_scale, adaptive_match_scale, 0.0};
+    TransportConfig cfg_C_fixed = {"C-fixed", false, false, CarryOverStrategy::Fixed, 0.01, 5.0, 0.5, adaptive_alpha_base, adaptive_theta_scale, adaptive_match_scale, 0.0};
+    TransportConfig cfg_C_adaptive_v1 = {"C-adaptive-v1", false, false, CarryOverStrategy::AdaptiveV1, 0.01, 5.0, 0.0, adaptive_alpha_base, adaptive_theta_scale, adaptive_match_scale, 0.0};
+    TransportConfig cfg_C_adaptive_v21 = {"C-adaptive-v2.1", false, false, CarryOverStrategy::AdaptiveV21, 0.01, 5.0, 0.0, adaptive_alpha_base, adaptive_theta_scale, adaptive_match_scale, 0.5};
+    TransportConfig cfg_A_C_adaptive_v1 = {"A+C-adaptive-v1", true, false, CarryOverStrategy::AdaptiveV1, 0.01, 5.0, 0.0, adaptive_alpha_base, adaptive_theta_scale, adaptive_match_scale, 0.0};
+    TransportConfig cfg_A_C_fixed = {"A+C-fixed", true, false, CarryOverStrategy::Fixed, 0.01, 5.0, 0.5, adaptive_alpha_base, adaptive_theta_scale, adaptive_match_scale, 0.0};
 
-    std::vector<TransportConfig> configs = {cfg_A, cfg_C_fixed, cfg_C_adaptive_v1, cfg_A_C_adaptive_v1, cfg_A_C_fixed};
+    std::vector<TransportConfig> configs = {cfg_A, cfg_C_fixed, cfg_C_adaptive_v1, cfg_C_adaptive_v21, cfg_A_C_adaptive_v1, cfg_A_C_fixed};
 
     // ========================================================================
     // Run all cases
@@ -1906,7 +2064,8 @@ int main(int argc, char* argv[]) {
     std::ofstream case_A_file(out_dir + "/sdf_patch_adaptive_carryover_case_A.csv");
     case_A_file << "config,clamp,attenuation,carry_strategy,final_y,expected_y,y_error,avg_force_y,force_std_dev,avg_torque_x,avg_torque_y,avg_torque_z,torque_std_dev,max_patch_count,avg_patch_count,multi_patch_ratio,avg_tangential_force_norm,max_tangential_force_norm,avg_tangential_force_ratio,avg_tangential_displacement_norm,avg_raw_transport_norm,avg_limited_transport_norm,avg_transport_attenuation,avg_carry_over_factor,min_carry_over_factor,max_carry_over_factor,avg_adaptive_alpha,min_adaptive_alpha,max_adaptive_alpha,avg_theta,max_theta,avg_match_distance,total_birth_events,total_transport_clamp_hits,clamp_trigger_count,clamp_pre_norm_avg,clamp_post_norm_avg,clamp_max_pre_norm,clamp_max_post_norm,stick_steps,slip_steps,stick_to_slip_transitions,stable" << std::endl;
     for (const auto& r : all_results[0]) {
-        std::string carry_str = (r.carry_strategy == CarryOverStrategy::AdaptiveV1) ? "adaptive-v1" : 
+        std::string carry_str = (r.carry_strategy == CarryOverStrategy::AdaptiveV21) ? "adaptive-v2.1" : 
+                                (r.carry_strategy == CarryOverStrategy::AdaptiveV1) ? "adaptive-v1" : 
                                 (r.carry_strategy == CarryOverStrategy::Adaptive) ? "adaptive" : "fixed";
         case_A_file << r.config_name << ","
                     << (r.enable_clamp ? 1 : 0) << ","
@@ -1959,7 +2118,8 @@ int main(int argc, char* argv[]) {
     std::ofstream case_B_file(out_dir + "/sdf_patch_adaptive_carryover_case_B.csv");
     case_B_file << "config,clamp,attenuation,carry_strategy,final_y,expected_y,y_error,avg_force_y,force_std_dev,avg_torque_x,avg_torque_y,avg_torque_z,torque_std_dev,max_patch_count,avg_patch_count,multi_patch_ratio,avg_tangential_force_norm,max_tangential_force_norm,avg_tangential_force_ratio,avg_tangential_displacement_norm,avg_raw_transport_norm,avg_limited_transport_norm,avg_transport_attenuation,avg_carry_over_factor,min_carry_over_factor,max_carry_over_factor,avg_adaptive_alpha,min_adaptive_alpha,max_adaptive_alpha,avg_theta,max_theta,avg_match_distance,total_birth_events,total_transport_clamp_hits,clamp_trigger_count,clamp_pre_norm_avg,clamp_post_norm_avg,clamp_max_pre_norm,clamp_max_post_norm,stick_steps,slip_steps,stick_to_slip_transitions,stable" << std::endl;
     for (const auto& r : all_results[1]) {
-        std::string carry_str = (r.carry_strategy == CarryOverStrategy::AdaptiveV1) ? "adaptive-v1" : 
+        std::string carry_str = (r.carry_strategy == CarryOverStrategy::AdaptiveV21) ? "adaptive-v2.1" : 
+                                (r.carry_strategy == CarryOverStrategy::AdaptiveV1) ? "adaptive-v1" : 
                                 (r.carry_strategy == CarryOverStrategy::Adaptive) ? "adaptive" : "fixed";
         case_B_file << r.config_name << ","
                     << (r.enable_clamp ? 1 : 0) << ","
@@ -2012,7 +2172,8 @@ int main(int argc, char* argv[]) {
     std::ofstream summary_file(out_dir + "/sdf_patch_adaptive_carryover_summary.csv");
     summary_file << "config,clamp,attenuation,carry_strategy,case_A_y_error,case_A_torque_z,case_A_trans_norm,case_A_alpha_mean,case_A_alpha_min,case_A_stable,case_B_y_error,case_B_torque_z,case_B_trans_norm,case_B_alpha_mean,case_B_alpha_min,case_B_stable" << std::endl;
     for (size_t ci = 0; ci < configs.size(); ci++) {
-        std::string carry_str = (configs[ci].carry_strategy == CarryOverStrategy::AdaptiveV1) ? "adaptive-v1" : 
+        std::string carry_str = (configs[ci].carry_strategy == CarryOverStrategy::AdaptiveV21) ? "adaptive-v2.1" : 
+                                (configs[ci].carry_strategy == CarryOverStrategy::AdaptiveV1) ? "adaptive-v1" : 
                                 (configs[ci].carry_strategy == CarryOverStrategy::Adaptive) ? "adaptive" : "fixed";
         summary_file << configs[ci].name << ","
                      << (configs[ci].enable_clamp ? 1 : 0) << ","
