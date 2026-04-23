@@ -1,219 +1,137 @@
-# Milestone 5 验收报告
+# 里程碑 6 验收报告
 
-## 验收日期
-2026-04-23
+## Patch Constitutive Law 数学定义
 
-## 验收人员
-AI Agent
-
----
-
-## 1. 验收项目检查清单
-
-| # | 验收项目 | 状态 | 证据 |
-|---|---------|------|------|
-| 1 | 工程能成功构建 | PASS | 编译成功，无警告 |
-| 2 | demo 能成功运行 | PASS | 退出码 0，输出 "Overall: PASS" |
-| 3 | 输出文件正确生成在 `out/milestone_06/` | PASS | 3 个 CSV 文件已生成 |
-| 4 | 成功输出 patch tracking 数据 | PASS | `sdf_patch_tracks.csv` 含完整生命周期记录 |
-| 5 | persistent patch ID 跨帧稳定出现 | PASS | avg_matched_ratio = 0.9947 |
-| 6 | 正确识别 birth / death 行为 | PASS | 3 births, 2 deaths 正确检测 |
-| 7 | tracking summary 指标可读 | PASS | 13 项指标全部有值 |
-| 8 | 文件归档正确 | PASS | 无散落临时文件 |
-
----
-
-## 2. Patch Tracking 定义与实现
-
-### 2.1 Persistent ID
-
-| 规则 | 实现 |
-|------|------|
-| 新 patch | `next_persistent_id++`（从 0 开始递增） |
-| 匹配成功 | 继承上一帧 persistent ID |
-| 消失后重现 | 分配新 ID（不尝试重识别） |
-
-### 2.2 Matching 规则
-
-| 条件 | 阈值 | 说明 |
-|------|------|------|
-| Center 距离 | < 0.1m（0.5 × dyn_sphere_radius） | 接触区域不应突变 |
-| 法向相似度 | cos(angle) > 0.9 | 接触面方向不应突变 |
-| 匹配策略 | 贪心（按 force 降序） | 单 patch 场景下与最优等价 |
-| 一一匹配 | 每个 prev patch 最多匹配一个 current | 避免多对一 |
-
-### 2.3 Birth / Death 规则
-
-| 事件 | 条件 | 处理 |
-|------|------|------|
-| **Birth** | 当前 patch 无匹配的上一帧 patch | 分配新 persistent ID，status = born |
-| **Alive** | 当前 patch 匹配到上一帧 patch | 继承 ID，status = alive |
-| **Death** | 上一帧 patch 无匹配的当前 patch | 写入 death 记录，status = dead |
-
-### 2.4 Track 输出格式
-
-**长表格式**（time, persistent_patch_id, ...），每个 patch 在每个时间步一条记录。
-- Born/Alive: 正常写入
-- Dead: 额外写入一行（记录最后状态）
-
----
-
-## 3. Tracking 结果摘要
-
-### 3.1 核心指标
-
-| 指标 | 值 | 说明 |
-|------|-----|------|
-| total_born | 3 | 3 次接触建立 |
-| total_dead | 2 | 2 次接触消失 |
-| total_frames | 4001 | 仿真总帧数 |
-| frames_with_patches | 940 | 23.5% 帧有接触 |
-| avg_patch_count | 0.2349 | 平均不到 1 个 patch（单接触区域） |
-| max_patch_count | 1 | 最多同时只有 1 个 patch |
-| **avg_matched_ratio** | **0.9947** | 匹配率极高，tracking 非常稳定 |
-| max_lifetime_steps | 621 | 最长 track 存活 621 步 |
-| avg_lifetime_steps | 207 | 平均存活 207 步 |
-| max_center_drift | 0.3374 m | 累计 center 漂移 |
-| max_normal_fluctuation | 0.0 | **Normal 完全稳定** |
-
-### 3.2 Patch 生命周期记录
-
-| Track ID | Birth Time | Death Time | Lifetime (steps) | 说明 |
-|----------|-----------|------------|-----------------|------|
-| **0** | t=0.590s | t=0.6495s | 118 | 第一次接触，弹起 |
-| **1** | t=1.290s | t=1.3885s | 198 | 第二次接触，弹起 |
-| **2** | t=1.690s | (still alive at t=2.0s) | 621+ | 第三次接触，持续接触 |
-
-### 3.3 Birth / Death 行为验证
-
-**Birth 正确性**：
-- Track 0 在 t=0.59s birth，此时动态球首次接触静态球（自由落体约 0.6s 到达接触面），正确
-- Track 1 在 t=1.29s birth，此时球从第一次弹起后回落到接触面，正确
-- Track 2 在 t=1.69s birth，第三次接触，正确
-
-**Death 正确性**：
-- Track 0 在 t=0.6495s death，此时球从接触面弹起，active sample 消失，正确
-- Track 1 在 t=1.3885s death，第二次弹起，正确
-
-**Continuous contact**：
-- Track 2 从 t=1.69s 持续到仿真结束（t=2.0s），说明球最终稳定在接触状态，符合 2B.6 的平衡结论
-
-### 3.4 是否稳定
-
-**是。** avg_matched_ratio = 0.9947 说明几乎每一帧的 patch 都能正确匹配到上一帧。在单 patch 场景下这是预期的——只要 contact 持续存在，patch center 变化很小（< 0.1m 阈值），normal 始终为 (0,1,0)。
-
----
-
-## 4. Pointwise / Patch-force / Patch-tracking 层级关系
+### 核心公式
 
 ```
-Level 1: Pointwise (active sample 级)
-         └─ 每个 sample 点有独立 force/torque
-         └─ 直接累加到刚体
-
-Level 2: Patch-force (patch 聚合级)
-         └─ sample → patch grouping → patch_force = Σ(sample_force)
-         └─ 输出结构化的 patch 描述符
-
-Level 3: Patch-tracking (跨时间步状态级)  ← 本里程碑
-         └─ 相邻帧 patch matching → persistent ID
-         └─ birth / death 检测
-         └─ track 时序记录（center drift, normal fluctuation, lifetime）
+penetration_eff = area-weighted mean of max(-phi_i, 0)
+vn_eff = patch_center_velocity · patch_normal
+F_patch = (k_patch * penetration_eff + c_patch * max(-vn_eff, 0)) * patch_normal
+T_patch = (patch_center - COM) × F_patch
 ```
 
-这三个层级是**递进关系**，每一层在前一层的基础上增加新的抽象：
-- Level 1 是物理基础
-- Level 2 是空间组织
-- Level 3 是时间组织
+### 详细说明
 
-Persistence 不是另一个不相关模块，而是 patch-force 层在时间维度上的自然扩展。
+- **penetration_eff**: 对 patch 内所有 active samples 的穿透深度 `max(-phi_i, 0)` 进行面积加权平均
+- **vn_eff**: patch 中心点在 patch 法向上的投影速度（相对速度法向分量）
+- **F_patch**: 法向力大小由刚度项和阻尼项组成，方向沿 patch_normal
+- **T_patch**: 力矩由 patch 中心到质心的力臂与 patch 力叉乘得到
 
----
+### 与 pointwise 的区别
 
-## 5. 当前局限
+| 特征 | Pointwise | Patch Constitutive |
+|------|-----------|-------------------|
+| 力计算单元 | 单个 sample | 整个 patch |
+| 输入量 | sample phi, sample velocity | patch mean penetration, patch center velocity |
+| 力方向 | sample grad 方向 | patch normal 方向 |
+| 聚合方式 | 直接求和 | 单一法向力 |
 
-### 5.1 场景过于简单
-- 当前只有单接触区域（球-球接触），始终最多 1 个 patch
-- Matching 算法在单 patch 下几乎是 trivial 的
-- 需要多接触区域场景（如 edge contact）验证 matching 的 robustness
+## 参数设置
 
-### 5.2 未实现 patch 重识别
-- 消失后重新出现的 patch 分配新 ID，不尝试重识别
-- 在某些场景中，同一个接触区域可能在间隙后重新出现
-- 但当前场景中这不会造成问题（每个接触区域确实是不同的事件）
+| 参数 | 值 | 单位 | 说明 |
+|------|-----|------|------|
+| 静态球半径 | 1.0 | m | OpenVDB level set sphere |
+| 动态球半径 | 0.2 | m | Chrono ChBodyEasySphere |
+| 动态球质量 | 33.5103 | kg | 密度 1000 kg/m³ |
+| 下落高度 | 3.0 | m | 初始 y 位置 |
+| 网格体素 | 0.05 | m | OpenVDB voxel size |
+| 采样分辨率 | 8×16 | - | n_theta × n_phi |
+| 刚度 k_patch | 1e5 | N/m | 与 pointwise 一致 |
+| 阻尼 c_patch | 500 | Ns/m | 与 pointwise 一致 |
+| 激活带宽 | 0.1 | m | candidate detection |
+| 力计算带宽 | 0.0 | m | actual penalty |
+| 时间步长 | 5e-4 | s | simulation step |
+| 总模拟时间 | 2.0 | s | total duration |
 
-### 5.3 未实现 split / merge 检测
-- 当前 patch grouping 使用连通分量，如果接触区域从连通变为不连通，会创建新 patch
-- 但不会显式检测 "split"（一个 patch 分为两个）或 "merge"（两个 patch 合并为一个）
-- 可以通过分析 parent/child persistent ID 关系来实现，但不是当前优先任务
+## 与 Baselines 的对照
 
-### 5.4 Center drift 阈值可能需要场景自适应
-- 当前阈值 = 0.5 × dyn_sphere_radius = 0.1m
-- 对于更复杂的几何或更大的接触区域，可能需要自适应阈值
+### 关键指标对比
 
----
+| 指标 | Pointwise | PatchForceSum | PatchConstitutive | 期望值 |
+|------|-----------|---------------|-------------------|--------|
+| final_y | 1.200327 m | 1.200327 m | 1.196844 m | 1.196713 m |
+| y_error | 0.003615 m | 0.003615 m | 0.000131 m | 0 m |
+| avg_force_y | 309.25 N | 309.25 N | 325.81 N | 328.73 N (mg) |
+| force_std_dev | 2868.74 N | 2868.74 N | 833.79 N | - |
+| stable | NO | NO | YES | YES |
 
-## 6. 最终文件结构
+### 分析
 
-```
-src/demos/core/
-├── demo_CH_sdf_point_contact.cpp                    (2B.5 解析平面)
-├── demo_CH_sdf_point_contact_openvdb.cpp            (2B.6 OpenVDB pointwise)
-├── demo_CH_sdf_patch_contact_openvdb.cpp            (3.0 OpenVDB patch observational)
-├── demo_CH_sdf_patch_force_openvdb.cpp              (4.0 OpenVDB patch force)
-├── demo_CH_sdf_patch_persistence_openvdb.cpp        (5.0 OpenVDB patch tracking，新增)
-└── CMakeLists.txt                                    (更新)
+#### 位置精度
+- **Patch Constitutive y_error = 0.000131m**，相比 baseline 降低 **96.4%**
+- 这是所有里程碑中最好的位置精度
+- Pointwise 和 PatchForceSum 完全一致（数学等价性验证通过）
 
-out/milestone_06/
-├── sdf_patch_tracking_output.csv                    (帧级追踪)
-├── sdf_patch_tracks.csv                             (Patch track 长表)
-└── sdf_patch_tracking_summary.csv                   (追踪指标汇总)
+#### 力精度
+- **Patch Constitutive avg_force = 325.81N**，与 mg=328.73N 相差仅 0.9%
+- Baseline avg_force = 309.25N，与 mg 相差 5.9%
+- Patch constitutive 的力平衡更精确
 
-reports/milestone_06/
-├── README_patch_tracking.md                          (说明文档)
-└── acceptance_report.md                              (本报告)
-```
+#### 稳定性
+- **Patch Constitutive 是唯一通过稳定性检查的模式**
+- Force std dev 降低 71%（833.79N vs 2868.74N）
+- 说明 patch-level 聚合有效平滑了数值振荡
 
----
+#### 为什么 PatchForceSum 与 Pointwise 完全一致？
+- 因为 PatchForceSum 模式下 patch_force = Σ sample_force_i
+- 根据力的叠加原理，两者数学等价
+- 这验证了 patch grouping 逻辑的正确性
 
-## 7. 如何构建
+#### 为什么 Patch Constitutive 更优？
+1. **单一法向方向**: 消除了 sample grad 方向不一致引起的横向振荡
+2. **面积加权平均**: 穿透深度聚合减少了离散采样噪声
+3. **中心速度投影**: 使用 patch 整体运动而非单个 sample 速度，更稳定
 
-```bash
-cd "E:\workspace\Multi-body Dynamics Solver\Multi-body Dynamics Solver"
-cmake --build build --config Release --target demo_CH_sdf_patch_persistence_openvdb
-```
+## 当前局限
 
-## 8. 如何运行
+1. **单 patch 场景**: 球-球接触始终只产生 1 个 patch，多 patch 交互尚未测试
+2. **线性 law**: 当前仅实现最简单的线性刚度+阻尼，未包含非线性效应
+3. **无历史项**: 未使用 patch age、历史穿透等时间相关信息
+4. **未使用 persistence 状态**: 虽然实现了匹配，但 constitutive law 未利用 persistent track 信息
+5. **Hertz 理论缺失**: 未引入接触面积与穿透深度的非线性关系
 
-```bash
-cd "E:\workspace\Multi-body Dynamics Solver\Multi-body Dynamics Solver\build\bin\Release"
-.\demo_CH_sdf_patch_persistence_openvdb.exe
-```
+## 验收结论
 
----
+### 通过项
 
-## 9. 验收结论
+| 验收标准 | 状态 |
+|----------|------|
+| 工程能成功构建 | PASS |
+| demo 能成功运行 | PASS |
+| 输出文件正确生成 | PASS |
+| 成功输出 patch constitutive mode 数据 | PASS |
+| 完成 constitutive vs baselines 对照 | PASS |
+| Constitutive mode 不崩溃、不发散 | PASS |
+| 报告清楚说明 patch law 定义与结果 | PASS |
+| 文件归档正确，无散落临时文件 | PASS |
 
-### 里程碑 5 状态：**PASSED** ✅
+### 整体评价
 
-所有 8 项验收标准均已满足。Patch persistence / tracking 首版实现成功验证了：
+**里程碑 6 通过**。
 
-1. **Patch 可以跨时间步匹配** ✅（avg_matched_ratio = 0.9947）
-2. **Persistent ID 稳定延续** ✅（3 tracks，每个都有连续的 ID）
-3. **Birth / Death 正确检测** ✅（3 births at correct times, 2 deaths at lift-off）
-4. **Track 时序指标可读** ✅（center drift, normal fluctuation, lifetime 全部有值）
-5. **Tracking 机制足够稳定** ✅（normal 完全稳定，center drift 可接受）
+Patch constitutive law 首版成功实现了从 patch 几何量到接触力的直接映射。在简单球-球接触场景下：
+- 位置精度超越 baseline 96%
+- 力振荡降低 71%
+- 是唯一通过稳定性检查的模式
 
-### 是否适合进入 patch constitutive law
+这表明 patch-level constitutive law 是一个正确的方向。
 
-**可以进入 ✅**
+### 是否适合进入更复杂 patch law 或多 patch 场景
 
-**支撑理由：**
-1. ✅ Patch tracking 已验证稳定性，可以作为 patch constitutive law 的状态承载体
-2. ✅ Persistent ID 确保同一 patch 的历史状态可以累积（如接触深度历史、力历史）
-3. ✅ Birth / death 检测确保 constitutive law 可以在接触建立时初始化、在消失时清理
+**是，但有条件**：
 
-**建议的 constitutive law 阶段优先事项：**
-1. **基于 patch area + mean_depth 的等效 Hertz 力模型**：用 patch descriptor 替代 pointwise force 聚合
-2. **利用 track 历史**：如接触深度变化率、接触面积变化趋势
-3. **平滑机制**：利用 persistent track 的时序连续性来平滑 patch force
+**适合进入多 patch 场景的理由**：
+1. 单 patch 场景已充分验证 constitutive law 的正确性
+2. 多 patch 场景能测试 patch grouping 和 force 分配逻辑
+3. 当前框架已支持多 patch（BFS 连通分量）
+
+**建议先完成的工作**：
+1. 在 constitutive law 中引入 patch persistence 状态（age、history）
+2. 测试简单多 patch 场景（如方盒落在粗糙表面上）
+3. 验证 patch 间力分配是否合理
+
+**不建议立即进行的工作**：
+1. 复杂非线性 constitutive law（Hertz、Mindlin）
+2. 复杂 mesh vs mesh 场景
+3. 粘滑摩擦模型
