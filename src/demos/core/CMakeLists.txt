@@ -18,7 +18,7 @@ set(DEMOS
 )
 
 # OpenVDB probe demo is built separately below if OpenVDB is found
-list(APPEND DEMOS_WITH_OPENVDB demo_CH_openvdb_probe demo_CH_sdf_point_contact_openvdb demo_CH_sdf_patch_contact_openvdb demo_CH_sdf_patch_force_openvdb demo_CH_sdf_patch_persistence_openvdb demo_CH_sdf_patch_constitutive_openvdb)
+list(APPEND DEMOS_WITH_OPENVDB demo_CH_openvdb_probe demo_CH_sdf_point_contact_openvdb demo_CH_sdf_patch_contact_openvdb demo_CH_sdf_patch_force_openvdb demo_CH_sdf_patch_persistence_openvdb demo_CH_sdf_patch_constitutive_openvdb demo_CH_sdf_patch_constitutive_cases_openvdb)
 
 #--------------------------------------------------------------
 
