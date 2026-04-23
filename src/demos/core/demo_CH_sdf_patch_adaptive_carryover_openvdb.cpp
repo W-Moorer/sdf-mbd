@@ -42,6 +42,7 @@
 #include <set>
 #include <map>
 #include <sstream>
+#include <numeric>
 
 // -- Chrono includes --
 #include "chrono/physics/ChSystemSMC.h"
@@ -177,8 +178,25 @@ enum class CarryOverStrategy {
     Fixed,      // alpha = constant
     Adaptive,   // alpha = f(theta, match_quality, topology)
     AdaptiveV1,  // V1: geometry-consistent transfer with return mapping
-    AdaptiveV21  // V2.1: transported elastic state + validity gate
+    AdaptiveV21,  // V2.1: transported elastic state + validity gate
+    AdaptiveV21a  // V2.1a: V2.1 with normalized validity gate
 };
+
+static std::string CarryOverStrategyName(CarryOverStrategy strategy) {
+    if (strategy == CarryOverStrategy::AdaptiveV21a) {
+        return "adaptive-v2.1a";
+    }
+    if (strategy == CarryOverStrategy::AdaptiveV21) {
+        return "adaptive-v2.1";
+    }
+    if (strategy == CarryOverStrategy::AdaptiveV1) {
+        return "adaptive-v1";
+    }
+    if (strategy == CarryOverStrategy::Adaptive) {
+        return "adaptive";
+    }
+    return "fixed";
+}
 
 // =============================================================================
 // Transport limit mechanism flags
@@ -224,6 +242,14 @@ struct TransportResult {
     int transport_clamp_hit;
     double frame_rotation_angle;
     double adaptive_alpha;
+    double theta_ref = 0.0;
+    double match_ref = 0.0;
+    double theta_rel = 0.0;
+    double match_rel = 0.0;
+    double w_theta = 1.0;
+    double w_match = 1.0;
+    double w_topo = 1.0;
+    double w_slip = 1.0;
 };
 
 // =============================================================================
@@ -300,6 +326,22 @@ struct RunResult {
     double avg_theta;
     double max_theta;
     double avg_match_distance;
+    double theta_p50;
+    double theta_p95;
+    double match_distance_p50;
+    double match_distance_p95;
+    double avg_theta_rel;
+    double theta_rel_p50;
+    double theta_rel_p95;
+    double max_theta_rel;
+    double avg_match_rel;
+    double match_rel_p50;
+    double match_rel_p95;
+    double max_match_rel;
+    double avg_gate_w_theta;
+    double avg_gate_w_match;
+    double avg_gate_w_topo;
+    double avg_gate_w_slip;
     int total_birth_events;
 
     // -- Clamp diagnostics --
@@ -517,6 +559,50 @@ static void EnsureDir(const std::string& dir_path) {
     std::filesystem::create_directories(std::filesystem::path(dir_path));
 }
 
+static double Percentile(std::vector<double> values, double q) {
+    if (values.empty()) {
+        return 0.0;
+    }
+    std::sort(values.begin(), values.end());
+    q = std::max(0.0, std::min(1.0, q));
+    size_t idx = static_cast<size_t>(std::floor(q * static_cast<double>(values.size() - 1)));
+    idx = std::min(idx, values.size() - 1);
+    return values[idx];
+}
+
+static double MeanValue(const std::vector<double>& values) {
+    if (values.empty()) {
+        return 0.0;
+    }
+    return std::accumulate(values.begin(), values.end(), 0.0) / static_cast<double>(values.size());
+}
+
+// =============================================================================
+// V2.1a gate normalization state
+// =============================================================================
+
+struct GateNormalizationStats {
+    std::vector<double> theta_samples;
+    std::vector<double> match_samples;
+
+    double ThetaRef() const {
+        return std::max(1.0e-4, MeanValue(theta_samples));
+    }
+
+    double MatchRef() const {
+        return std::max(1.0e-4, MeanValue(match_samples));
+    }
+
+    void Observe(double theta, double match_distance) {
+        if (std::isfinite(theta)) {
+            theta_samples.push_back(std::max(0.0, theta));
+        }
+        if (std::isfinite(match_distance)) {
+            match_samples.push_back(std::max(0.0, match_distance));
+        }
+    }
+};
+
 // =============================================================================
 // Build orthonormal tangent basis from normal
 // =============================================================================
@@ -636,6 +722,48 @@ double ValidityGateV21(
 }
 
 // =============================================================================
+// V2.1a Validity gate: normalized history validity gate
+// =============================================================================
+
+double ValidityGateV21a(
+    double theta,
+    double match_distance,
+    int topology_event,
+    double slip_risk,
+    const TransportConfig& config,
+    const GateNormalizationStats& gate_stats,
+    TransportResult& result
+) {
+    result.theta_ref = gate_stats.ThetaRef();
+    result.match_ref = gate_stats.MatchRef();
+    result.theta_rel = theta / (result.theta_ref + 1.0e-12);
+    result.match_rel = match_distance / (result.match_ref + 1.0e-12);
+
+    const double theta_rel_scale = std::max(1.0e-12, config.adaptive_theta_scale);
+    const double match_rel_scale = std::max(1.0e-12, config.adaptive_match_scale);
+    result.w_theta = std::exp(-result.theta_rel / theta_rel_scale);
+    result.w_match = std::exp(-result.match_rel / match_rel_scale);
+
+    if (topology_event == 1) {
+        result.w_topo = 0.0;
+    } else if (topology_event == 2) {
+        result.w_topo = 0.3;
+    } else {
+        result.w_topo = 1.0;
+    }
+
+    result.w_slip = 1.0;
+    if (config.adaptive_slip_risk_scale > 1.0e-12) {
+        double excess = std::max(0.0, slip_risk - 1.0);
+        result.w_slip = std::exp(-config.adaptive_slip_risk_scale * excess);
+        result.w_slip = std::max(0.85, std::min(1.0, result.w_slip));
+    }
+
+    double w = result.w_theta * result.w_match * result.w_topo * result.w_slip;
+    return std::max(0.0, std::min(1.0, w));
+}
+
+// =============================================================================
 // V2.1: Transported elastic state + validity gate + unchanged return mapping
 // =============================================================================
 
@@ -694,6 +822,95 @@ TransportResult TransportWithCarryOverV21(
     double slip_risk = (friction_limit_estimate > 1e-12) ? (tau_trial_mag_estimate / friction_limit_estimate) : 0.0;
 
     double w = ValidityGateV21(theta, match_distance, topology_event, slip_risk, config);
+    result.adaptive_alpha = w;
+    result.carry_over_factor = w;
+
+    ChVector3d xi_valid = xi_transport * w;
+
+    // Step 4: Add current step increment
+    ChVector3d delta_xi = delta_xi1 * t1_new + delta_xi2 * t2_new;
+    ChVector3d xi_trial = xi_valid + delta_xi;
+
+    // Step 5: Coulomb return mapping (UNCHANGED)
+    ChVector3d tau_trial = tangential_stiffness * xi_trial + tangential_damping * (vt1 * t1_new + vt2 * t2_new);
+    double tau_trial_mag = tau_trial.Length();
+    double friction_limit = friction_coefficient * fn_magnitude;
+
+    if (tau_trial_mag <= friction_limit) {
+        result.xi1_new = xi_trial.Dot(t1_new);
+        result.xi2_new = xi_trial.Dot(t2_new);
+    } else {
+        ChVector3d tau_new = tau_trial * (friction_limit / tau_trial_mag);
+        ChVector3d xi_elastic_new = tau_new / tangential_stiffness;
+        result.xi1_new = xi_elastic_new.Dot(t1_new);
+        result.xi2_new = xi_elastic_new.Dot(t2_new);
+    }
+
+    result.limited_transport_norm = std::sqrt(result.xi1_new * result.xi1_new + result.xi2_new * result.xi2_new);
+    return result;
+}
+
+// =============================================================================
+// V2.1a: transported elastic state + normalized validity gate + unchanged return mapping
+// =============================================================================
+
+TransportResult TransportWithCarryOverV21a(
+    double xi1_old, double xi2_old,
+    const ChVector3d& t1_old, const ChVector3d& t2_old, const ChVector3d& n_old,
+    const ChVector3d& t1_new, const ChVector3d& t2_new, const ChVector3d& n_new,
+    double match_distance,
+    int topology_event,
+    double vt1, double vt2,
+    double time_step,
+    double tangential_stiffness,
+    double tangential_damping,
+    double friction_coefficient,
+    double fn_magnitude,
+    bool is_newborn,
+    const TangentialHistoryState* history_state,
+    const TransportConfig& config,
+    GateNormalizationStats& gate_stats
+) {
+    TransportResult result;
+    result.raw_transport_norm = 0.0;
+    result.limited_transport_norm = 0.0;
+    result.transport_attenuation = 1.0;
+    result.carry_over_factor = 1.0;
+    result.transport_clamp_hit = 0;
+    result.frame_rotation_angle = 0.0;
+    result.adaptive_alpha = 0.0;
+    result.xi1_new = 0.0;
+    result.xi2_new = 0.0;
+
+    if (history_state == nullptr || !history_state->valid || is_newborn) {
+        result.xi1_new = vt1 * time_step;
+        result.xi2_new = vt2 * time_step;
+        result.limited_transport_norm = std::sqrt(result.xi1_new * result.xi1_new + result.xi2_new * result.xi2_new);
+        return result;
+    }
+
+    // Step 1: Read old xi_elastic from persistent patch
+    ChVector3d xi_elastic_world_prev = history_state->xi_elastic_world;
+
+    // Step 2: Transport xi_elastic to current tangent plane
+    ChVector3d xi_transport = TransportElasticStateToCurrentTangent(
+        xi_elastic_world_prev, n_new
+    );
+    result.raw_transport_norm = xi_transport.Length();
+    result.frame_rotation_angle = std::acos(std::max(-1.0, std::min(1.0, history_state->normal_prev.Dot(n_new))));
+
+    // Step 3: Normalized validity gate
+    double theta = result.frame_rotation_angle;
+    double delta_xi1 = vt1 * time_step;
+    double delta_xi2 = vt2 * time_step;
+    ChVector3d xi_trial_estimate = xi_transport + delta_xi1 * t1_new + delta_xi2 * t2_new;
+    ChVector3d tau_trial_estimate = tangential_stiffness * xi_trial_estimate + tangential_damping * (vt1 * t1_new + vt2 * t2_new);
+    double tau_trial_mag_estimate = tau_trial_estimate.Length();
+    double friction_limit_estimate = friction_coefficient * fn_magnitude;
+    double slip_risk = (friction_limit_estimate > 1e-12) ? (tau_trial_mag_estimate / friction_limit_estimate) : 0.0;
+
+    double w = ValidityGateV21a(theta, match_distance, topology_event, slip_risk, config, gate_stats, result);
+    gate_stats.Observe(theta, match_distance);
     result.adaptive_alpha = w;
     result.carry_over_factor = w;
 
@@ -1099,6 +1316,7 @@ RunResult RunCaseWithConfig(
 
     // -- V1 tangential history state map --
     std::map<int, TangentialHistoryState> tangential_history;
+    GateNormalizationStats gate_stats;
 
     // -- Buffers --
     std::vector<SDFQueryResult> sdf_results(samples.size());
@@ -1120,6 +1338,12 @@ RunResult RunCaseWithConfig(
     std::vector<double> adaptive_alpha_values;
     std::vector<double> theta_values;
     std::vector<double> match_distance_values;
+    std::vector<double> theta_rel_values;
+    std::vector<double> match_rel_values;
+    std::vector<double> gate_w_theta_values;
+    std::vector<double> gate_w_match_values;
+    std::vector<double> gate_w_topo_values;
+    std::vector<double> gate_w_slip_values;
     int total_birth_events = 0;
     int total_transport_clamp_hits = 0;
     double total_force_y = 0.0;
@@ -1189,6 +1413,30 @@ RunResult RunCaseWithConfig(
         double ft_final_mag;
     };
     std::vector<PatchTrace> patch_traces;
+
+    struct GateSampleTrace {
+        bool valid = false;
+        int frame_id = -1;
+        int persistent_id = -1;
+        double theta = 0.0;
+        double theta_ref = 0.0;
+        double theta_rel = 0.0;
+        double match_distance = 0.0;
+        double match_ref = 0.0;
+        double match_rel = 0.0;
+        double w_theta = 1.0;
+        double w_match = 1.0;
+        double w_topo = 1.0;
+        double w_slip = 1.0;
+        double validity_gate = 1.0;
+        double v21_abs_w_theta = 1.0;
+        double v21_abs_w_match = 1.0;
+        double v21_abs_gate = 1.0;
+        double raw_transport_norm = 0.0;
+        double limited_transport_norm = 0.0;
+        double score = -1.0;
+    };
+    GateSampleTrace gate_sample_trace;
 
     // Trace target: select specific frame/patch for detailed output
     // Use frame numbers that exist in simulation (~4000 frames for 2s at dt=5e-4)
@@ -1356,7 +1604,10 @@ RunResult RunCaseWithConfig(
 
             // Find V1 history state
             const TangentialHistoryState* v1_history = nullptr;
-            if ((transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV1 || transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV21) && patch.matched_persistent_id >= 0) {
+            if ((transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV1 ||
+                 transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV21 ||
+                 transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV21a) &&
+                patch.matched_persistent_id >= 0) {
                 auto it = tangential_history.find(patch.matched_persistent_id);
                 if (it != tangential_history.end() && it->second.valid) {
                     v1_history = &it->second;
@@ -1375,9 +1626,28 @@ RunResult RunCaseWithConfig(
 
                 match_dist = center_drift;
 
-                if (transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV1 || transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV21) {
+                if (transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV1 ||
+                    transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV21 ||
+                    transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV21a) {
                     TransportResult trans;
-                    if (transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV21) {
+                    if (transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV21a) {
+                        trans = TransportWithCarryOverV21a(
+                            prev_track->xi1, prev_track->xi2,
+                            prev_track->tangent_t1, prev_track->tangent_t2, prev_track->normal,
+                            patch.tangent_t1, patch.tangent_t2, patch.normal,
+                            match_dist, topology_event,
+                            vt1, vt2,
+                            config.time_step,
+                            config.tangential_stiffness,
+                            config.tangential_damping,
+                            config.friction_coefficient,
+                            F_n.Length(),
+                            is_newborn,
+                            v1_history,
+                            transport_cfg,
+                            gate_stats
+                        );
+                    } else if (transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV21) {
                         trans = TransportWithCarryOverV21(
                             prev_track->xi1, prev_track->xi2,
                             prev_track->tangent_t1, prev_track->tangent_t2, prev_track->normal,
@@ -1419,6 +1689,42 @@ RunResult RunCaseWithConfig(
                     adaptive_alpha = trans.adaptive_alpha;
                     clamp_hit = trans.transport_clamp_hit;
                     frame_rot_angle = trans.frame_rotation_angle;
+                    if (transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV21a) {
+                        theta_rel_values.push_back(trans.theta_rel);
+                        match_rel_values.push_back(trans.match_rel);
+                        gate_w_theta_values.push_back(trans.w_theta);
+                        gate_w_match_values.push_back(trans.w_match);
+                        gate_w_topo_values.push_back(trans.w_topo);
+                        gate_w_slip_values.push_back(trans.w_slip);
+
+                        double sample_score = (1.0 - trans.adaptive_alpha) * std::max(1.0e-12, raw_trans_norm);
+                        if (sample_score > gate_sample_trace.score) {
+                            gate_sample_trace.valid = true;
+                            gate_sample_trace.frame_id = frame_offset;
+                            gate_sample_trace.persistent_id = patch.matched_persistent_id;
+                            gate_sample_trace.theta = frame_rot_angle;
+                            gate_sample_trace.theta_ref = trans.theta_ref;
+                            gate_sample_trace.theta_rel = trans.theta_rel;
+                            gate_sample_trace.match_distance = match_dist;
+                            gate_sample_trace.match_ref = trans.match_ref;
+                            gate_sample_trace.match_rel = trans.match_rel;
+                            gate_sample_trace.w_theta = trans.w_theta;
+                            gate_sample_trace.w_match = trans.w_match;
+                            gate_sample_trace.w_topo = trans.w_topo;
+                            gate_sample_trace.w_slip = trans.w_slip;
+                            gate_sample_trace.validity_gate = trans.adaptive_alpha;
+                            gate_sample_trace.v21_abs_w_theta = std::exp(-frame_rot_angle / 0.3);
+                            gate_sample_trace.v21_abs_w_match = std::exp(-match_dist / 0.05);
+                            gate_sample_trace.v21_abs_gate =
+                                gate_sample_trace.v21_abs_w_theta *
+                                gate_sample_trace.v21_abs_w_match *
+                                trans.w_topo *
+                                trans.w_slip;
+                            gate_sample_trace.raw_transport_norm = raw_trans_norm;
+                            gate_sample_trace.limited_transport_norm = limited_trans_norm;
+                            gate_sample_trace.score = sample_score;
+                        }
+                    }
 
                     // V1: increment already included in transport, no extra addition needed
                     // But if clamp is enabled, apply clamp to final value
@@ -1637,7 +1943,10 @@ RunResult RunCaseWithConfig(
             }
 
             // Update V1/V2.1 tangential history state
-            if ((transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV1 || transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV21) && patch.matched_persistent_id >= 0) {
+            if ((transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV1 ||
+                 transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV21 ||
+                 transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV21a) &&
+                patch.matched_persistent_id >= 0) {
                 ChVector3d xi_elastic_world_new = xi1 * patch.tangent_t1 + xi2 * patch.tangent_t2;
                 TangentialHistoryState new_hist;
                 new_hist.persistent_id = patch.matched_persistent_id;
@@ -1661,7 +1970,8 @@ RunResult RunCaseWithConfig(
             match_distance_values.push_back(match_dist);
             if (transport_cfg.carry_strategy == CarryOverStrategy::Adaptive || 
                 transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV1 ||
-                transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV21) {
+                transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV21 ||
+                transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV21a) {
                 adaptive_alpha_values.push_back(adaptive_alpha);
             }
 
@@ -1822,6 +2132,22 @@ RunResult RunCaseWithConfig(
     result.max_theta = theta_values.empty() ? 0.0 : *std::max_element(theta_values.begin(), theta_values.end());
     result.avg_match_distance = match_distance_values.empty() ? 0.0 :
         std::accumulate(match_distance_values.begin(), match_distance_values.end(), 0.0) / match_distance_values.size();
+    result.theta_p50 = Percentile(theta_values, 0.50);
+    result.theta_p95 = Percentile(theta_values, 0.95);
+    result.match_distance_p50 = Percentile(match_distance_values, 0.50);
+    result.match_distance_p95 = Percentile(match_distance_values, 0.95);
+    result.avg_theta_rel = MeanValue(theta_rel_values);
+    result.theta_rel_p50 = Percentile(theta_rel_values, 0.50);
+    result.theta_rel_p95 = Percentile(theta_rel_values, 0.95);
+    result.max_theta_rel = theta_rel_values.empty() ? 0.0 : *std::max_element(theta_rel_values.begin(), theta_rel_values.end());
+    result.avg_match_rel = MeanValue(match_rel_values);
+    result.match_rel_p50 = Percentile(match_rel_values, 0.50);
+    result.match_rel_p95 = Percentile(match_rel_values, 0.95);
+    result.max_match_rel = match_rel_values.empty() ? 0.0 : *std::max_element(match_rel_values.begin(), match_rel_values.end());
+    result.avg_gate_w_theta = MeanValue(gate_w_theta_values);
+    result.avg_gate_w_match = MeanValue(gate_w_match_values);
+    result.avg_gate_w_topo = MeanValue(gate_w_topo_values);
+    result.avg_gate_w_slip = MeanValue(gate_w_slip_values);
     result.total_birth_events = total_birth_events;
 
     result.total_stick_steps = total_stick_steps;
@@ -1909,6 +2235,27 @@ RunResult RunCaseWithConfig(
            << max_xi_tracker.stick_or_slip << "," << max_xi_tracker.ft_final_mag << ","
            << sample_rank << "," << is_global_max << std::endl;
         tf.close();
+    }
+
+    // -- Write V2.1a gate representative sample --
+    if (transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV21a) {
+        std::string case_name = (config.dyn_body_type == 0) ? "Case_A" : "Case_B";
+        std::string gate_file = out_dir + "/sdf_patch_adaptive_carryover_gate_sample_" + case_name + "_" + mode_name + ".csv";
+        std::ofstream gf(gate_file);
+        gf << "case_name,config_name,frame_id,persistent_id,theta,theta_ref,theta_rel,match_distance,match_ref,match_rel,"
+           << "w_theta,w_match,w_topo,w_slip,validity_gate,v21_abs_w_theta,v21_abs_w_match,v21_abs_gate,"
+           << "raw_transport_norm,limited_transport_norm,score" << std::endl;
+        gf << case_name << "," << mode_name << ","
+           << gate_sample_trace.frame_id << "," << gate_sample_trace.persistent_id << ","
+           << std::fixed << std::setprecision(8)
+           << gate_sample_trace.theta << "," << gate_sample_trace.theta_ref << "," << gate_sample_trace.theta_rel << ","
+           << gate_sample_trace.match_distance << "," << gate_sample_trace.match_ref << "," << gate_sample_trace.match_rel << ","
+           << gate_sample_trace.w_theta << "," << gate_sample_trace.w_match << "," << gate_sample_trace.w_topo << ","
+           << gate_sample_trace.w_slip << "," << gate_sample_trace.validity_gate << ","
+           << gate_sample_trace.v21_abs_w_theta << "," << gate_sample_trace.v21_abs_w_match << "," << gate_sample_trace.v21_abs_gate << ","
+           << gate_sample_trace.raw_transport_norm << "," << gate_sample_trace.limited_transport_norm << ","
+           << gate_sample_trace.score << std::endl;
+        gf.close();
     }
 
     size_t last_10_percent = pos_y_values.size() * 9 / 10;
@@ -2009,17 +2356,18 @@ int main(int argc, char* argv[]) {
 
     // Adaptive carry-over parameters
     double adaptive_alpha_base = 0.8;     // Base alpha when theta=0 (higher than fixed 0.5)
-    double adaptive_theta_scale = 0.3;     // Theta decay scale (radians)
-    double adaptive_match_scale = 0.05;    // Match distance decay scale (meters)
+    double adaptive_theta_scale = 0.3;     // V1/V2.1 absolute theta decay scale (radians)
+    double adaptive_match_scale = 0.05;    // V1/V2.1 absolute match distance decay scale (meters)
+    double v21a_theta_rel_scale = 0.7;     // V2.1a relative theta decay scale (dimensionless)
+    double v21a_match_rel_scale = 8.0;     // V2.1a relative match distance decay scale (dimensionless)
 
     TransportConfig cfg_A = {"A-only", true, false, CarryOverStrategy::Fixed, 0.01, 5.0, 0.0, adaptive_alpha_base, adaptive_theta_scale, adaptive_match_scale, 0.0};
     TransportConfig cfg_C_fixed = {"C-fixed", false, false, CarryOverStrategy::Fixed, 0.01, 5.0, 0.5, adaptive_alpha_base, adaptive_theta_scale, adaptive_match_scale, 0.0};
     TransportConfig cfg_C_adaptive_v1 = {"C-adaptive-v1", false, false, CarryOverStrategy::AdaptiveV1, 0.01, 5.0, 0.0, adaptive_alpha_base, adaptive_theta_scale, adaptive_match_scale, 0.0};
     TransportConfig cfg_C_adaptive_v21 = {"C-adaptive-v2.1", false, false, CarryOverStrategy::AdaptiveV21, 0.01, 5.0, 0.0, adaptive_alpha_base, adaptive_theta_scale, adaptive_match_scale, 0.5};
-    TransportConfig cfg_A_C_adaptive_v1 = {"A+C-adaptive-v1", true, false, CarryOverStrategy::AdaptiveV1, 0.01, 5.0, 0.0, adaptive_alpha_base, adaptive_theta_scale, adaptive_match_scale, 0.0};
-    TransportConfig cfg_A_C_fixed = {"A+C-fixed", true, false, CarryOverStrategy::Fixed, 0.01, 5.0, 0.5, adaptive_alpha_base, adaptive_theta_scale, adaptive_match_scale, 0.0};
+    TransportConfig cfg_C_adaptive_v21a = {"C-adaptive-v2.1a", false, false, CarryOverStrategy::AdaptiveV21a, 0.01, 5.0, 0.0, adaptive_alpha_base, v21a_theta_rel_scale, v21a_match_rel_scale, 0.05};
 
-    std::vector<TransportConfig> configs = {cfg_A, cfg_C_fixed, cfg_C_adaptive_v1, cfg_C_adaptive_v21, cfg_A_C_adaptive_v1, cfg_A_C_fixed};
+    std::vector<TransportConfig> configs = {cfg_A, cfg_C_fixed, cfg_C_adaptive_v1, cfg_C_adaptive_v21, cfg_C_adaptive_v21a};
 
     // ========================================================================
     // Run all cases
@@ -2049,6 +2397,12 @@ int main(int argc, char* argv[]) {
             std::cout << "    Avg Theta: " << result.avg_theta << " rad" << std::endl;
             std::cout << "    Max Theta: " << result.max_theta << " rad" << std::endl;
             std::cout << "    Avg Match Distance: " << result.avg_match_distance << " m" << std::endl;
+            std::cout << "    Avg Theta Rel / Match Rel: " << result.avg_theta_rel << " / " << result.avg_match_rel << std::endl;
+            std::cout << "    Avg Gate Components (theta, match, topo, slip): "
+                      << result.avg_gate_w_theta << ", "
+                      << result.avg_gate_w_match << ", "
+                      << result.avg_gate_w_topo << ", "
+                      << result.avg_gate_w_slip << std::endl;
             std::cout << "    Birth Events: " << result.total_birth_events << std::endl;
             std::cout << "    Stable: " << (result.is_stable ? "YES" : "NO") << std::endl;
         }
@@ -2062,11 +2416,9 @@ int main(int argc, char* argv[]) {
 
     // Case A output
     std::ofstream case_A_file(out_dir + "/sdf_patch_adaptive_carryover_case_A.csv");
-    case_A_file << "config,clamp,attenuation,carry_strategy,final_y,expected_y,y_error,avg_force_y,force_std_dev,avg_torque_x,avg_torque_y,avg_torque_z,torque_std_dev,max_patch_count,avg_patch_count,multi_patch_ratio,avg_tangential_force_norm,max_tangential_force_norm,avg_tangential_force_ratio,avg_tangential_displacement_norm,avg_raw_transport_norm,avg_limited_transport_norm,avg_transport_attenuation,avg_carry_over_factor,min_carry_over_factor,max_carry_over_factor,avg_adaptive_alpha,min_adaptive_alpha,max_adaptive_alpha,avg_theta,max_theta,avg_match_distance,total_birth_events,total_transport_clamp_hits,clamp_trigger_count,clamp_pre_norm_avg,clamp_post_norm_avg,clamp_max_pre_norm,clamp_max_post_norm,stick_steps,slip_steps,stick_to_slip_transitions,stable" << std::endl;
+    case_A_file << "config,clamp,attenuation,carry_strategy,final_y,expected_y,y_error,avg_force_y,force_std_dev,avg_torque_x,avg_torque_y,avg_torque_z,torque_std_dev,max_patch_count,avg_patch_count,multi_patch_ratio,avg_tangential_force_norm,max_tangential_force_norm,avg_tangential_force_ratio,avg_tangential_displacement_norm,avg_raw_transport_norm,avg_limited_transport_norm,avg_transport_attenuation,avg_carry_over_factor,min_carry_over_factor,max_carry_over_factor,avg_adaptive_alpha,min_adaptive_alpha,max_adaptive_alpha,avg_theta,max_theta,avg_match_distance,theta_p50,theta_p95,match_distance_p50,match_distance_p95,avg_theta_rel,theta_rel_p50,theta_rel_p95,max_theta_rel,avg_match_rel,match_rel_p50,match_rel_p95,max_match_rel,avg_gate_w_theta,avg_gate_w_match,avg_gate_w_topo,avg_gate_w_slip,total_birth_events,total_transport_clamp_hits,clamp_trigger_count,clamp_pre_norm_avg,clamp_post_norm_avg,clamp_max_pre_norm,clamp_max_post_norm,stick_steps,slip_steps,stick_to_slip_transitions,stable" << std::endl;
     for (const auto& r : all_results[0]) {
-        std::string carry_str = (r.carry_strategy == CarryOverStrategy::AdaptiveV21) ? "adaptive-v2.1" : 
-                                (r.carry_strategy == CarryOverStrategy::AdaptiveV1) ? "adaptive-v1" : 
-                                (r.carry_strategy == CarryOverStrategy::Adaptive) ? "adaptive" : "fixed";
+        std::string carry_str = CarryOverStrategyName(r.carry_strategy);
         case_A_file << r.config_name << ","
                     << (r.enable_clamp ? 1 : 0) << ","
                     << (r.enable_attenuation ? 1 : 0) << ","
@@ -2100,6 +2452,22 @@ int main(int argc, char* argv[]) {
                     << r.avg_theta << ","
                     << r.max_theta << ","
                     << r.avg_match_distance << ","
+                    << r.theta_p50 << ","
+                    << r.theta_p95 << ","
+                    << r.match_distance_p50 << ","
+                    << r.match_distance_p95 << ","
+                    << r.avg_theta_rel << ","
+                    << r.theta_rel_p50 << ","
+                    << r.theta_rel_p95 << ","
+                    << r.max_theta_rel << ","
+                    << r.avg_match_rel << ","
+                    << r.match_rel_p50 << ","
+                    << r.match_rel_p95 << ","
+                    << r.max_match_rel << ","
+                    << r.avg_gate_w_theta << ","
+                    << r.avg_gate_w_match << ","
+                    << r.avg_gate_w_topo << ","
+                    << r.avg_gate_w_slip << ","
                     << r.total_birth_events << ","
                     << r.total_transport_clamp_hits << ","
                     << r.clamp_trigger_count << ","
@@ -2116,11 +2484,9 @@ int main(int argc, char* argv[]) {
 
     // Case B output
     std::ofstream case_B_file(out_dir + "/sdf_patch_adaptive_carryover_case_B.csv");
-    case_B_file << "config,clamp,attenuation,carry_strategy,final_y,expected_y,y_error,avg_force_y,force_std_dev,avg_torque_x,avg_torque_y,avg_torque_z,torque_std_dev,max_patch_count,avg_patch_count,multi_patch_ratio,avg_tangential_force_norm,max_tangential_force_norm,avg_tangential_force_ratio,avg_tangential_displacement_norm,avg_raw_transport_norm,avg_limited_transport_norm,avg_transport_attenuation,avg_carry_over_factor,min_carry_over_factor,max_carry_over_factor,avg_adaptive_alpha,min_adaptive_alpha,max_adaptive_alpha,avg_theta,max_theta,avg_match_distance,total_birth_events,total_transport_clamp_hits,clamp_trigger_count,clamp_pre_norm_avg,clamp_post_norm_avg,clamp_max_pre_norm,clamp_max_post_norm,stick_steps,slip_steps,stick_to_slip_transitions,stable" << std::endl;
+    case_B_file << "config,clamp,attenuation,carry_strategy,final_y,expected_y,y_error,avg_force_y,force_std_dev,avg_torque_x,avg_torque_y,avg_torque_z,torque_std_dev,max_patch_count,avg_patch_count,multi_patch_ratio,avg_tangential_force_norm,max_tangential_force_norm,avg_tangential_force_ratio,avg_tangential_displacement_norm,avg_raw_transport_norm,avg_limited_transport_norm,avg_transport_attenuation,avg_carry_over_factor,min_carry_over_factor,max_carry_over_factor,avg_adaptive_alpha,min_adaptive_alpha,max_adaptive_alpha,avg_theta,max_theta,avg_match_distance,theta_p50,theta_p95,match_distance_p50,match_distance_p95,avg_theta_rel,theta_rel_p50,theta_rel_p95,max_theta_rel,avg_match_rel,match_rel_p50,match_rel_p95,max_match_rel,avg_gate_w_theta,avg_gate_w_match,avg_gate_w_topo,avg_gate_w_slip,total_birth_events,total_transport_clamp_hits,clamp_trigger_count,clamp_pre_norm_avg,clamp_post_norm_avg,clamp_max_pre_norm,clamp_max_post_norm,stick_steps,slip_steps,stick_to_slip_transitions,stable" << std::endl;
     for (const auto& r : all_results[1]) {
-        std::string carry_str = (r.carry_strategy == CarryOverStrategy::AdaptiveV21) ? "adaptive-v2.1" : 
-                                (r.carry_strategy == CarryOverStrategy::AdaptiveV1) ? "adaptive-v1" : 
-                                (r.carry_strategy == CarryOverStrategy::Adaptive) ? "adaptive" : "fixed";
+        std::string carry_str = CarryOverStrategyName(r.carry_strategy);
         case_B_file << r.config_name << ","
                     << (r.enable_clamp ? 1 : 0) << ","
                     << (r.enable_attenuation ? 1 : 0) << ","
@@ -2154,6 +2520,22 @@ int main(int argc, char* argv[]) {
                     << r.avg_theta << ","
                     << r.max_theta << ","
                     << r.avg_match_distance << ","
+                    << r.theta_p50 << ","
+                    << r.theta_p95 << ","
+                    << r.match_distance_p50 << ","
+                    << r.match_distance_p95 << ","
+                    << r.avg_theta_rel << ","
+                    << r.theta_rel_p50 << ","
+                    << r.theta_rel_p95 << ","
+                    << r.max_theta_rel << ","
+                    << r.avg_match_rel << ","
+                    << r.match_rel_p50 << ","
+                    << r.match_rel_p95 << ","
+                    << r.max_match_rel << ","
+                    << r.avg_gate_w_theta << ","
+                    << r.avg_gate_w_match << ","
+                    << r.avg_gate_w_topo << ","
+                    << r.avg_gate_w_slip << ","
                     << r.total_birth_events << ","
                     << r.total_transport_clamp_hits << ","
                     << r.clamp_trigger_count << ","
@@ -2172,9 +2554,7 @@ int main(int argc, char* argv[]) {
     std::ofstream summary_file(out_dir + "/sdf_patch_adaptive_carryover_summary.csv");
     summary_file << "config,clamp,attenuation,carry_strategy,case_A_y_error,case_A_torque_z,case_A_trans_norm,case_A_alpha_mean,case_A_alpha_min,case_A_stable,case_B_y_error,case_B_torque_z,case_B_trans_norm,case_B_alpha_mean,case_B_alpha_min,case_B_stable" << std::endl;
     for (size_t ci = 0; ci < configs.size(); ci++) {
-        std::string carry_str = (configs[ci].carry_strategy == CarryOverStrategy::AdaptiveV21) ? "adaptive-v2.1" : 
-                                (configs[ci].carry_strategy == CarryOverStrategy::AdaptiveV1) ? "adaptive-v1" : 
-                                (configs[ci].carry_strategy == CarryOverStrategy::Adaptive) ? "adaptive" : "fixed";
+        std::string carry_str = CarryOverStrategyName(configs[ci].carry_strategy);
         summary_file << configs[ci].name << ","
                      << (configs[ci].enable_clamp ? 1 : 0) << ","
                      << (configs[ci].enable_attenuation ? 1 : 0) << ","
@@ -2197,14 +2577,22 @@ int main(int argc, char* argv[]) {
 
     // Diagnostics
     std::ofstream diag_file(out_dir + "/sdf_patch_adaptive_carryover_diagnostics.csv");
-    diag_file << "config,case_A_avg_theta,case_A_max_theta,case_A_avg_match_dist,case_A_birth_events,case_A_avg_alpha,case_A_min_alpha,case_A_max_alpha,case_B_avg_theta,case_B_max_theta,case_B_avg_match_dist,case_B_birth_events,case_B_avg_alpha,case_B_min_alpha,case_B_max_alpha" << std::endl;
+    diag_file << "config,case_A_avg_theta,case_A_theta_p50,case_A_theta_p95,case_A_avg_theta_rel,case_A_theta_rel_p50,case_A_theta_rel_p95,case_A_max_theta,case_A_avg_match_dist,case_A_match_p50,case_A_match_p95,case_A_avg_match_rel,case_A_match_rel_p50,case_A_match_rel_p95,case_A_w_theta,case_A_w_match,case_A_w_topo,case_A_w_slip,case_A_birth_events,case_A_avg_alpha,case_A_min_alpha,case_A_max_alpha,case_B_avg_theta,case_B_theta_p50,case_B_theta_p95,case_B_avg_theta_rel,case_B_theta_rel_p50,case_B_theta_rel_p95,case_B_max_theta,case_B_avg_match_dist,case_B_match_p50,case_B_match_p95,case_B_avg_match_rel,case_B_match_rel_p50,case_B_match_rel_p95,case_B_w_theta,case_B_w_match,case_B_w_topo,case_B_w_slip,case_B_birth_events,case_B_avg_alpha,case_B_min_alpha,case_B_max_alpha" << std::endl;
     for (size_t ci = 0; ci < configs.size(); ci++) {
         diag_file << configs[ci].name << ","
                   << std::fixed << std::setprecision(6)
-                  << all_results[0][ci].avg_theta << "," << all_results[0][ci].max_theta << "," << all_results[0][ci].avg_match_distance << "," << all_results[0][ci].total_birth_events << ","
-                  << all_results[0][ci].avg_adaptive_alpha << "," << all_results[0][ci].min_adaptive_alpha << "," << all_results[0][ci].max_adaptive_alpha << ","
-                  << all_results[1][ci].avg_theta << "," << all_results[1][ci].max_theta << "," << all_results[1][ci].avg_match_distance << "," << all_results[1][ci].total_birth_events << ","
-                  << all_results[1][ci].avg_adaptive_alpha << "," << all_results[1][ci].min_adaptive_alpha << "," << all_results[1][ci].max_adaptive_alpha << std::endl;
+                  << all_results[0][ci].avg_theta << "," << all_results[0][ci].theta_p50 << "," << all_results[0][ci].theta_p95 << ","
+                  << all_results[0][ci].avg_theta_rel << "," << all_results[0][ci].theta_rel_p50 << "," << all_results[0][ci].theta_rel_p95 << "," << all_results[0][ci].max_theta << ","
+                  << all_results[0][ci].avg_match_distance << "," << all_results[0][ci].match_distance_p50 << "," << all_results[0][ci].match_distance_p95 << ","
+                  << all_results[0][ci].avg_match_rel << "," << all_results[0][ci].match_rel_p50 << "," << all_results[0][ci].match_rel_p95 << ","
+                  << all_results[0][ci].avg_gate_w_theta << "," << all_results[0][ci].avg_gate_w_match << "," << all_results[0][ci].avg_gate_w_topo << "," << all_results[0][ci].avg_gate_w_slip << ","
+                  << all_results[0][ci].total_birth_events << "," << all_results[0][ci].avg_adaptive_alpha << "," << all_results[0][ci].min_adaptive_alpha << "," << all_results[0][ci].max_adaptive_alpha << ","
+                  << all_results[1][ci].avg_theta << "," << all_results[1][ci].theta_p50 << "," << all_results[1][ci].theta_p95 << ","
+                  << all_results[1][ci].avg_theta_rel << "," << all_results[1][ci].theta_rel_p50 << "," << all_results[1][ci].theta_rel_p95 << "," << all_results[1][ci].max_theta << ","
+                  << all_results[1][ci].avg_match_distance << "," << all_results[1][ci].match_distance_p50 << "," << all_results[1][ci].match_distance_p95 << ","
+                  << all_results[1][ci].avg_match_rel << "," << all_results[1][ci].match_rel_p50 << "," << all_results[1][ci].match_rel_p95 << ","
+                  << all_results[1][ci].avg_gate_w_theta << "," << all_results[1][ci].avg_gate_w_match << "," << all_results[1][ci].avg_gate_w_topo << "," << all_results[1][ci].avg_gate_w_slip << ","
+                  << all_results[1][ci].total_birth_events << "," << all_results[1][ci].avg_adaptive_alpha << "," << all_results[1][ci].min_adaptive_alpha << "," << all_results[1][ci].max_adaptive_alpha << std::endl;
     }
     diag_file.close();
 
