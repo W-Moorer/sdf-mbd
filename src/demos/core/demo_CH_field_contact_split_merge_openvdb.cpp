@@ -12,11 +12,13 @@
 //
 // Milestone 15: real split/merge field-contact primitive demo.
 //
-// A triangulated surface plane moves against an OpenVDB SDF generated from two
-// overlapping sphere meshes. As the plane height changes, the active surface
-// region naturally evolves from two disconnected patches to one merged patch
-// and then splits again. The demo records overlap-based history sources,
-// split/merge classifications, tangential-history energy, and force jumps.
+// A Chrono body carrying a triangulated surface plane moves against an OpenVDB
+// SDF generated from two overlapping sphere meshes. Primitive contact force and
+// torque are fed back through the body accumulator. As the body crosses the
+// target, the active surface region naturally evolves from two disconnected
+// patches to one merged patch and then splits again. The demo records
+// overlap-based history sources, split/merge classifications, tangential-history
+// energy, and force jumps.
 //
 // =============================================================================
 
@@ -35,6 +37,8 @@
 #include <vector>
 
 #include "chrono/collision/ChFieldContactPrimitives.h"
+#include "chrono/physics/ChBody.h"
+#include "chrono/physics/ChSystemSMC.h"
 
 #include <openvdb/openvdb.h>
 #include <openvdb/tools/Interpolation.h>
@@ -261,7 +265,7 @@ int main(int argc, char* argv[]) {
     const double y_high = 0.431;
     const double y_low = 0.305;
     const double total_time = 1.6;
-    const double dt = 0.002;
+    const double dt = 0.001;
     const int frame_count = static_cast<int>(total_time / dt);
 
     DemoTriangleMesh target_mesh = BuildDoubleSphereTarget(target_radius, target_separation);
@@ -278,8 +282,8 @@ int main(int argc, char* argv[]) {
     extract_settings.min_samples = 3;
 
     NormalContactSettings normal_settings;
-    normal_settings.stiffness = 5.0e6;
-    normal_settings.damping = 1.0e4;
+    normal_settings.stiffness = 3.0e6;
+    normal_settings.damping = 8.0e3;
 
     TangentialContactSettings tangential_settings;
     tangential_settings.stiffness = 1.5e5;
@@ -293,14 +297,34 @@ int main(int argc, char* argv[]) {
     inheritance_settings.max_center_distance = 0.18;
     inheritance_settings.geometry_fallback_weight = 0.05;
 
+    ChSystemSMC sys;
+    sys.SetGravitationalAcceleration(ChVector3d(0, 0, 0));
+    sys.SetSolverType(ChSolver::Type::PSOR);
+    sys.GetSolver()->AsIterative()->SetMaxIterations(100);
+    sys.GetSolver()->AsIterative()->SetTolerance(1.0e-8);
+
+    auto plane_body = chrono_types::make_shared<ChBody>();
+    plane_body->SetMass(80.0);
+    plane_body->SetInertiaXX(ChVector3d(500.0, 500.0, 500.0));
+    plane_body->SetPos(ChVector3d(0, y_high, 0));
+    plane_body->SetPosDt(ChVector3d(0.035 * (2.0 * M_PI / total_time), 0, 0));
+    plane_body->SetFixed(false);
+    sys.AddBody(plane_body);
+    unsigned int accumulator_id = plane_body->AddAccumulator();
+
+    const double guide_kp = 8.0e6;
+    const double guide_kd = 4.5e4;
+    const double angular_damping = 2.0e4;
+
     std::string out_dir = GetProjectRoot() + "/out/milestone_15";
     std::filesystem::create_directories(out_dir);
 
     std::ofstream frame_csv(out_dir + "/field_contact_split_merge_frames.csv");
     frame_csv << "frame,time,plane_y,patch_count,newborn_count,merge_count,split_count,death_count,"
               << "max_source_count,max_previous_reuse,total_force_x,total_force_y,total_force_z,"
-              << "total_torque_x,total_torque_y,total_torque_z,force_jump,torque_jump,max_tangent_ratio,"
-              << "max_energy_gate_ratio,max_inherited_energy_ratio" << std::endl;
+              << "total_torque_x,total_torque_y,total_torque_z,guide_force_x,guide_force_y,guide_force_z,"
+              << "body_x,body_y,body_z,desired_x,desired_y,tracking_error,force_jump,torque_jump,"
+              << "max_tangent_ratio,max_energy_gate_ratio,max_inherited_energy_ratio" << std::endl;
 
     std::ofstream patch_csv(out_dir + "/field_contact_split_merge_patches.csv");
     patch_csv << "frame,time,patch_index,persistent_id,event,area,center_x,center_y,center_z,"
@@ -328,23 +352,35 @@ int main(int argc, char* argv[]) {
     double max_inherited_energy_ratio_all = 0.0;
     double max_force_jump = 0.0;
     double max_torque_jump = 0.0;
+    double max_tracking_error = 0.0;
+    double max_contact_force = 0.0;
+    double max_guide_force = 0.0;
     ChVector3d previous_total_force(0, 0, 0);
     ChVector3d previous_total_torque(0, 0, 0);
 
     for (int frame = 0; frame < frame_count; frame++) {
+        plane_body->EmptyAccumulator(accumulator_id);
+
         double time = frame * dt;
         double phase = time / total_time;
-        double y = PlaneHeight(phase, y_high, y_low);
-        double ydot = PlaneHeightDt(phase, total_time, y_high, y_low);
-        double x = 0.035 * std::sin(2.0 * M_PI * phase);
-        double xdot = 0.035 * (2.0 * M_PI / total_time) * std::cos(2.0 * M_PI * phase);
-        ChVector3d body_pos(x, y, 0);
-        ChVector3d body_vel(xdot, ydot, 0);
+        double desired_y = PlaneHeight(phase, y_high, y_low);
+        double desired_ydot = PlaneHeightDt(phase, total_time, y_high, y_low);
+        double desired_x = 0.035 * std::sin(2.0 * M_PI * phase);
+        double desired_xdot = 0.035 * (2.0 * M_PI / total_time) * std::cos(2.0 * M_PI * phase);
+        ChVector3d desired_pos(desired_x, desired_y, 0);
+        ChVector3d desired_vel(desired_xdot, desired_ydot, 0);
+
+        ChVector3d body_pos = plane_body->GetPos();
+        ChQuaterniond body_rot = plane_body->GetRot();
+        ChVector3d body_vel = plane_body->GetPosDt();
+        ChVector3d body_omega = body_rot.Rotate(plane_body->GetAngVelLocal());
 
         std::vector<FieldSampleQuery> queries(plane_graph.samples.size());
         for (size_t si = 0; si < plane_graph.samples.size(); si++) {
-            ChVector3d world_pos = body_pos + plane_graph.samples[si].local_pos;
-            queries[si] = target_sdf.Query(world_pos, body_vel);
+            ChVector3d sample_offset = body_rot.Rotate(plane_graph.samples[si].local_pos);
+            ChVector3d world_pos = body_pos + sample_offset;
+            ChVector3d world_vel = body_vel + body_omega.Cross(sample_offset);
+            queries[si] = target_sdf.Query(world_pos, world_vel);
         }
 
         std::vector<int> active = BuildActiveSet(queries, extract_settings.activation_band);
@@ -532,6 +568,15 @@ int main(int argc, char* argv[]) {
                       << (tangential.state == StickSlipState::Stick ? "stick" : "slip") << std::endl;
         }
 
+        ChVector3d guide_force = guide_kp * (desired_pos - body_pos) + guide_kd * (desired_vel - body_vel);
+        ChVector3d guide_torque = -angular_damping * body_omega;
+        if ((total_force + guide_force).Length() > 1.0e-12) {
+            plane_body->AccumulateForce(accumulator_id, total_force + guide_force, body_pos, false);
+        }
+        if ((total_torque + guide_torque).Length() > 1.0e-12) {
+            plane_body->AccumulateTorque(accumulator_id, total_torque + guide_torque, false);
+        }
+
         double force_jump = frame > 0 ? (total_force - previous_total_force).Length() : 0.0;
         double torque_jump = frame > 0 ? (total_torque - previous_total_torque).Length() : 0.0;
         previous_total_force = total_force;
@@ -545,6 +590,9 @@ int main(int argc, char* argv[]) {
         max_inherited_energy_ratio_all = std::max(max_inherited_energy_ratio_all, max_inherited_energy_ratio);
         max_force_jump = std::max(max_force_jump, force_jump);
         max_torque_jump = std::max(max_torque_jump, torque_jump);
+        max_tracking_error = std::max(max_tracking_error, (body_pos - desired_pos).Length());
+        max_contact_force = std::max(max_contact_force, total_force.Length());
+        max_guide_force = std::max(max_guide_force, guide_force.Length());
         if (patches.size() == 1) {
             frames_with_one++;
         }
@@ -561,7 +609,7 @@ int main(int argc, char* argv[]) {
         frame_csv << frame << ","
                   << std::fixed << std::setprecision(8)
                   << time << ","
-                  << y << ","
+                  << body_pos.y() << ","
                   << patches.size() << ","
                   << newborn_count << ","
                   << merge_count << ","
@@ -575,6 +623,15 @@ int main(int argc, char* argv[]) {
                   << total_torque.x() << ","
                   << total_torque.y() << ","
                   << total_torque.z() << ","
+                  << guide_force.x() << ","
+                  << guide_force.y() << ","
+                  << guide_force.z() << ","
+                  << body_pos.x() << ","
+                  << body_pos.y() << ","
+                  << body_pos.z() << ","
+                  << desired_x << ","
+                  << desired_y << ","
+                  << (body_pos - desired_pos).Length() << ","
                   << force_jump << ","
                   << torque_jump << ","
                   << max_tangent_ratio << ","
@@ -583,6 +640,7 @@ int main(int argc, char* argv[]) {
 
         previous_snapshots = current_snapshots;
         history_store = new_history_store;
+        sys.DoStepDynamics(dt);
     }
 
     frame_csv.close();
@@ -611,6 +669,10 @@ int main(int argc, char* argv[]) {
             << "max_tangential_force_ratio," << max_tangent_ratio_all << std::endl
             << "max_energy_gate_ratio," << max_energy_gate_ratio_all << std::endl
             << "max_inherited_energy_ratio," << max_inherited_energy_ratio_all << std::endl
+            << "max_tracking_error," << max_tracking_error << std::endl
+            << "max_contact_force," << max_contact_force << std::endl
+            << "max_guide_force," << max_guide_force << std::endl
+            << "final_body_y," << plane_body->GetPos().y() << std::endl
             << "max_force_jump," << max_force_jump << std::endl
             << "max_torque_jump," << max_torque_jump << std::endl;
     summary.close();

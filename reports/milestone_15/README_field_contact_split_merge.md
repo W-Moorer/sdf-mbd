@@ -11,11 +11,13 @@ primitive implementation.
 
 - Target field: OpenVDB narrow-band SDF built from two overlapping triangulated
   sphere meshes.
-- Moving surface: triangulated plane surface graph with vertex area weights and
-  edge adjacency.
-- Motion: the plane height follows a down-up trajectory. At high position the
-  active contact set has two disconnected components; at lower position the two
-  components merge; when the plane rises again, the merged component splits.
+- Moving body: a Chrono `ChBody` carrying a triangulated plane surface graph
+  with vertex area weights and edge adjacency.
+- Force coupling: primitive normal/tangential force and torque are accumulated
+  into the moving body with `AccumulateForce` and `AccumulateTorque`.
+- Motion: a low-frequency PD guide force drives the body through a down-up
+  trajectory, while the actual body position and velocity are integrated by
+  Chrono and perturbed by the primitive contact force.
 
 This produces a true runtime topology sequence:
 
@@ -32,14 +34,14 @@ manual event injection.
 
 ## Current Results
 
-- frames: 800
+- frames: 1600
 - plane vertices: 5376
 - plane faces: 10450
 - target vertices: 12324
 - target faces: 24640
 - target SDF active voxels: 340649
-- frames with one patch: 367
-- frames with two patches: 433
+- frames with one patch: 716
+- frames with two patches: 884
 - frames with merge: 1
 - frames with split: 1
 - total newborn primitives: 2
@@ -47,18 +49,21 @@ manual event injection.
 - max source count: 2
 - max previous reuse: 2
 - max tangential force ratio: 1.0
+- max tracking error: about 0.007 m
+- max contact force: about 5.62e4 N
+- max guide force: about 5.64e4 N
 
 Event frames:
 
-- Frame 258: merge. One current primitive inherits from two previous sources:
-  `0:0.4994;1:0.4945`.
-- Frame 625: split. Two current primitives inherit from the previous merged
-  primitive with weight about `0.4938` each.
+- Frame 524: merge. One current primitive inherits from two previous sources:
+  `1:0.4988;0:0.4951`.
+- Frame 1240: split. Two current primitives inherit from the previous merged
+  primitive with weights about `0.5144` and `0.4782`.
 
 Energy checks:
 
-- Merge inherited-energy ratio: about `0.9779`.
-- Split inherited-energy ratio: about `0.4938` for each child.
+- Merge inherited-energy ratio: about `0.9937`.
+- Split inherited-energy ratios: about `0.5144` and `0.4782`.
 
 These ratios are relative to the weighted source-history energy bound. Values
 below one verify that overlap inheritance does not amplify stored tangential
@@ -67,7 +72,8 @@ history through the split/merge transition.
 ## Interpretation
 
 This is the first demo where the TeX paper's persistent primitive history model
-is exercised by an actual topology change. The implementation now demonstrates:
+is exercised by an actual topology change inside a Chrono force-accumulation
+loop. The implementation now demonstrates:
 
 - active-set connectivity can naturally create split/merge primitive events;
 - merge can aggregate two previous tangential histories;
@@ -75,11 +81,14 @@ is exercised by an actual topology change. The implementation now demonstrates:
   assigning unique current persistent IDs;
 - inherited history weights remain bounded;
 - tangential force remains inside the Coulomb disk.
+- primitive contact force and torque enter the rigid-body dynamics through the
+  same accumulator path used by the earlier SDF contact demos.
 
 ## Remaining Work
 
 - Add external mesh asset loading instead of generated meshes.
 - Add bidirectional split/merge de-duplication across both bodies.
-- Convert this kinematic demo into a Chrono body-pair force accumulation demo.
+- Replace the guide force with a controlled actuator or an unconstrained
+  benchmark once the contact law is ready for full dynamics validation.
 - Add automated regression tests for objectivity, Coulomb feasibility,
   non-amplification, and split/merge event classification.
