@@ -23,6 +23,7 @@
 #define CH_FIELD_CONTACT_RUNTIME_H
 
 #include <algorithm>
+#include <cmath>
 #include <map>
 #include <set>
 #include <vector>
@@ -125,6 +126,41 @@ struct FieldContactPairResult {
     double max_tangential_force_ratio = 0.0;
     bool used_a_to_b = false;
     bool used_b_to_a = false;
+};
+
+struct FieldContactTopologyMetricsSummary {
+    int frames = 0;
+    int active_frames = 0;
+    int total_patch_count = 0;
+    int max_patch_count = 0;
+    int total_newborn = 0;
+    int total_death = 0;
+    int total_merge_patches = 0;
+    int total_split_patches = 0;
+    int total_stick_slip_switches = 0;
+    int max_source_count = 0;
+    int max_previous_reuse = 0;
+    int max_abs_patch_count_change = 0;
+    double mean_patch_count = 0.0;
+    double mean_abs_patch_count_change = 0.0;
+    double primitive_persistence_ratio = 0.0;
+    double mean_source_weight_sum = 0.0;
+    double mean_normal_jump_angle = 0.0;
+    double rms_normal_jump_angle = 0.0;
+    double max_normal_jump_angle = 0.0;
+    double mean_force_jump = 0.0;
+    double rms_force_jump = 0.0;
+    double max_force_jump = 0.0;
+    double mean_torque_jump = 0.0;
+    double rms_torque_jump = 0.0;
+    double max_torque_jump = 0.0;
+    double max_force_norm = 0.0;
+    double max_torque_norm = 0.0;
+    double force_oscillation_index = 0.0;
+    double torque_oscillation_index = 0.0;
+    double max_tangential_force_ratio = 0.0;
+    double max_energy_gate_ratio = 0.0;
+    double max_inherited_energy_ratio = 0.0;
 };
 
 class FieldContactPrimitiveTracker {
@@ -343,6 +379,170 @@ class FieldContactPrimitiveTracker {
     int m_next_persistent_id = 0;
     std::vector<PrimitiveSnapshot> m_previous_snapshots;
     std::map<int, TangentialHistory> m_history_store;
+};
+
+class FieldContactTopologyMetricsAccumulator {
+  public:
+    void Reset() {
+        m_summary = FieldContactTopologyMetricsSummary();
+        m_has_previous_frame = false;
+        m_previous_patch_count = 0;
+        m_previous_total_force = ChVector3d(0, 0, 0);
+        m_previous_total_torque = ChVector3d(0, 0, 0);
+        m_current_patch_samples = 0;
+        m_matched_patch_samples = 0;
+        m_source_weight_sum = 0.0;
+        m_source_weight_samples = 0;
+        m_count_change_sum = 0.0;
+        m_count_change_samples = 0;
+        m_normal_jump_sum = 0.0;
+        m_normal_jump_sq_sum = 0.0;
+        m_normal_jump_samples = 0;
+        m_force_jump_sum = 0.0;
+        m_force_jump_sq_sum = 0.0;
+        m_force_jump_samples = 0;
+        m_torque_jump_sum = 0.0;
+        m_torque_jump_sq_sum = 0.0;
+        m_torque_jump_samples = 0;
+        m_previous_stick_slip.clear();
+    }
+
+    void Accumulate(const FieldContactStepResult& step) {
+        m_summary.frames++;
+        if (step.stats.patch_count > 0) {
+            m_summary.active_frames++;
+        }
+
+        m_summary.total_patch_count += step.stats.patch_count;
+        m_summary.max_patch_count = std::max(m_summary.max_patch_count, step.stats.patch_count);
+        m_summary.total_newborn += step.stats.newborn_count;
+        m_summary.total_death += step.stats.death_count;
+        m_summary.total_merge_patches += step.stats.merge_count;
+        m_summary.total_split_patches += step.stats.split_count;
+        m_summary.max_source_count = std::max(m_summary.max_source_count, step.stats.max_source_count);
+        m_summary.max_previous_reuse = std::max(m_summary.max_previous_reuse, step.stats.max_previous_reuse);
+        m_summary.max_tangential_force_ratio =
+            std::max(m_summary.max_tangential_force_ratio, step.stats.max_tangential_force_ratio);
+        m_summary.max_energy_gate_ratio =
+            std::max(m_summary.max_energy_gate_ratio, step.stats.max_energy_gate_ratio);
+        m_summary.max_inherited_energy_ratio =
+            std::max(m_summary.max_inherited_energy_ratio, step.stats.max_inherited_energy_ratio);
+
+        m_current_patch_samples += step.stats.patch_count;
+        std::map<int, StickSlipState> current_stick_slip;
+
+        for (const auto& patch_result : step.patches) {
+            if (!patch_result.sources.empty()) {
+                m_matched_patch_samples++;
+                m_source_weight_sum += patch_result.source_weight_sum;
+                m_source_weight_samples++;
+
+                double angle = std::acos(ClampSigned(patch_result.sources.front().normal_dot));
+                m_normal_jump_sum += angle;
+                m_normal_jump_sq_sum += angle * angle;
+                m_normal_jump_samples++;
+                m_summary.max_normal_jump_angle = std::max(m_summary.max_normal_jump_angle, angle);
+            }
+
+            if (patch_result.persistent_id >= 0) {
+                auto previous_state = m_previous_stick_slip.find(patch_result.persistent_id);
+                if (previous_state != m_previous_stick_slip.end() &&
+                    previous_state->second != patch_result.tangential.state) {
+                    m_summary.total_stick_slip_switches++;
+                }
+                current_stick_slip[patch_result.persistent_id] = patch_result.tangential.state;
+            }
+        }
+
+        if (m_has_previous_frame) {
+            int count_change = std::abs(step.stats.patch_count - m_previous_patch_count);
+            m_count_change_sum += static_cast<double>(count_change);
+            m_count_change_samples++;
+            m_summary.max_abs_patch_count_change =
+                std::max(m_summary.max_abs_patch_count_change, count_change);
+
+            double force_jump = (step.total_force - m_previous_total_force).Length();
+            m_force_jump_sum += force_jump;
+            m_force_jump_sq_sum += force_jump * force_jump;
+            m_force_jump_samples++;
+            m_summary.max_force_jump = std::max(m_summary.max_force_jump, force_jump);
+
+            double torque_jump = (step.total_torque - m_previous_total_torque).Length();
+            m_torque_jump_sum += torque_jump;
+            m_torque_jump_sq_sum += torque_jump * torque_jump;
+            m_torque_jump_samples++;
+            m_summary.max_torque_jump = std::max(m_summary.max_torque_jump, torque_jump);
+        }
+
+        m_summary.max_force_norm = std::max(m_summary.max_force_norm, step.total_force.Length());
+        m_summary.max_torque_norm = std::max(m_summary.max_torque_norm, step.total_torque.Length());
+
+        m_previous_patch_count = step.stats.patch_count;
+        m_previous_total_force = step.total_force;
+        m_previous_total_torque = step.total_torque;
+        m_previous_stick_slip = current_stick_slip;
+        m_has_previous_frame = true;
+    }
+
+    FieldContactTopologyMetricsSummary GetSummary() const {
+        FieldContactTopologyMetricsSummary out = m_summary;
+        if (out.frames > 0) {
+            out.mean_patch_count = static_cast<double>(out.total_patch_count) / static_cast<double>(out.frames);
+        }
+        if (m_count_change_samples > 0) {
+            out.mean_abs_patch_count_change = m_count_change_sum / static_cast<double>(m_count_change_samples);
+        }
+        if (m_current_patch_samples > 0) {
+            out.primitive_persistence_ratio =
+                static_cast<double>(m_matched_patch_samples) / static_cast<double>(m_current_patch_samples);
+        }
+        if (m_source_weight_samples > 0) {
+            out.mean_source_weight_sum = m_source_weight_sum / static_cast<double>(m_source_weight_samples);
+        }
+        if (m_normal_jump_samples > 0) {
+            out.mean_normal_jump_angle = m_normal_jump_sum / static_cast<double>(m_normal_jump_samples);
+            out.rms_normal_jump_angle =
+                std::sqrt(m_normal_jump_sq_sum / static_cast<double>(m_normal_jump_samples));
+        }
+        if (m_force_jump_samples > 0) {
+            out.mean_force_jump = m_force_jump_sum / static_cast<double>(m_force_jump_samples);
+            out.rms_force_jump = std::sqrt(m_force_jump_sq_sum / static_cast<double>(m_force_jump_samples));
+            if (out.max_force_norm > 1.0e-14) {
+                out.force_oscillation_index = out.rms_force_jump / out.max_force_norm;
+            }
+        }
+        if (m_torque_jump_samples > 0) {
+            out.mean_torque_jump = m_torque_jump_sum / static_cast<double>(m_torque_jump_samples);
+            out.rms_torque_jump = std::sqrt(m_torque_jump_sq_sum / static_cast<double>(m_torque_jump_samples));
+            if (out.max_torque_norm > 1.0e-14) {
+                out.torque_oscillation_index = out.rms_torque_jump / out.max_torque_norm;
+            }
+        }
+        return out;
+    }
+
+  private:
+    FieldContactTopologyMetricsSummary m_summary;
+    bool m_has_previous_frame = false;
+    int m_previous_patch_count = 0;
+    ChVector3d m_previous_total_force = ChVector3d(0, 0, 0);
+    ChVector3d m_previous_total_torque = ChVector3d(0, 0, 0);
+    int m_current_patch_samples = 0;
+    int m_matched_patch_samples = 0;
+    double m_source_weight_sum = 0.0;
+    int m_source_weight_samples = 0;
+    double m_count_change_sum = 0.0;
+    int m_count_change_samples = 0;
+    double m_normal_jump_sum = 0.0;
+    double m_normal_jump_sq_sum = 0.0;
+    int m_normal_jump_samples = 0;
+    double m_force_jump_sum = 0.0;
+    double m_force_jump_sq_sum = 0.0;
+    int m_force_jump_samples = 0;
+    double m_torque_jump_sum = 0.0;
+    double m_torque_jump_sq_sum = 0.0;
+    int m_torque_jump_samples = 0;
+    std::map<int, StickSlipState> m_previous_stick_slip;
 };
 
 inline ChVector3d EstimateFieldContactApplicationPoint(const FieldContactStepResult& step,

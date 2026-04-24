@@ -96,6 +96,30 @@ FieldContactStepResult MakeOneSidedPairStep(const ChVector3d& force,
     return step;
 }
 
+FieldContactPatchRuntimeResult MakeMetricsPatch(int persistent_id,
+                                                FieldContactPrimitiveEvent event,
+                                                StickSlipState state,
+                                                double source_weight,
+                                                double normal_jump_angle) {
+    FieldContactPatchRuntimeResult patch_result;
+    patch_result.persistent_id = persistent_id;
+    patch_result.event = event;
+    patch_result.patch.area = 1.0;
+    patch_result.patch.normal = ChVector3d(0, 1, 0);
+    patch_result.tangential.state = state;
+
+    if (source_weight > 0.0) {
+        HistorySource source;
+        source.persistent_id = 0;
+        source.weight = source_weight;
+        source.normal_dot = std::cos(normal_jump_angle);
+        patch_result.sources.push_back(source);
+        patch_result.source_weight_sum = source_weight;
+    }
+
+    return patch_result;
+}
+
 ChVector3d ProjectionOnlyTransport(const ChVector3d& xi_elastic_world_prev, const ChVector3d& normal_cur) {
     return ProjectToTangent(xi_elastic_world_prev, SafeNormalize(normal_cur, ChVector3d(0, 1, 0)));
 }
@@ -395,6 +419,66 @@ TEST(FieldContactPrimitives, MinimalRotationTransportBeatsProjectionOnlyTranspor
     ASSERT_GE(projection_error_ratio, 0.10);
     ASSERT_LT(projection_energy_ratio, 0.90);
     ASSERT_GT(projection_error_ratio, 1.0e8 * std::max(minimal_error_ratio, 1.0e-16));
+}
+
+TEST(FieldContactPrimitives, TopologyConsistencyMetricsAccumulator) {
+    FieldContactTopologyMetricsAccumulator metrics;
+
+    FieldContactStepResult step0;
+    step0.stats.patch_count = 1;
+    step0.stats.newborn_count = 1;
+    step0.patches.push_back(MakeMetricsPatch(0, FieldContactPrimitiveEvent::Newborn, StickSlipState::Stick, 0.0, 0.0));
+    step0.total_force = ChVector3d(10, 0, 0);
+    step0.total_torque = ChVector3d(0, 1, 0);
+    metrics.Accumulate(step0);
+
+    FieldContactStepResult step1;
+    step1.stats.patch_count = 1;
+    step1.stats.max_source_count = 1;
+    step1.stats.max_tangential_force_ratio = 0.2;
+    step1.patches.push_back(MakeMetricsPatch(0, FieldContactPrimitiveEvent::Stable, StickSlipState::Slip, 0.9, 0.1));
+    step1.total_force = ChVector3d(12, 0, 0);
+    step1.total_torque = ChVector3d(0, 1.5, 0);
+    metrics.Accumulate(step1);
+
+    FieldContactStepResult step2;
+    step2.stats.patch_count = 2;
+    step2.stats.split_count = 2;
+    step2.stats.max_source_count = 1;
+    step2.stats.max_previous_reuse = 2;
+    step2.stats.max_tangential_force_ratio = 0.3;
+    step2.patches.push_back(
+        MakeMetricsPatch(0, FieldContactPrimitiveEvent::SplitPrimary, StickSlipState::Slip, 0.6, 0.2));
+    step2.patches.push_back(
+        MakeMetricsPatch(1, FieldContactPrimitiveEvent::Split, StickSlipState::Stick, 0.3, 0.3));
+    step2.total_force = ChVector3d(13, 1, 0);
+    step2.total_torque = ChVector3d(0, 1.2, 0);
+    metrics.Accumulate(step2);
+
+    FieldContactTopologyMetricsSummary summary = metrics.GetSummary();
+
+    ASSERT_EQ(summary.frames, 3);
+    ASSERT_EQ(summary.active_frames, 3);
+    ASSERT_EQ(summary.total_patch_count, 4);
+    ASSERT_EQ(summary.max_patch_count, 2);
+    ASSERT_EQ(summary.total_newborn, 1);
+    ASSERT_EQ(summary.total_split_patches, 2);
+    ASSERT_EQ(summary.total_stick_slip_switches, 1);
+    ASSERT_NEAR(summary.mean_patch_count, 4.0 / 3.0, 1.0e-12);
+    ASSERT_NEAR(summary.mean_abs_patch_count_change, 0.5, 1.0e-12);
+    ASSERT_EQ(summary.max_abs_patch_count_change, 1);
+    ASSERT_NEAR(summary.primitive_persistence_ratio, 0.75, 1.0e-12);
+    ASSERT_NEAR(summary.mean_source_weight_sum, 0.6, 1.0e-12);
+    ASSERT_NEAR(summary.mean_normal_jump_angle, 0.2, 1.0e-12);
+    ASSERT_NEAR(summary.rms_normal_jump_angle, std::sqrt(0.14 / 3.0), 1.0e-12);
+    ASSERT_NEAR(summary.max_normal_jump_angle, 0.3, 1.0e-12);
+    ASSERT_NEAR(summary.mean_force_jump, (2.0 + std::sqrt(2.0)) / 2.0, 1.0e-12);
+    ASSERT_NEAR(summary.rms_force_jump, std::sqrt(3.0), 1.0e-12);
+    ASSERT_NEAR(summary.max_force_jump, 2.0, 1.0e-12);
+    ASSERT_NEAR(summary.mean_torque_jump, 0.4, 1.0e-12);
+    ASSERT_NEAR(summary.rms_torque_jump, std::sqrt(0.17), 1.0e-12);
+    ASSERT_NEAR(summary.max_torque_jump, 0.5, 1.0e-12);
+    ASSERT_NEAR(summary.max_tangential_force_ratio, 0.3, 1.0e-12);
 }
 
 TEST(FieldContactPrimitives, BidirectionalPairConservesAndDeduplicatesForces) {

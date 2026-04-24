@@ -309,6 +309,7 @@ int main(int argc, char* argv[]) {
     contact_settings.tangential = tangential_settings;
     contact_settings.inheritance = inheritance_settings;
     FieldContactPrimitiveTracker contact_tracker;
+    FieldContactTopologyMetricsAccumulator topology_metrics;
 
     ChSystemSMC sys;
     sys.SetGravitationalAcceleration(ChVector3d(0, 0, 0));
@@ -394,6 +395,7 @@ int main(int argc, char* argv[]) {
 
         FieldContactStepResult contact_step =
             contact_tracker.Evaluate(plane_graph, queries, body_pos, contact_settings);
+        topology_metrics.Accumulate(contact_step);
 
         const auto& stats = contact_step.stats;
         int newborn_count = stats.newborn_count;
@@ -520,6 +522,8 @@ int main(int argc, char* argv[]) {
     frame_csv.close();
     patch_csv.close();
 
+    FieldContactTopologyMetricsSummary topology_summary = topology_metrics.GetSummary();
+
     std::ofstream summary(out_dir + "/field_contact_split_merge_summary.csv");
     summary << "metric,value" << std::endl;
     summary << std::fixed << std::setprecision(8)
@@ -548,7 +552,24 @@ int main(int argc, char* argv[]) {
             << "max_guide_force," << max_guide_force << std::endl
             << "final_body_y," << plane_body->GetPos().y() << std::endl
             << "max_force_jump," << max_force_jump << std::endl
-            << "max_torque_jump," << max_torque_jump << std::endl;
+            << "max_torque_jump," << max_torque_jump << std::endl
+            << "topology_active_frames," << topology_summary.active_frames << std::endl
+            << "topology_mean_patch_count," << topology_summary.mean_patch_count << std::endl
+            << "topology_primitive_persistence_ratio," << topology_summary.primitive_persistence_ratio << std::endl
+            << "topology_mean_source_weight_sum," << topology_summary.mean_source_weight_sum << std::endl
+            << "topology_mean_abs_patch_count_change," << topology_summary.mean_abs_patch_count_change << std::endl
+            << "topology_max_abs_patch_count_change," << topology_summary.max_abs_patch_count_change << std::endl
+            << "topology_rms_normal_jump_angle," << topology_summary.rms_normal_jump_angle << std::endl
+            << "topology_max_normal_jump_angle," << topology_summary.max_normal_jump_angle << std::endl
+            << "topology_mean_force_jump," << topology_summary.mean_force_jump << std::endl
+            << "topology_rms_force_jump," << topology_summary.rms_force_jump << std::endl
+            << "topology_max_force_jump," << topology_summary.max_force_jump << std::endl
+            << "topology_force_oscillation_index," << topology_summary.force_oscillation_index << std::endl
+            << "topology_mean_torque_jump," << topology_summary.mean_torque_jump << std::endl
+            << "topology_rms_torque_jump," << topology_summary.rms_torque_jump << std::endl
+            << "topology_max_torque_jump," << topology_summary.max_torque_jump << std::endl
+            << "topology_torque_oscillation_index," << topology_summary.torque_oscillation_index << std::endl
+            << "topology_stick_slip_switches," << topology_summary.total_stick_slip_switches << std::endl;
     summary.close();
 
     std::cout << "Output:" << std::endl;
