@@ -22,7 +22,7 @@ set(DEMOS
 )
 
 # OpenVDB probe demo is built separately below if OpenVDB is found
-list(APPEND DEMOS_WITH_OPENVDB demo_CH_openvdb_probe demo_CH_sdf_point_contact_openvdb demo_CH_sdf_patch_contact_openvdb demo_CH_sdf_patch_force_openvdb demo_CH_sdf_patch_persistence_openvdb demo_CH_sdf_patch_constitutive_openvdb demo_CH_sdf_patch_constitutive_cases_openvdb demo_CH_sdf_patch_constitutive_tangential_openvdb demo_CH_sdf_patch_constitutive_stickslip_openvdb demo_CH_sdf_patch_constitutive_frame_openvdb demo_CH_sdf_patch_constitutive_transport_limited_openvdb demo_CH_sdf_patch_transport_ablation_openvdb demo_CH_sdf_patch_adaptive_carryover_openvdb demo_CH_sdf_patch_tangential_history_v1_openvdb demo_CH_field_contact_primitives_openvdb demo_CH_field_contact_split_merge_openvdb demo_CH_field_contact_mesh_sdf_nonconvex_openvdb demo_CH_field_contact_matched_mesh_native_openvdb demo_CH_field_contact_free_dynamics_openvdb)
+list(APPEND DEMOS_WITH_OPENVDB demo_CH_openvdb_probe demo_CH_sdf_point_contact_openvdb demo_CH_sdf_patch_contact_openvdb demo_CH_sdf_patch_force_openvdb demo_CH_sdf_patch_persistence_openvdb demo_CH_sdf_patch_constitutive_openvdb demo_CH_sdf_patch_constitutive_cases_openvdb demo_CH_sdf_patch_constitutive_tangential_openvdb demo_CH_sdf_patch_constitutive_stickslip_openvdb demo_CH_sdf_patch_constitutive_frame_openvdb demo_CH_sdf_patch_constitutive_transport_limited_openvdb demo_CH_sdf_patch_transport_ablation_openvdb demo_CH_sdf_patch_adaptive_carryover_openvdb demo_CH_sdf_patch_tangential_history_v1_openvdb demo_CH_field_contact_primitives_openvdb demo_CH_field_contact_split_merge_openvdb demo_CH_field_contact_mesh_sdf_nonconvex_openvdb demo_CH_field_contact_matched_mesh_native_openvdb demo_CH_field_contact_free_dynamics_openvdb demo_CH_field_contact_cad_mesh_case_study_openvdb)
 
 #--------------------------------------------------------------
 
@@ -170,8 +170,24 @@ if(OpenVDB_FOUND)
                            LABELS "collision;field_contact;free_dynamics;acceptance"
                            FIXTURES_REQUIRED free_dynamics_response
                            TIMEOUT 60)
+
+      add_test(NAME demo_CH_field_contact_cad_mesh_case_study
+               COMMAND "$<TARGET_FILE:demo_CH_field_contact_cad_mesh_case_study_openvdb>")
+      set_tests_properties(demo_CH_field_contact_cad_mesh_case_study PROPERTIES
+                           LABELS "collision;field_contact;cad_mesh"
+                           FIXTURES_SETUP cad_mesh_case_study
+                           TIMEOUT 300)
+
+      add_test(NAME demo_CH_field_contact_cad_mesh_case_study_regression
+               COMMAND "${Python3_EXECUTABLE}"
+                       "${CMAKE_SOURCE_DIR}/scripts/check_cad_mesh_case_study.py"
+                       --project-root "${CMAKE_SOURCE_DIR}")
+      set_tests_properties(demo_CH_field_contact_cad_mesh_case_study_regression PROPERTIES
+                           LABELS "collision;field_contact;cad_mesh;acceptance"
+                           FIXTURES_REQUIRED cad_mesh_case_study
+                           TIMEOUT 60)
     else()
-      message(STATUS "Python3 interpreter not found - skipping matched mesh baseline regression test")
+      message(STATUS "Python3 interpreter not found - skipping OpenVDB field-contact regression tests")
     endif()
   endif()
 else()
