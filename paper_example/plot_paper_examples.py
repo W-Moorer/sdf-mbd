@@ -45,6 +45,16 @@ def col(rows, name):
     return [float(row[name]) for row in rows]
 
 
+def optional_col(rows, name):
+    values = []
+    for row in rows:
+        value = row.get(name, "")
+        if value == "":
+            return None
+        values.append(float(value))
+    return values
+
+
 def elastic_post(v1, v2, m1, m2):
     post_1 = ((m1 - m2) / (m1 + m2)) * v1 + (2.0 * m2 / (m1 + m2)) * v2
     post_2 = (2.0 * m1 / (m1 + m2)) * v1 + ((m2 - m1) / (m1 + m2)) * v2
@@ -158,13 +168,19 @@ def plot_headon_case(rows, model, case_name, output_dir):
 def plot_simple_gear_case(rows, case_name, output_dir):
     times = col(rows, "time")
     omega = col(rows, "backend_y")
-    reference = col(rows, "reference_y")
-    error = col(rows, "y_error")
+    analytic = col(rows, "reference_y")
+    recurdyn = optional_col(rows, "recurdyn_y")
+    error = [w - r for w, r in zip(omega, analytic)]
+    recurdyn_error = None
+    if recurdyn is not None:
+        recurdyn_error = [r - a for r, a in zip(recurdyn, analytic)]
     patch_count = col(rows, "patch_count")
 
     fig, axes = plt.subplots(4, 1, figsize=(9.0, 9.5), sharex=False)
     axes[0].plot(times, omega, label="backend dynamic", linewidth=1.6)
-    axes[0].plot(times, reference, "--", label="reference", linewidth=1.4)
+    axes[0].plot(times, analytic, "--", label="analytic -1 rad/s", linewidth=1.4)
+    if recurdyn is not None:
+        axes[0].plot(times, recurdyn, ":", label="RecurDyn", linewidth=1.4)
     axes[0].set_ylabel(r"GEAR22 $\omega_x$ (rad/s)")
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
@@ -172,14 +188,22 @@ def plot_simple_gear_case(rows, case_name, output_dir):
     zoom_rows = [i for i, time in enumerate(times) if time <= 0.05]
     axes[1].plot([times[i] for i in zoom_rows], [omega[i] for i in zoom_rows],
                  label="backend dynamic", linewidth=1.6)
-    axes[1].plot([times[i] for i in zoom_rows], [reference[i] for i in zoom_rows],
-                 "--", label="reference", linewidth=1.4)
+    axes[1].plot([times[i] for i in zoom_rows], [analytic[i] for i in zoom_rows],
+                 "--", label="analytic -1 rad/s", linewidth=1.4)
+    if recurdyn is not None:
+        axes[1].plot([times[i] for i in zoom_rows], [recurdyn[i] for i in zoom_rows],
+                     ":", label="RecurDyn", linewidth=1.4)
     axes[1].set_ylabel(r"0-0.05 s $\omega_x$")
+    axes[1].legend()
     axes[1].grid(True, alpha=0.3)
 
-    axes[2].plot(times, error, color="#b7410e", linewidth=1.2)
+    axes[2].plot(times, error, color="#b7410e", linewidth=1.2, label="backend - analytic")
+    if recurdyn_error is not None:
+        axes[2].plot(times, recurdyn_error, color="#4c78a8", linestyle=":", linewidth=1.2,
+                     label="RecurDyn - analytic")
     axes[2].axhline(0.0, color="black", linewidth=0.8)
-    axes[2].set_ylabel("error (rad/s)")
+    axes[2].set_ylabel("error vs analytic (rad/s)")
+    axes[2].legend()
     axes[2].grid(True, alpha=0.3)
 
     axes[3].step(times, patch_count, where="post", color="#2f6f4e", linewidth=1.2)

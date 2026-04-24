@@ -92,12 +92,12 @@
       ],
       "checks": [
         {
-          "quantity": "gear22_rx_final",
-          "tolerance": 0.02
+          "quantity": "gear22_rx_analytic_final",
+          "tolerance": 0.09
         },
         {
-          "quantity": "gear22_rx_rms_t_ge_0p02",
-          "tolerance": 0.09
+          "quantity": "gear22_rx_analytic_rms_t_ge_0p02",
+          "tolerance": 0.05
         },
         {
           "quantity": "gear22_rx_max_jump_t_ge_0p02",
