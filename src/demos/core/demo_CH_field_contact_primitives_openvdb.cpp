@@ -38,14 +38,14 @@
 
 #include <openvdb/openvdb.h>
 #include <openvdb/tools/Interpolation.h>
-#include <openvdb/tools/LevelSetSphere.h>
+#include <openvdb/tools/MeshToVolume.h>
 
 using namespace chrono;
 using namespace chrono::fieldcontact;
 
 namespace {
 
-struct OpenVDBSphereSDF {
+struct OpenVDBSDF {
     openvdb::FloatGrid::Ptr grid;
     ChVector3d center = ChVector3d(0, 0, 0);
     double voxel_size = 0.02;
@@ -83,6 +83,85 @@ static ChVector3d RotateZ(const ChVector3d& v, double angle) {
     return ChVector3d(c * v.x() - s * v.y(), s * v.x() + c * v.y(), v.z());
 }
 
+struct DemoTriangleMesh {
+    std::vector<ChVector3d> vertices;
+    std::vector<TriangleFace> faces;
+};
+
+static DemoTriangleMesh BuildTriangulatedSphereMesh(double radius, int n_latitude, int n_longitude) {
+    DemoTriangleMesh mesh;
+    if (radius <= 0.0 || n_latitude < 3 || n_longitude < 3) {
+        return mesh;
+    }
+
+    mesh.vertices.reserve(2 + static_cast<size_t>((n_latitude - 1) * n_longitude));
+    mesh.faces.reserve(static_cast<size_t>(2 * n_longitude * (n_latitude - 1)));
+
+    int north = static_cast<int>(mesh.vertices.size());
+    mesh.vertices.push_back(ChVector3d(0, radius, 0));
+
+    auto ring_index = [n_longitude](int ring, int j) {
+        return 1 + (ring - 1) * n_longitude + ((j + n_longitude) % n_longitude);
+    };
+
+    for (int i = 1; i < n_latitude; i++) {
+        double theta = M_PI * static_cast<double>(i) / static_cast<double>(n_latitude);
+        for (int j = 0; j < n_longitude; j++) {
+            double phi = 2.0 * M_PI * static_cast<double>(j) / static_cast<double>(n_longitude);
+            mesh.vertices.push_back(ChVector3d(radius * std::sin(theta) * std::cos(phi),
+                                               radius * std::cos(theta),
+                                               radius * std::sin(theta) * std::sin(phi)));
+        }
+    }
+
+    int south = static_cast<int>(mesh.vertices.size());
+    mesh.vertices.push_back(ChVector3d(0, -radius, 0));
+
+    for (int j = 0; j < n_longitude; j++) {
+        mesh.faces.push_back({north, ring_index(1, j + 1), ring_index(1, j)});
+    }
+
+    for (int i = 1; i < n_latitude - 1; i++) {
+        for (int j = 0; j < n_longitude; j++) {
+            int a = ring_index(i, j);
+            int b = ring_index(i, j + 1);
+            int c = ring_index(i + 1, j);
+            int d = ring_index(i + 1, j + 1);
+            mesh.faces.push_back({a, b, d});
+            mesh.faces.push_back({a, d, c});
+        }
+    }
+
+    for (int j = 0; j < n_longitude; j++) {
+        mesh.faces.push_back({ring_index(n_latitude - 1, j), ring_index(n_latitude - 1, j + 1), south});
+    }
+
+    return mesh;
+}
+
+static openvdb::FloatGrid::Ptr BuildLevelSetFromTriangleMesh(const DemoTriangleMesh& mesh,
+                                                             double voxel_size,
+                                                             float half_width_voxels) {
+    std::vector<openvdb::Vec3s> points;
+    std::vector<openvdb::Vec3I> triangles;
+    points.reserve(mesh.vertices.size());
+    triangles.reserve(mesh.faces.size());
+
+    for (const auto& v : mesh.vertices) {
+        points.emplace_back(static_cast<float>(v.x()), static_cast<float>(v.y()), static_cast<float>(v.z()));
+    }
+
+    for (const auto& face : mesh.faces) {
+        triangles.emplace_back(face.v0, face.v1, face.v2);
+    }
+
+    auto transform = openvdb::math::Transform::createLinearTransform(voxel_size);
+    auto grid = openvdb::tools::meshToLevelSet<openvdb::FloatGrid>(
+        *transform, points, triangles, half_width_voxels);
+    grid->setGridClass(openvdb::GRID_LEVEL_SET);
+    return grid;
+}
+
 static std::string GetProjectRoot() {
     auto path = std::filesystem::current_path();
     for (int i = 0; i < 3; i++) {
@@ -99,6 +178,18 @@ static double SumHistoryWeights(const std::vector<HistorySource>& sources) {
     return sum;
 }
 
+static FieldSampleQuery QueryLocalSDFInMovingFrame(const OpenVDBSDF& sdf,
+                                                   const ChVector3d& world_pos,
+                                                   const ChVector3d& body_pos,
+                                                   double body_angle) {
+    ChVector3d local_pos = RotateZ(world_pos - body_pos, -body_angle);
+    FieldSampleQuery query = sdf.Query(local_pos, ChVector3d(0, 0, 0));
+    query.world_pos = world_pos;
+    query.world_vel = ChVector3d(0, 0, 0);
+    query.grad = RotateZ(query.grad, body_angle);
+    return query;
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -112,17 +203,20 @@ int main(int argc, char* argv[]) {
     const double dt = 0.002;
     const int frame_count = 420;
 
-    OpenVDBSphereSDF sdf;
+    DemoTriangleMesh target_mesh = BuildTriangulatedSphereMesh(target_radius, 64, 128);
+    DemoTriangleMesh moving_mesh = BuildTriangulatedSphereMesh(moving_radius, 48, 96);
+    SurfaceGraph target_graph = MakeTriangleMeshSurfaceGraph(target_mesh.vertices, target_mesh.faces);
+    SurfaceGraph graph = MakeTriangleMeshSurfaceGraph(moving_mesh.vertices, moving_mesh.faces);
+
+    OpenVDBSDF sdf;
     sdf.center = ChVector3d(0, 0, 0);
     sdf.voxel_size = voxel_size;
-    sdf.grid = openvdb::tools::createLevelSetSphere<openvdb::FloatGrid>(
-        static_cast<float>(target_radius),
-        openvdb::Vec3f(0.0f, 0.0f, 0.0f),
-        static_cast<float>(voxel_size),
-        4.0f);
-    sdf.grid->setGridClass(openvdb::GRID_LEVEL_SET);
+    sdf.grid = BuildLevelSetFromTriangleMesh(target_mesh, voxel_size, 4.0f);
 
-    SurfaceGraph graph = MakeSphereSurfaceGraph(moving_radius, 48, 96);
+    OpenVDBSDF moving_sdf;
+    moving_sdf.center = ChVector3d(0, 0, 0);
+    moving_sdf.voxel_size = voxel_size;
+    moving_sdf.grid = BuildLevelSetFromTriangleMesh(moving_mesh, voxel_size, 4.0f);
 
     PatchExtractionSettings extract_settings;
     extract_settings.activation_band = 0.02;
@@ -148,7 +242,7 @@ int main(int argc, char* argv[]) {
     std::string out_dir = GetProjectRoot() + "/out/milestone_14";
     std::filesystem::create_directories(out_dir);
     std::ofstream csv(out_dir + "/field_contact_primitives_core.csv");
-    csv << "frame,time,patch_count,active_area,total_force_x,total_force_y,total_force_z,"
+    csv << "frame,time,patch_count,active_area,reverse_patch_count,reverse_active_area,total_force_x,total_force_y,total_force_z,"
         << "total_torque_x,total_torque_y,total_torque_z,main_persistent_id,main_area,"
         << "main_overlap_gate,main_normal_force,main_tangential_force,main_friction_limit,"
         << "main_stick_slip,history_energy_before_gate,history_energy_after_gate" << std::endl;
@@ -161,6 +255,8 @@ int main(int argc, char* argv[]) {
     double min_overlap_gate = 1.0;
     int total_newborn = 0;
     int total_patch_frames = 0;
+    int total_reverse_patch_frames = 0;
+    int multi_source_history_events = 0;
 
     for (int frame = 0; frame < frame_count; frame++) {
         double time = frame * dt;
@@ -186,9 +282,19 @@ int main(int argc, char* argv[]) {
         std::vector<int> active = BuildActiveSet(queries, extract_settings.activation_band);
         std::vector<PrimitivePatch> patches = ExtractPrimitives(graph, queries, active, extract_settings);
 
+        std::vector<FieldSampleQuery> reverse_queries(target_graph.samples.size());
+        for (size_t si = 0; si < target_graph.samples.size(); si++) {
+            reverse_queries[si] = QueryLocalSDFInMovingFrame(
+                moving_sdf, target_graph.samples[si].local_pos, body_pos, angle);
+        }
+        std::vector<int> reverse_active = BuildActiveSet(reverse_queries, extract_settings.activation_band);
+        std::vector<PrimitivePatch> reverse_patches =
+            ExtractPrimitives(target_graph, reverse_queries, reverse_active, extract_settings);
+
         ChVector3d total_force(0, 0, 0);
         ChVector3d total_torque(0, 0, 0);
         double active_area = 0.0;
+        double reverse_active_area = 0.0;
         int main_persistent_id = -1;
         double main_area = 0.0;
         double main_overlap_gate = 0.0;
@@ -201,6 +307,11 @@ int main(int argc, char* argv[]) {
 
         std::vector<PrimitiveSnapshot> current_snapshots;
         current_snapshots.reserve(patches.size());
+
+        for (const auto& patch : reverse_patches) {
+            reverse_active_area += patch.area;
+            total_reverse_patch_frames++;
+        }
 
         for (auto& patch : patches) {
             ApplyNormalContactIntegral(patch, graph, queries, body_pos, normal_settings);
@@ -217,11 +328,24 @@ int main(int argc, char* argv[]) {
                 gate = 0.0;
             }
 
-            const TangentialHistory* previous_history = nullptr;
-            auto hist_it = history_store.find(persistent_id);
-            if (hist_it != history_store.end()) {
-                previous_history = &hist_it->second;
+            std::vector<WeightedTangentialHistorySource> weighted_history_sources;
+            weighted_history_sources.reserve(sources.size());
+            for (const auto& source : sources) {
+                auto hist_it = history_store.find(source.persistent_id);
+                if (hist_it != history_store.end() && hist_it->second.valid) {
+                    WeightedTangentialHistorySource weighted_source;
+                    weighted_source.history = hist_it->second;
+                    weighted_source.weight = source.weight;
+                    weighted_history_sources.push_back(weighted_source);
+                }
             }
+            if (weighted_history_sources.size() > 1) {
+                multi_source_history_events++;
+            }
+
+            TangentialHistory aggregated_history =
+                AggregateTangentialHistorySources(weighted_history_sources, patch.normal, persistent_id);
+            const TangentialHistory* previous_history = aggregated_history.valid ? &aggregated_history : nullptr;
 
             ChVector3d vt = ProjectToTangent(patch.representative_velocity, patch.normal);
             TangentialUpdateResult tangential =
@@ -229,7 +353,7 @@ int main(int argc, char* argv[]) {
                                         patch.normal,
                                         vt,
                                         patch.normal_force.Length(),
-                                        gate,
+                                        previous_history ? 1.0 : 0.0,
                                         tangential_settings);
             tangential.history.persistent_id = persistent_id;
             history_store[persistent_id] = tangential.history;
@@ -271,6 +395,8 @@ int main(int argc, char* argv[]) {
             << time << ","
             << patches.size() << ","
             << active_area << ","
+            << reverse_patches.size() << ","
+            << reverse_active_area << ","
             << total_force.x() << ","
             << total_force.y() << ","
             << total_force.z() << ","
@@ -292,15 +418,69 @@ int main(int argc, char* argv[]) {
 
     csv.close();
 
+    PrimitivePatch synthetic_current;
+    synthetic_current.normal = ChVector3d(0, 1, 0);
+    for (int i = 0; i < 240 && i < static_cast<int>(graph.samples.size()); i++) {
+        synthetic_current.sample_ids.push_back(i);
+    }
+
+    PrimitiveSnapshot synthetic_prev_a;
+    synthetic_prev_a.persistent_id = 100;
+    synthetic_prev_a.normal = ChVector3d(0, 1, 0);
+    synthetic_prev_a.center = ChVector3d(0, 0, 0);
+    for (int i = 0; i < 120 && i < static_cast<int>(graph.samples.size()); i++) {
+        synthetic_prev_a.sample_ids.push_back(i);
+    }
+
+    PrimitiveSnapshot synthetic_prev_b;
+    synthetic_prev_b.persistent_id = 101;
+    synthetic_prev_b.normal = ChVector3d(0, 1, 0);
+    synthetic_prev_b.center = ChVector3d(0, 0, 0);
+    for (int i = 120; i < 240 && i < static_cast<int>(graph.samples.size()); i++) {
+        synthetic_prev_b.sample_ids.push_back(i);
+    }
+
+    std::vector<PrimitiveSnapshot> synthetic_previous = {synthetic_prev_a, synthetic_prev_b};
+    std::vector<HistorySource> synthetic_sources =
+        ComputeHistorySources(synthetic_current, synthetic_previous, graph, inheritance_settings);
+    std::vector<WeightedTangentialHistorySource> synthetic_weighted_sources;
+    double synthetic_weight_sum = 0.0;
+    for (const auto& source : synthetic_sources) {
+        WeightedTangentialHistorySource weighted_source;
+        weighted_source.weight = source.weight;
+        weighted_source.history.persistent_id = source.persistent_id;
+        weighted_source.history.valid = true;
+        weighted_source.history.normal = ChVector3d(0, 1, 0);
+        weighted_source.history.xi_elastic_world =
+            source.persistent_id == synthetic_prev_a.persistent_id ? ChVector3d(0.001, 0, 0)
+                                                                   : ChVector3d(0, 0, 0.001);
+        synthetic_weight_sum += source.weight;
+        synthetic_weighted_sources.push_back(weighted_source);
+    }
+    TangentialHistory synthetic_merged_history =
+        AggregateTangentialHistorySources(synthetic_weighted_sources, ChVector3d(0, 1, 0), 200);
+
     std::ofstream summary(out_dir + "/field_contact_primitives_core_summary.csv");
     summary << "metric,value" << std::endl;
     summary << std::fixed << std::setprecision(8)
             << "frames," << frame_count << std::endl
+            << "target_mesh_vertices," << target_mesh.vertices.size() << std::endl
+            << "target_mesh_faces," << target_mesh.faces.size() << std::endl
+            << "target_sdf_active_voxels," << sdf.grid->activeVoxelCount() << std::endl
+            << "target_surface_samples," << target_graph.samples.size() << std::endl
+            << "moving_sdf_active_voxels," << moving_sdf.grid->activeVoxelCount() << std::endl
+            << "mesh_vertices," << moving_mesh.vertices.size() << std::endl
+            << "mesh_faces," << moving_mesh.faces.size() << std::endl
             << "surface_samples," << graph.samples.size() << std::endl
             << "total_patch_frames," << total_patch_frames << std::endl
+            << "total_reverse_patch_frames," << total_reverse_patch_frames << std::endl
+            << "multi_source_history_events," << multi_source_history_events << std::endl
             << "newborn_primitives," << total_newborn << std::endl
             << "max_tangential_force_ratio," << max_tangent_ratio << std::endl
-            << "min_nonzero_overlap_gate," << (min_overlap_gate == 1.0 ? 0.0 : min_overlap_gate) << std::endl;
+            << "min_nonzero_overlap_gate," << (min_overlap_gate == 1.0 ? 0.0 : min_overlap_gate) << std::endl
+            << "synthetic_merge_source_count," << synthetic_sources.size() << std::endl
+            << "synthetic_merge_weight_sum," << synthetic_weight_sum << std::endl
+            << "synthetic_merge_history_norm," << synthetic_merged_history.xi_elastic_world.Length() << std::endl;
     summary.close();
 
     std::cout << "Output:" << std::endl;

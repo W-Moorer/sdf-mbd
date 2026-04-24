@@ -154,6 +154,74 @@ struct SurfaceGraph {
     }
 };
 
+struct TriangleFace {
+    int v0 = -1;
+    int v1 = -1;
+    int v2 = -1;
+};
+
+inline void AddUniqueNeighbor(std::vector<int>& neighbors, int value) {
+    if (std::find(neighbors.begin(), neighbors.end(), value) == neighbors.end()) {
+        neighbors.push_back(value);
+    }
+}
+
+inline SurfaceGraph MakeTriangleMeshSurfaceGraph(const std::vector<ChVector3d>& vertices,
+                                                 const std::vector<TriangleFace>& faces,
+                                                 double min_triangle_area = 1.0e-16) {
+    SurfaceGraph graph;
+    graph.samples.resize(vertices.size());
+
+    for (size_t i = 0; i < vertices.size(); i++) {
+        graph.samples[i].id = static_cast<int>(i);
+        graph.samples[i].local_pos = vertices[i];
+        graph.samples[i].area = 0.0;
+    }
+
+    auto valid_index = [&](int idx) {
+        return idx >= 0 && idx < static_cast<int>(vertices.size());
+    };
+
+    auto add_edge = [&](int a, int b) {
+        if (a == b || !valid_index(a) || !valid_index(b)) {
+            return;
+        }
+        AddUniqueNeighbor(graph.samples[a].neighbors, b);
+        AddUniqueNeighbor(graph.samples[b].neighbors, a);
+    };
+
+    for (const auto& face : faces) {
+        if (!valid_index(face.v0) || !valid_index(face.v1) || !valid_index(face.v2)) {
+            continue;
+        }
+
+        ChVector3d a = vertices[face.v0];
+        ChVector3d b = vertices[face.v1];
+        ChVector3d c = vertices[face.v2];
+        double area = 0.5 * (b - a).Cross(c - a).Length();
+        if (area <= min_triangle_area) {
+            continue;
+        }
+
+        double vertex_area = area / 3.0;
+        graph.samples[face.v0].area += vertex_area;
+        graph.samples[face.v1].area += vertex_area;
+        graph.samples[face.v2].area += vertex_area;
+
+        add_edge(face.v0, face.v1);
+        add_edge(face.v1, face.v2);
+        add_edge(face.v2, face.v0);
+    }
+
+    for (auto& sample : graph.samples) {
+        std::sort(sample.neighbors.begin(), sample.neighbors.end());
+        sample.neighbors.erase(std::unique(sample.neighbors.begin(), sample.neighbors.end()),
+                               sample.neighbors.end());
+    }
+
+    return graph;
+}
+
 inline SurfaceGraph MakeSphereSurfaceGraph(double radius, int n_theta, int n_phi) {
     SurfaceGraph graph;
     if (radius <= 0.0 || n_theta <= 0 || n_phi <= 2) {
@@ -520,6 +588,40 @@ struct TangentialHistory {
     ChVector3d xi_elastic_world = ChVector3d(0, 0, 0);
     ChVector3d normal = ChVector3d(0, 1, 0);
 };
+
+struct WeightedTangentialHistorySource {
+    TangentialHistory history;
+    double weight = 0.0;
+};
+
+inline TangentialHistory AggregateTangentialHistorySources(
+    const std::vector<WeightedTangentialHistorySource>& sources,
+    const ChVector3d& current_normal,
+    int persistent_id) {
+    TangentialHistory result;
+    result.persistent_id = persistent_id;
+    result.normal = SafeNormalize(current_normal, ChVector3d(0, 1, 0));
+    result.xi_elastic_world = ChVector3d(0, 0, 0);
+    result.valid = false;
+
+    double weight_sum = 0.0;
+    for (const auto& source : sources) {
+        double w = Clamp01(source.weight);
+        if (!source.history.valid || w <= 0.0) {
+            continue;
+        }
+
+        ChVector3d transported = TransportElasticStateMinimalRotation(source.history.xi_elastic_world,
+                                                                      source.history.normal,
+                                                                      result.normal);
+        result.xi_elastic_world += transported * w;
+        weight_sum += w;
+    }
+
+    result.xi_elastic_world = ProjectToTangent(result.xi_elastic_world, result.normal);
+    result.valid = weight_sum > 1.0e-16;
+    return result;
+}
 
 struct TangentialContactSettings {
     double stiffness = 1.0e5;
