@@ -57,6 +57,19 @@
 
 using namespace chrono;
 
+static double ClampSigned(double value) {
+    return std::max(-1.0, std::min(1.0, value));
+}
+
+static ChVector3d SafeNormalize(const ChVector3d& v, const ChVector3d& fallback) {
+    double len = v.Length();
+    return len > 1.0e-14 ? v / len : fallback;
+}
+
+static ChVector3d ProjectToTangent(const ChVector3d& v, const ChVector3d& n) {
+    return v - v.Dot(n) * n;
+}
+
 // =============================================================================
 // SDF query interface
 // =============================================================================
@@ -181,10 +194,18 @@ enum class CarryOverStrategy {
     AdaptiveV1,  // V1: geometry-consistent transfer with return mapping
     AdaptiveV21,  // V2.1: transported elastic state + validity gate
     AdaptiveV21b,  // V2.1b: V2.1 with normalized tail-aware validity gate
-    AdaptiveV22  // V2.2: V2.1b with direction-consistency gate
+    AdaptiveV22,  // V2.2: V2.1b with direction-consistency gate
+    AdaptiveV23,  // V2.3: V2.1b with direction-pollution gate
+    AdaptiveV24  // V2.4: V2.1b with basis-distortion + direction-pollution gate
 };
 
 static std::string CarryOverStrategyName(CarryOverStrategy strategy) {
+    if (strategy == CarryOverStrategy::AdaptiveV24) {
+        return "adaptive-v2.4";
+    }
+    if (strategy == CarryOverStrategy::AdaptiveV23) {
+        return "adaptive-v2.3";
+    }
     if (strategy == CarryOverStrategy::AdaptiveV22) {
         return "adaptive-v2.2";
     }
@@ -260,6 +281,20 @@ struct TransportResult {
     double direction_consistency = 1.0;
     double w_dir = 1.0;
     double gate_before_direction = 1.0;
+    double direction_pollution = 0.0;
+    double w_pollution = 1.0;
+    double gate_before_pollution = 1.0;
+    double gate_after_pollution = 1.0;
+    double tau_hist_z = 0.0;
+    double tau_ref_z = 0.0;
+    double basis_distortion = 0.0;
+    double w_unified = 1.0;
+    double gate_before_unified = 1.0;
+    double gate_after_unified = 1.0;
+    double xi_prev_basis_t1 = 0.0;
+    double xi_prev_basis_t2 = 0.0;
+    double xi_cur_basis_t1 = 0.0;
+    double xi_cur_basis_t2 = 0.0;
     double xi_transport_dir_t1 = 0.0;
     double xi_transport_dir_t2 = 0.0;
     double delta_xi_dir_t1 = 0.0;
@@ -317,7 +352,7 @@ struct RunResult {
     double avg_torque_z;
     double torque_std_dev;
     int max_patch_count;
-    int avg_patch_count;
+    double avg_patch_count;
     double multi_patch_ratio;
     double avg_tangential_force_norm;
     double max_tangential_force_norm;
@@ -369,6 +404,20 @@ struct RunResult {
     double direction_consistency_p95;
     double direction_consistency_p99;
     double avg_gate_w_dir;
+    double avg_basis_distortion;
+    double basis_distortion_p50;
+    double basis_distortion_p95;
+    double basis_distortion_p99;
+    double avg_gate_w_unified;
+    double basis_gate_before_avg;
+    double basis_gate_after_avg;
+    double avg_direction_pollution;
+    double direction_pollution_p50;
+    double direction_pollution_p95;
+    double direction_pollution_p99;
+    double avg_gate_w_pollution;
+    double pollution_gate_before_avg;
+    double pollution_gate_after_avg;
     double direction_bad_gate_before_avg;
     double direction_bad_gate_after_avg;
     double high_risk_gate_avg;
@@ -417,6 +466,10 @@ std::vector<SurfaceSample> GenerateSphereSamples(double radius, int n_theta, int
     std::vector<SurfaceSample> samples;
     for (int i = 0; i < n_theta; i++) {
         double theta = M_PI * (i + 0.5) / n_theta;
+        double theta_min = M_PI * i / n_theta;
+        double theta_max = M_PI * (i + 1) / n_theta;
+        double ring_area = 2.0 * M_PI * radius * radius * (std::cos(theta_min) - std::cos(theta_max));
+        double sample_area = ring_area / n_phi;
         for (int j = 0; j < n_phi; j++) {
             double phi_angle = 2.0 * M_PI * j / n_phi;
             double x = radius * std::sin(theta) * std::cos(phi_angle);
@@ -424,7 +477,7 @@ std::vector<SurfaceSample> GenerateSphereSamples(double radius, int n_theta, int
             double z = radius * std::sin(theta) * std::sin(phi_angle);
             SurfaceSample s;
             s.local_pos = ChVector3d(x, y, z);
-            s.area_weight = 1.0 / (n_theta * n_phi);
+            s.area_weight = sample_area;
             s.theta_index = i;
             s.phi_index = j;
             s.global_index = i * n_phi + j;
@@ -458,7 +511,7 @@ std::vector<SurfaceSample> GenerateBoxSamples(double half_size, int samples_per_
                 }
                 SurfaceSample s;
                 s.local_pos = pos;
-                s.area_weight = 1.0 / (6 * n * n);
+                s.area_weight = step * step;
                 s.theta_index = 0;
                 s.phi_index = 0;
                 s.global_index = static_cast<int>(samples.size());
@@ -643,6 +696,38 @@ static double MeanGateForDirectionMax(
     return count > 0 ? sum / static_cast<double>(count) : 0.0;
 }
 
+static double MeanGateForPollutionMin(
+    const std::vector<double>& pollutions,
+    const std::vector<double>& gates,
+    double min_pollution
+) {
+    double sum = 0.0;
+    int count = 0;
+    for (size_t i = 0; i < pollutions.size() && i < gates.size(); i++) {
+        if (pollutions[i] >= min_pollution) {
+            sum += gates[i];
+            count++;
+        }
+    }
+    return count > 0 ? sum / static_cast<double>(count) : 0.0;
+}
+
+static double MeanGateForBasisMin(
+    const std::vector<double>& distortions,
+    const std::vector<double>& gates,
+    double min_distortion
+) {
+    double sum = 0.0;
+    int count = 0;
+    for (size_t i = 0; i < distortions.size() && i < gates.size(); i++) {
+        if (distortions[i] >= min_distortion) {
+            sum += gates[i];
+            count++;
+        }
+    }
+    return count > 0 ? sum / static_cast<double>(count) : 0.0;
+}
+
 // =============================================================================
 // V2.1a gate normalization state
 // =============================================================================
@@ -674,9 +759,10 @@ struct GateNormalizationStats {
 // =============================================================================
 
 void BuildTangentBasis(const ChVector3d& n, ChVector3d& t1, ChVector3d& t2) {
-    ChVector3d ref = std::abs(n.x()) < 0.9 ? ChVector3d(1, 0, 0) : ChVector3d(0, 1, 0);
-    t1 = (n.Cross(ref)).GetNormalized();
-    t2 = n.Cross(t1);
+    ChVector3d nn = SafeNormalize(n, ChVector3d(0, 1, 0));
+    ChVector3d ref = std::abs(nn.x()) < 0.9 ? ChVector3d(1, 0, 0) : ChVector3d(0, 1, 0);
+    t1 = SafeNormalize(nn.Cross(ref), ChVector3d(0, 0, 1));
+    t2 = SafeNormalize(nn.Cross(t1), ChVector3d(1, 0, 0));
 }
 
 // =============================================================================
@@ -746,15 +832,33 @@ struct TangentialHistoryState {
 
 ChVector3d TransportElasticStateToCurrentTangent(
     const ChVector3d& xi_elastic_world_prev,
+    const ChVector3d& n_prev,
     const ChVector3d& n_cur
 ) {
-    double normal_component = xi_elastic_world_prev.Dot(n_cur);
-    ChVector3d xi_transport = xi_elastic_world_prev - normal_component * n_cur;
-    return xi_transport;
+    ChVector3d a = SafeNormalize(n_prev, ChVector3d(0, 1, 0));
+    ChVector3d b = SafeNormalize(n_cur, a);
+    ChVector3d xi_prev_tangent = ProjectToTangent(xi_elastic_world_prev, a);
+
+    ChVector3d v = a.Cross(b);
+    double c = ClampSigned(a.Dot(b));
+    double s2 = v.Dot(v);
+
+    ChVector3d xi_rotated = xi_prev_tangent;
+    if (s2 > 1.0e-24) {
+        ChVector3d vx = v.Cross(xi_prev_tangent);
+        ChVector3d vvx = v.Cross(vx);
+        xi_rotated = xi_prev_tangent + vx + vvx * ((1.0 - c) / s2);
+    } else if (c < 0.0) {
+        // Anti-parallel normals make the shortest rotation axis underdetermined.
+        // Keep the non-amplifying part only; topology/gate should usually reset it.
+        xi_rotated = ProjectToTangent(xi_prev_tangent, b);
+    }
+
+    return ProjectToTangent(xi_rotated, b);
 }
 
 // =============================================================================
-// V2.1 Validity gate: compute history retention weight w ∈ [0, 1]
+// V2.1 Validity gate: compute history retention weight w in [0, 1]
 // =============================================================================
 
 double ValidityGateV21(
@@ -870,6 +974,185 @@ double DirectionConsistencyGate(
     return result.w_dir;
 }
 
+double DirectionPollutionGate(
+    const ChVector3d& xi_transport,
+    const ChVector3d& delta_xi,
+    const ChVector3d& tangential_velocity,
+    const ChVector3d& normal_force,
+    const ChVector3d& patch_moment_arm,
+    double tangential_stiffness,
+    double tangential_damping,
+    TransportResult& result
+) {
+    result.direction_pollution = 0.0;
+    result.w_pollution = 1.0;
+    result.gate_before_pollution = result.gate_before_direction;
+    result.gate_after_pollution = result.gate_before_direction;
+    result.tau_hist_z = 0.0;
+    result.tau_ref_z = 0.0;
+
+    ChVector3d ft_hist = -tangential_stiffness * xi_transport;
+    ChVector3d ft_current = -tangential_stiffness * delta_xi - tangential_damping * tangential_velocity;
+    ChVector3d ref_force = normal_force + ft_current;
+
+    result.tau_hist_z = patch_moment_arm.Cross(ft_hist).z();
+    result.tau_ref_z = patch_moment_arm.Cross(ref_force).z();
+
+    double hist_abs = std::abs(result.tau_hist_z);
+    double ref_abs = std::abs(result.tau_ref_z);
+    if (hist_abs <= 1.0e-12 || ref_abs <= 1.0e-12) {
+        return 1.0;
+    }
+
+    double opposition = std::max(
+        0.0,
+        -(result.tau_hist_z * result.tau_ref_z) / (hist_abs * ref_abs + 1.0e-18)
+    );
+    double hist_share = hist_abs / (hist_abs + ref_abs + 1.0e-18);
+    result.direction_pollution = std::max(0.0, std::min(1.0, opposition * hist_share));
+
+    const double theta_rel_activation = 0.65;
+    const double gate_activation = 0.05;
+    const double pollution_knee = 0.10;
+    const double pollution_strength = 0.30;
+    const double pollution_floor = 0.70;
+
+    if (result.theta_rel < theta_rel_activation ||
+        result.gate_before_direction < gate_activation ||
+        result.direction_pollution <= pollution_knee) {
+        return 1.0;
+    }
+
+    double excess = (result.direction_pollution - pollution_knee) / (1.0 - pollution_knee);
+    excess = std::max(0.0, std::min(1.0, excess));
+    result.w_pollution = std::max(pollution_floor, 1.0 - pollution_strength * excess);
+    result.gate_after_pollution = result.gate_before_direction * result.w_pollution;
+    return result.w_pollution;
+}
+
+double BasisDistortionPollutionGate(
+    double xi1_old,
+    double xi2_old,
+    const ChVector3d& t1_old,
+    const ChVector3d& t2_old,
+    const ChVector3d& xi_transport,
+    const ChVector3d& t1_new,
+    const ChVector3d& t2_new,
+    const ChVector3d& delta_xi,
+    const ChVector3d& tangential_velocity,
+    const ChVector3d& normal_force,
+    const ChVector3d& patch_moment_arm,
+    double tangential_stiffness,
+    double tangential_damping,
+    TransportResult& result
+) {
+    result.basis_distortion = 0.0;
+    result.direction_pollution = 0.0;
+    result.w_unified = 1.0;
+    result.w_pollution = 1.0;
+    result.gate_before_unified = result.gate_before_direction;
+    result.gate_after_unified = result.gate_before_direction;
+    result.gate_before_pollution = result.gate_before_direction;
+    result.gate_after_pollution = result.gate_before_direction;
+    result.tau_hist_z = 0.0;
+    result.tau_ref_z = 0.0;
+    result.xi_prev_basis_t1 = xi1_old;
+    result.xi_prev_basis_t2 = xi2_old;
+    result.xi_cur_basis_t1 = xi_transport.Dot(t1_new);
+    result.xi_cur_basis_t2 = xi_transport.Dot(t2_new);
+    ChVector3d xi_prev_world_from_basis = xi1_old * t1_old + xi2_old * t2_old;
+
+    double prev_norm = std::sqrt(xi1_old * xi1_old + xi2_old * xi2_old);
+    double cur_norm = std::sqrt(result.xi_cur_basis_t1 * result.xi_cur_basis_t1 +
+                                result.xi_cur_basis_t2 * result.xi_cur_basis_t2);
+    if (prev_norm > 1.0e-12 && cur_norm > 1.0e-12) {
+        double projection_change = (xi_prev_world_from_basis - xi_transport).Length() / prev_norm;
+        double projection_distortion = std::max(0.0, std::min(1.0, projection_change / 0.01));
+        double u_prev1 = xi1_old / prev_norm;
+        double u_prev2 = xi2_old / prev_norm;
+        double cur1 = result.xi_cur_basis_t1 / cur_norm;
+        double cur2 = result.xi_cur_basis_t2 / cur_norm;
+        double pred1 = t1_old.Dot(t1_new) * u_prev1 + t2_old.Dot(t1_new) * u_prev2;
+        double pred2 = t1_old.Dot(t2_new) * u_prev1 + t2_old.Dot(t2_new) * u_prev2;
+        double pred_norm = std::sqrt(pred1 * pred1 + pred2 * pred2);
+        double component_dot = std::max(-1.0, std::min(1.0, u_prev1 * cur1 + u_prev2 * cur2));
+        double component_distortion = 0.5 * (1.0 - component_dot);
+        double axis_distortion = std::abs(u_prev1) * 0.5 * (1.0 - std::max(-1.0, std::min(1.0, t1_old.Dot(t1_new)))) +
+                                 std::abs(u_prev2) * 0.5 * (1.0 - std::max(-1.0, std::min(1.0, t2_old.Dot(t2_new))));
+        axis_distortion = std::max(0.0, std::min(1.0, axis_distortion));
+        double prediction_distortion = 0.0;
+        if (pred_norm > 1.0e-12) {
+            pred1 /= pred_norm;
+            pred2 /= pred_norm;
+            double dir_dot = std::max(-1.0, std::min(1.0, pred1 * cur1 + pred2 * cur2));
+            prediction_distortion = 0.5 * (1.0 - dir_dot);
+        }
+        bool prev_t1_dominant = std::abs(xi1_old) >= std::abs(xi2_old);
+        bool cur_t1_dominant = std::abs(result.xi_cur_basis_t1) >= std::abs(result.xi_cur_basis_t2);
+        double dominant_swap = (prev_t1_dominant != cur_t1_dominant) ? 1.0 : 0.0;
+        double prev_dom = prev_t1_dominant ? u_prev1 : u_prev2;
+        double cur_dom = prev_t1_dominant ? cur1 : cur2;
+        double dominant_sign_flip = (prev_dom * cur_dom < 0.0) ? 1.0 : 0.0;
+        result.basis_distortion = std::max(
+            0.0,
+            std::min(1.0,
+                     0.50 * component_distortion +
+                     0.25 * axis_distortion +
+                     0.15 * dominant_swap +
+                     0.05 * dominant_sign_flip +
+                     0.05 * prediction_distortion)
+        );
+        result.basis_distortion = std::max(result.basis_distortion, projection_distortion);
+    }
+
+    ChVector3d ft_hist = -tangential_stiffness * xi_transport;
+    ChVector3d ft_current = -tangential_stiffness * delta_xi - tangential_damping * tangential_velocity;
+    ChVector3d ref_force = normal_force + ft_current;
+    result.tau_hist_z = patch_moment_arm.Cross(ft_hist).z();
+    result.tau_ref_z = patch_moment_arm.Cross(ref_force).z();
+
+    double hist_abs = std::abs(result.tau_hist_z);
+    double ref_abs = std::abs(result.tau_ref_z);
+    if (hist_abs > 1.0e-12 && ref_abs > 1.0e-12) {
+        double opposition = std::max(
+            0.0,
+            -(result.tau_hist_z * result.tau_ref_z) / (hist_abs * ref_abs + 1.0e-18)
+        );
+        double hist_share = hist_abs / (hist_abs + ref_abs + 1.0e-18);
+        result.direction_pollution = std::max(0.0, std::min(1.0, opposition * hist_share));
+    }
+
+    const double theta_rel_activation = 0.65;
+    const double gate_activation = 0.05;
+    const double pollution_knee = 0.10;
+    const double pollution_strength = 0.30;
+    const double pollution_floor = 0.70;
+    if (result.theta_rel < theta_rel_activation ||
+        result.gate_before_direction < gate_activation ||
+        result.direction_pollution <= pollution_knee) {
+        return 1.0;
+    }
+
+    double pollution_excess = (result.direction_pollution - pollution_knee) / (1.0 - pollution_knee);
+    pollution_excess = std::max(0.0, std::min(1.0, pollution_excess));
+    result.w_pollution = std::max(pollution_floor, 1.0 - pollution_strength * pollution_excess);
+    result.gate_after_pollution = result.gate_before_direction * result.w_pollution;
+
+    const double basis_knee = 0.08;
+    const double basis_strength = 0.50;
+    const double basis_floor = 0.70;
+    double basis_excess = 0.0;
+    if (result.basis_distortion > basis_knee) {
+        basis_excess = (result.basis_distortion - basis_knee) / (1.0 - basis_knee);
+        basis_excess = std::max(0.0, std::min(1.0, basis_excess));
+    }
+    double w_basis_extra = std::max(basis_floor, 1.0 - basis_strength * basis_excess * pollution_excess);
+    result.w_unified = result.w_pollution * w_basis_extra;
+    result.gate_after_unified = result.gate_before_direction * result.w_unified;
+    result.gate_after_pollution = result.gate_after_unified;
+    return result.w_unified;
+}
+
 // =============================================================================
 // V2.1: Transported elastic state + validity gate + unchanged return mapping
 // =============================================================================
@@ -913,7 +1196,7 @@ TransportResult TransportWithCarryOverV21(
 
     // Step 2: Transport xi_elastic to current tangent plane
     ChVector3d xi_transport = TransportElasticStateToCurrentTangent(
-        xi_elastic_world_prev, n_new
+        xi_elastic_world_prev, history_state->normal_prev, n_new
     );
     result.raw_transport_norm = xi_transport.Length();
     result.frame_rotation_angle = std::acos(std::max(-1.0, std::min(1.0, history_state->normal_prev.Dot(n_new))));
@@ -938,22 +1221,10 @@ TransportResult TransportWithCarryOverV21(
     ChVector3d delta_xi = delta_xi1 * t1_new + delta_xi2 * t2_new;
     ChVector3d xi_trial = xi_valid + delta_xi;
 
-    // Step 5: Coulomb return mapping (UNCHANGED)
-    ChVector3d tau_trial = tangential_stiffness * xi_trial + tangential_damping * (vt1 * t1_new + vt2 * t2_new);
-    double tau_trial_mag = tau_trial.Length();
-    double friction_limit = friction_coefficient * fn_magnitude;
-
-    if (tau_trial_mag <= friction_limit) {
-        result.xi1_new = xi_trial.Dot(t1_new);
-        result.xi2_new = xi_trial.Dot(t2_new);
-    } else {
-        ChVector3d tau_new = tau_trial * (friction_limit / tau_trial_mag);
-        ChVector3d xi_elastic_new = tau_new / tangential_stiffness;
-        result.xi1_new = xi_elastic_new.Dot(t1_new);
-        result.xi2_new = xi_elastic_new.Dot(t2_new);
-    }
-
-    result.limited_transport_norm = std::sqrt(result.xi1_new * result.xi1_new + result.xi2_new * result.xi2_new);
+    // The common force path below performs the single Coulomb return mapping.
+    result.xi1_new = xi_trial.Dot(t1_new);
+    result.xi2_new = xi_trial.Dot(t2_new);
+    result.limited_transport_norm = xi_valid.Length();
     return result;
 }
 
@@ -977,7 +1248,11 @@ TransportResult TransportWithCarryOverV21b(
     const TangentialHistoryState* history_state,
     const TransportConfig& config,
     GateNormalizationStats& gate_stats,
-    bool enable_direction_gate
+    bool enable_direction_gate,
+    bool enable_pollution_gate,
+    bool enable_unified_gate,
+    const ChVector3d& patch_moment_arm,
+    const ChVector3d& normal_force
 ) {
     TransportResult result;
     result.raw_transport_norm = 0.0;
@@ -1002,9 +1277,13 @@ TransportResult TransportWithCarryOverV21b(
 
     // Step 2: Transport xi_elastic to current tangent plane
     ChVector3d xi_transport = TransportElasticStateToCurrentTangent(
-        xi_elastic_world_prev, n_new
+        xi_elastic_world_prev, history_state->normal_prev, n_new
     );
     result.raw_transport_norm = xi_transport.Length();
+    result.xi_prev_basis_t1 = xi1_old;
+    result.xi_prev_basis_t2 = xi2_old;
+    result.xi_cur_basis_t1 = xi_transport.Dot(t1_new);
+    result.xi_cur_basis_t2 = xi_transport.Dot(t2_new);
     if (result.raw_transport_norm > 1.0e-12) {
         result.xi_transport_dir_t1 = xi_transport.Dot(t1_new) / result.raw_transport_norm;
         result.xi_transport_dir_t2 = xi_transport.Dot(t2_new) / result.raw_transport_norm;
@@ -1029,7 +1308,37 @@ TransportResult TransportWithCarryOverV21b(
     double w = ValidityGateV21b(theta, match_distance, topology_event, slip_risk, config, gate_stats, result);
     gate_stats.Observe(theta, match_distance);
     result.gate_before_direction = w;
-    if (enable_direction_gate) {
+    ChVector3d delta_xi = delta_xi1 * t1_new + delta_xi2 * t2_new;
+    ChVector3d tangential_velocity = vt1 * t1_new + vt2 * t2_new;
+    if (enable_unified_gate) {
+        w *= BasisDistortionPollutionGate(
+            xi1_old,
+            xi2_old,
+            t1_old,
+            t2_old,
+            xi_transport,
+            t1_new,
+            t2_new,
+            delta_xi,
+            tangential_velocity,
+            normal_force,
+            patch_moment_arm,
+            tangential_stiffness,
+            tangential_damping,
+            result
+        );
+    } else if (enable_pollution_gate) {
+        w *= DirectionPollutionGate(
+            xi_transport,
+            delta_xi,
+            tangential_velocity,
+            normal_force,
+            patch_moment_arm,
+            tangential_stiffness,
+            tangential_damping,
+            result
+        );
+    } else if (enable_direction_gate) {
         w *= DirectionConsistencyGate(xi_transport, delta_xi1 * t1_new + delta_xi2 * t2_new, result);
     }
     result.adaptive_alpha = w;
@@ -1038,25 +1347,12 @@ TransportResult TransportWithCarryOverV21b(
     ChVector3d xi_valid = xi_transport * w;
 
     // Step 4: Add current step increment
-    ChVector3d delta_xi = delta_xi1 * t1_new + delta_xi2 * t2_new;
     ChVector3d xi_trial = xi_valid + delta_xi;
 
-    // Step 5: Coulomb return mapping (UNCHANGED)
-    ChVector3d tau_trial = tangential_stiffness * xi_trial + tangential_damping * (vt1 * t1_new + vt2 * t2_new);
-    double tau_trial_mag = tau_trial.Length();
-    double friction_limit = friction_coefficient * fn_magnitude;
-
-    if (tau_trial_mag <= friction_limit) {
-        result.xi1_new = xi_trial.Dot(t1_new);
-        result.xi2_new = xi_trial.Dot(t2_new);
-    } else {
-        ChVector3d tau_new = tau_trial * (friction_limit / tau_trial_mag);
-        ChVector3d xi_elastic_new = tau_new / tangential_stiffness;
-        result.xi1_new = xi_elastic_new.Dot(t1_new);
-        result.xi2_new = xi_elastic_new.Dot(t2_new);
-    }
-
-    result.limited_transport_norm = std::sqrt(result.xi1_new * result.xi1_new + result.xi2_new * result.xi2_new);
+    // The common force path below performs the single Coulomb return mapping.
+    result.xi1_new = xi_trial.Dot(t1_new);
+    result.xi2_new = xi_trial.Dot(t2_new);
+    result.limited_transport_norm = xi_valid.Length();
     return result;
 }
 
@@ -1121,21 +1417,9 @@ TransportResult TransportWithCarryOverV1(
     ChVector3d delta_xi = delta_xi1 * t1_new + delta_xi2 * t2_new;
     ChVector3d xi_trial = xi_transfer + delta_xi;
 
-    ChVector3d tau_trial = tangential_stiffness * xi_trial + tangential_damping * (vt1 * t1_new + vt2 * t2_new);
-    double tau_trial_mag = tau_trial.Length();
-    double friction_limit = friction_coefficient * fn_magnitude;
-
-    if (tau_trial_mag <= friction_limit) {
-        result.xi1_new = xi_trial.Dot(t1_new);
-        result.xi2_new = xi_trial.Dot(t2_new);
-    } else {
-        ChVector3d tau_new = tau_trial * (friction_limit / tau_trial_mag);
-        ChVector3d xi_elastic_new = tau_new / tangential_stiffness;
-        result.xi1_new = xi_elastic_new.Dot(t1_new);
-        result.xi2_new = xi_elastic_new.Dot(t2_new);
-    }
-
-    result.limited_transport_norm = std::sqrt(result.xi1_new * result.xi1_new + result.xi2_new * result.xi2_new);
+    result.xi1_new = xi_trial.Dot(t1_new);
+    result.xi2_new = xi_trial.Dot(t2_new);
+    result.limited_transport_norm = xi_transfer.Length();
     result.carry_over_factor = alpha;
 
     return result;
@@ -1472,6 +1756,12 @@ RunResult RunCaseWithConfig(
     std::vector<double> direction_consistency_values;
     std::vector<double> gate_w_dir_values;
     std::vector<double> gate_before_direction_values;
+    std::vector<double> direction_pollution_values;
+    std::vector<double> gate_w_pollution_values;
+    std::vector<double> gate_before_pollution_values;
+    std::vector<double> basis_distortion_values;
+    std::vector<double> gate_w_unified_values;
+    std::vector<double> gate_before_unified_values;
     int total_birth_events = 0;
     int total_transport_clamp_hits = 0;
     double total_force_y = 0.0;
@@ -1556,6 +1846,10 @@ RunResult RunCaseWithConfig(
         double risk_combo = 0.0;
         double xi_transport_norm = 0.0;
         double delta_xi_norm = 0.0;
+        double xi_prev_basis_t1 = 0.0;
+        double xi_prev_basis_t2 = 0.0;
+        double xi_cur_basis_t1 = 0.0;
+        double xi_cur_basis_t2 = 0.0;
         double xi_transport_dir_t1 = 0.0;
         double xi_transport_dir_t2 = 0.0;
         double delta_xi_dir_t1 = 0.0;
@@ -1563,12 +1857,22 @@ RunResult RunCaseWithConfig(
         double direction_consistency = 1.0;
         double gate_before_direction = 1.0;
         double gate_after_direction = 1.0;
+        double direction_pollution = 0.0;
+        double gate_before_pollution = 1.0;
+        double gate_after_pollution = 1.0;
+        double basis_distortion = 0.0;
+        double gate_before_unified = 1.0;
+        double gate_after_unified = 1.0;
         double w_theta = 1.0;
         double w_match = 1.0;
         double w_topo = 1.0;
         double w_slip = 1.0;
         double w_tail = 1.0;
         double w_dir = 1.0;
+        double w_pollution = 1.0;
+        double w_unified = 1.0;
+        double tau_hist_z = 0.0;
+        double tau_ref_z = 0.0;
         double validity_gate = 1.0;
         double v21_abs_w_theta = 1.0;
         double v21_abs_w_match = 1.0;
@@ -1748,13 +2052,17 @@ RunResult RunCaseWithConfig(
             int topology_event = 0;
             bool is_newborn = (prev_track == nullptr || prev_track->topology_birth_event == 1);
             bool is_v22 = (transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV22);
+            bool is_v23 = (transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV23);
+            bool is_v24 = (transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV24);
 
             // Find V1 history state
             const TangentialHistoryState* v1_history = nullptr;
             if ((transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV1 ||
                  transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV21 ||
                  transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV21b ||
-                 transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV22) &&
+                 transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV22 ||
+                 transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV23 ||
+                 transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV24) &&
                 patch.matched_persistent_id >= 0) {
                 auto it = tangential_history.find(patch.matched_persistent_id);
                 if (it != tangential_history.end() && it->second.valid) {
@@ -1777,10 +2085,14 @@ RunResult RunCaseWithConfig(
                 if (transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV1 ||
                     transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV21 ||
                     transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV21b ||
-                    transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV22) {
+                    transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV22 ||
+                    transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV23 ||
+                    transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV24) {
                     TransportResult trans;
                     if (transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV21b ||
-                        transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV22) {
+                        transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV22 ||
+                        transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV23 ||
+                        transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV24) {
                         trans = TransportWithCarryOverV21b(
                             prev_track->xi1, prev_track->xi2,
                             prev_track->tangent_t1, prev_track->tangent_t2, prev_track->normal,
@@ -1796,7 +2108,11 @@ RunResult RunCaseWithConfig(
                             v1_history,
                             transport_cfg,
                             gate_stats,
-                            is_v22
+                            is_v22,
+                            is_v23,
+                            is_v24,
+                            patch.center - body_pos,
+                            F_n
                         );
                     } else if (transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV21) {
                         trans = TransportWithCarryOverV21(
@@ -1841,7 +2157,9 @@ RunResult RunCaseWithConfig(
                     clamp_hit = trans.transport_clamp_hit;
                     frame_rot_angle = trans.frame_rotation_angle;
                     if (transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV21b ||
-                        transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV22) {
+                        transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV22 ||
+                        transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV23 ||
+                        transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV24) {
                         theta_rel_values.push_back(trans.theta_rel);
                         match_rel_values.push_back(trans.match_rel);
                         risk_combo_values.push_back(trans.risk_combo);
@@ -1859,6 +2177,12 @@ RunResult RunCaseWithConfig(
                         direction_consistency_values.push_back(trans.direction_consistency);
                         gate_w_dir_values.push_back(trans.w_dir);
                         gate_before_direction_values.push_back(trans.gate_before_direction);
+                        direction_pollution_values.push_back(trans.direction_pollution);
+                        gate_w_pollution_values.push_back(trans.w_pollution);
+                        gate_before_pollution_values.push_back(trans.gate_before_pollution);
+                        basis_distortion_values.push_back(trans.basis_distortion);
+                        gate_w_unified_values.push_back(trans.w_unified);
+                        gate_before_unified_values.push_back(trans.gate_before_unified);
 
                         auto fill_gate_trace = [&](GateSampleTrace& trace, double score) {
                             trace.valid = true;
@@ -1874,6 +2198,10 @@ RunResult RunCaseWithConfig(
                             trace.risk_combo = trans.risk_combo;
                             trace.xi_transport_norm = raw_trans_norm;
                             trace.delta_xi_norm = std::sqrt(std::pow(vt1 * config.time_step, 2) + std::pow(vt2 * config.time_step, 2));
+                            trace.xi_prev_basis_t1 = trans.xi_prev_basis_t1;
+                            trace.xi_prev_basis_t2 = trans.xi_prev_basis_t2;
+                            trace.xi_cur_basis_t1 = trans.xi_cur_basis_t1;
+                            trace.xi_cur_basis_t2 = trans.xi_cur_basis_t2;
                             trace.xi_transport_dir_t1 = trans.xi_transport_dir_t1;
                             trace.xi_transport_dir_t2 = trans.xi_transport_dir_t2;
                             trace.delta_xi_dir_t1 = trans.delta_xi_dir_t1;
@@ -1881,12 +2209,22 @@ RunResult RunCaseWithConfig(
                             trace.direction_consistency = trans.direction_consistency;
                             trace.gate_before_direction = trans.gate_before_direction;
                             trace.gate_after_direction = trans.adaptive_alpha;
+                            trace.direction_pollution = trans.direction_pollution;
+                            trace.gate_before_pollution = trans.gate_before_pollution;
+                            trace.gate_after_pollution = trans.gate_after_pollution;
+                            trace.basis_distortion = trans.basis_distortion;
+                            trace.gate_before_unified = trans.gate_before_unified;
+                            trace.gate_after_unified = trans.gate_after_unified;
                             trace.w_theta = trans.w_theta;
                             trace.w_match = trans.w_match;
                             trace.w_topo = trans.w_topo;
                             trace.w_slip = trans.w_slip;
                             trace.w_tail = trans.w_tail;
                             trace.w_dir = trans.w_dir;
+                            trace.w_pollution = trans.w_pollution;
+                            trace.w_unified = trans.w_unified;
+                            trace.tau_hist_z = trans.tau_hist_z;
+                            trace.tau_ref_z = trans.tau_ref_z;
                             trace.validity_gate = trans.adaptive_alpha;
                             trace.v21_abs_w_theta = std::exp(-frame_rot_angle / 0.3);
                             trace.v21_abs_w_match = std::exp(-match_dist / 0.05);
@@ -1896,15 +2234,26 @@ RunResult RunCaseWithConfig(
                             trace.score = score;
                         };
 
-                        double high_score = is_v22 ? ((1.0 - trans.direction_consistency) * std::max(1.0e-12, raw_trans_norm))
-                                                   : trans.risk_combo;
+                        double high_score = is_v24 ? ((1.0 - trans.w_unified) *
+                                                       trans.basis_distortion *
+                                                       trans.direction_pollution *
+                                                       std::max(1.0e-12, std::abs(trans.tau_hist_z)))
+                                                   : (is_v23 ? ((1.0 - trans.w_pollution) *
+                                                                trans.direction_pollution *
+                                                                std::max(1.0e-12, std::abs(trans.tau_hist_z)))
+                                                             : (is_v22 ? ((1.0 - trans.direction_consistency) * std::max(1.0e-12, raw_trans_norm))
+                                                                       : trans.risk_combo));
                         if (high_score > gate_sample_trace.score) {
                             fill_gate_trace(gate_sample_trace, high_score);
                         }
 
                         double normal_score = raw_trans_norm;
-                        bool normal_sample = is_v22 ? (trans.direction_consistency >= 0.8 && trans.risk_combo <= 1.0)
-                                                    : (trans.risk_combo <= 1.0);
+                        bool normal_sample = is_v24 ? (trans.basis_distortion <= 0.05 &&
+                                                        trans.direction_pollution <= 0.05 &&
+                                                        trans.risk_combo <= 1.0)
+                                                    : (is_v23 ? (trans.direction_pollution <= 0.05 && trans.risk_combo <= 1.0)
+                                                              : (is_v22 ? (trans.direction_consistency >= 0.8 && trans.risk_combo <= 1.0)
+                                                                        : (trans.risk_combo <= 1.0)));
                         if (normal_sample && normal_score > gate_normal_sample_trace.score) {
                             fill_gate_trace(gate_normal_sample_trace, normal_score);
                         }
@@ -2056,38 +2405,65 @@ RunResult RunCaseWithConfig(
                 xi2 = vt2 * config.time_step;
             }
 
-            // Trial tangential force in local frame
-            double ft1_trial = -config.tangential_stiffness * xi1 - config.tangential_damping * vt1;
-            double ft2_trial = -config.tangential_stiffness * xi2 - config.tangential_damping * vt2;
+            // Trial tangential force in local frame. Elastic history and damping are
+            // separated so the stored state remains the recoverable elastic part.
+            double ft1_el_trial = -config.tangential_stiffness * xi1;
+            double ft2_el_trial = -config.tangential_stiffness * xi2;
+            double ft_el_trial_mag = std::sqrt(ft1_el_trial * ft1_el_trial + ft2_el_trial * ft2_el_trial);
+            double ft1_damp = -config.tangential_damping * vt1;
+            double ft2_damp = -config.tangential_damping * vt2;
+            double ft1_trial = ft1_el_trial + ft1_damp;
+            double ft2_trial = ft2_el_trial + ft2_damp;
             double ft_trial_mag = std::sqrt(ft1_trial * ft1_trial + ft2_trial * ft2_trial);
 
-            // Stick-slip decision
+            // Coulomb return mapping: project the elastic trial force first, then
+            // project the elastic+damping force to the final friction disk.
             double fn_mag = F_n.Length();
             double friction_limit = config.friction_coefficient * fn_mag;
             StickSlipState state;
             ChVector3d F_t;
             double ft_mag;
 
-            if (ft_trial_mag <= friction_limit) {
-                F_t = ft1_trial * patch.tangent_t1 + ft2_trial * patch.tangent_t2;
-                ft_mag = ft_trial_mag;
-                state = StickSlipState::Stick;
-            } else {
-                double vt_local_norm = std::sqrt(vt1 * vt1 + vt2 * vt2);
-                if (vt_local_norm > 1e-12) {
-                    double vt1_dir = vt1 / vt_local_norm;
-                    double vt2_dir = vt2 / vt_local_norm;
-                    double ft1_slip = -friction_limit * vt1_dir;
-                    double ft2_slip = -friction_limit * vt2_dir;
-                    F_t = ft1_slip * patch.tangent_t1 + ft2_slip * patch.tangent_t2;
-                    ft_mag = friction_limit;
-                    xi1 = ft1_slip / (-config.tangential_stiffness);
-                    xi2 = ft2_slip / (-config.tangential_stiffness);
-                } else {
-                    F_t = ChVector3d(0, 0, 0);
-                    ft_mag = 0.0;
-                }
+            if (friction_limit <= 1.0e-12) {
+                F_t = ChVector3d(0, 0, 0);
+                ft_mag = 0.0;
+                xi1 = 0.0;
+                xi2 = 0.0;
                 state = StickSlipState::Slip;
+            } else {
+                bool elastic_slip = ft_el_trial_mag > friction_limit;
+                double ft1_el = ft1_el_trial;
+                double ft2_el = ft2_el_trial;
+                if (elastic_slip) {
+                    double elastic_scale = friction_limit / ft_el_trial_mag;
+                    ft1_el *= elastic_scale;
+                    ft2_el *= elastic_scale;
+                    xi1 = -ft1_el / config.tangential_stiffness;
+                    xi2 = -ft2_el / config.tangential_stiffness;
+                }
+
+                double ft1_combined = ft1_el + ft1_damp;
+                double ft2_combined = ft2_el + ft2_damp;
+                double ft_combined_mag = std::sqrt(ft1_combined * ft1_combined + ft2_combined * ft2_combined);
+                bool damping_projection = ft_combined_mag > friction_limit;
+
+                if (!elastic_slip && !damping_projection) {
+                    F_t = ft1_combined * patch.tangent_t1 + ft2_combined * patch.tangent_t2;
+                    ft_mag = ft_combined_mag;
+                    state = StickSlipState::Stick;
+                } else {
+                    if (damping_projection && ft_combined_mag > 1.0e-12) {
+                        double combined_scale = friction_limit / ft_combined_mag;
+                        ft1_combined *= combined_scale;
+                        ft2_combined *= combined_scale;
+                    } else {
+                        ft1_combined = ft1_el;
+                        ft2_combined = ft2_el;
+                    }
+                    F_t = ft1_combined * patch.tangent_t1 + ft2_combined * patch.tangent_t2;
+                    ft_mag = F_t.Length();
+                    state = StickSlipState::Slip;
+                }
             }
 
             patch.force = F_n + F_t;
@@ -2098,7 +2474,9 @@ RunResult RunCaseWithConfig(
             patch.tangential_displacement_local_norm = std::sqrt(xi1 * xi1 + xi2 * xi2);
 
             if ((transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV21b ||
-                 transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV22) &&
+                 transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV22 ||
+                 transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV23 ||
+                 transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV24) &&
                 patch.matched_persistent_id >= 0) {
                 auto update_gate_trace_force_fields = [&](GateSampleTrace& trace) {
                     if (trace.frame_id == frame_offset &&
@@ -2147,7 +2525,9 @@ RunResult RunCaseWithConfig(
             if ((transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV1 ||
                  transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV21 ||
                  transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV21b ||
-                 transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV22) &&
+                 transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV22 ||
+                 transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV23 ||
+                 transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV24) &&
                 patch.matched_persistent_id >= 0) {
                 ChVector3d xi_elastic_world_new = xi1 * patch.tangent_t1 + xi2 * patch.tangent_t2;
                 TangentialHistoryState new_hist;
@@ -2174,7 +2554,9 @@ RunResult RunCaseWithConfig(
                 transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV1 ||
                 transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV21 ||
                 transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV21b ||
-                transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV22) {
+                transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV22 ||
+                transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV23 ||
+                transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV24) {
                 adaptive_alpha_values.push_back(adaptive_alpha);
             }
 
@@ -2301,7 +2683,8 @@ RunResult RunCaseWithConfig(
     result.torque_std_dev = force_sample_count > 0 ? std::sqrt((sum_sq_tx + sum_sq_ty + sum_sq_tz) / force_sample_count) : 0.0;
 
     result.max_patch_count = patch_counts.empty() ? 0 : *std::max_element(patch_counts.begin(), patch_counts.end());
-    result.avg_patch_count = patch_counts.empty() ? 0 : static_cast<int>(std::accumulate(patch_counts.begin(), patch_counts.end(), 0) / patch_counts.size());
+    result.avg_patch_count = patch_counts.empty() ? 0.0 :
+        static_cast<double>(std::accumulate(patch_counts.begin(), patch_counts.end(), 0)) / patch_counts.size();
 
     int multi_patch_count = 0;
     for (int pc : patch_counts) {
@@ -2366,6 +2749,20 @@ RunResult RunCaseWithConfig(
     result.direction_consistency_p99 = Percentile(direction_consistency_values, 0.99);
     result.direction_bad_gate_before_avg = MeanGateForDirectionMax(direction_consistency_values, gate_before_direction_values, 0.50);
     result.direction_bad_gate_after_avg = MeanGateForDirectionMax(direction_consistency_values, final_gate_values, 0.50);
+    result.avg_basis_distortion = MeanValue(basis_distortion_values);
+    result.basis_distortion_p50 = Percentile(basis_distortion_values, 0.50);
+    result.basis_distortion_p95 = Percentile(basis_distortion_values, 0.95);
+    result.basis_distortion_p99 = Percentile(basis_distortion_values, 0.99);
+    result.avg_gate_w_unified = MeanValue(gate_w_unified_values);
+    result.basis_gate_before_avg = MeanGateForBasisMin(basis_distortion_values, gate_before_unified_values, result.basis_distortion_p95);
+    result.basis_gate_after_avg = MeanGateForBasisMin(basis_distortion_values, final_gate_values, result.basis_distortion_p95);
+    result.avg_direction_pollution = MeanValue(direction_pollution_values);
+    result.direction_pollution_p50 = Percentile(direction_pollution_values, 0.50);
+    result.direction_pollution_p95 = Percentile(direction_pollution_values, 0.95);
+    result.direction_pollution_p99 = Percentile(direction_pollution_values, 0.99);
+    result.avg_gate_w_pollution = MeanValue(gate_w_pollution_values);
+    result.pollution_gate_before_avg = MeanGateForPollutionMin(direction_pollution_values, gate_before_pollution_values, result.direction_pollution_p95);
+    result.pollution_gate_after_avg = MeanGateForPollutionMin(direction_pollution_values, final_gate_values, result.direction_pollution_p95);
     result.high_risk_gate_avg = MeanGateForRiskRange(risk_combo_values, final_gate_values, result.risk_combo_p95, std::numeric_limits<double>::infinity());
     result.high_risk_v21_gate_avg = MeanGateForRiskRange(risk_combo_values, v21_abs_gate_values, result.risk_combo_p95, std::numeric_limits<double>::infinity());
     result.median_risk_gate_avg = MeanGateForRiskRange(risk_combo_values, final_gate_values, result.risk_combo_p50 * 0.95, result.risk_combo_p50 * 1.05);
@@ -2461,14 +2858,18 @@ RunResult RunCaseWithConfig(
 
     // -- Write V2.1b/V2.2 gate representative samples --
     if (transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV21b ||
-        transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV22) {
+        transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV22 ||
+        transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV23 ||
+        transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV24) {
         std::string case_name = (config.dyn_body_type == 0) ? "Case_A" : "Case_B";
         std::string gate_file = out_dir + "/sdf_patch_adaptive_carryover_gate_sample_" + case_name + "_" + mode_name + ".csv";
         std::ofstream gf(gate_file);
         gf << "trace_type,case_name,config_name,frame_id,patch_index,persistent_id,theta,theta_ref,theta_rel,match_distance,match_ref,match_rel,"
-           << "risk_combo,xi_transport_norm,delta_xi_norm,xi_transport_dir_t1,xi_transport_dir_t2,delta_xi_dir_t1,delta_xi_dir_t2,"
-           << "direction_consistency,gate_before_direction,gate_after_direction,"
-           << "w_theta,w_match,w_topo,w_slip,w_tail,w_dir,validity_gate,v21_abs_w_theta,v21_abs_w_match,v21_abs_gate,"
+           << "risk_combo,xi_transport_norm,delta_xi_norm,xi_prev_basis_t1,xi_prev_basis_t2,xi_cur_basis_t1,xi_cur_basis_t2,"
+           << "xi_transport_dir_t1,xi_transport_dir_t2,delta_xi_dir_t1,delta_xi_dir_t2,"
+           << "basis_distortion,direction_consistency,direction_pollution,gate_before_direction,gate_after_direction,"
+           << "gate_before_pollution,gate_after_pollution,gate_before_unified,gate_after_unified,"
+           << "tau_hist_z,tau_ref_z,w_theta,w_match,w_topo,w_slip,w_tail,w_dir,w_pollution,w_unified,validity_gate,v21_abs_w_theta,v21_abs_w_match,v21_abs_gate,"
            << "raw_transport_norm,limited_transport_norm,ft_trial_mag,friction_limit,stick_or_slip,ft_final_mag,score" << std::endl;
         auto write_gate_trace = [&](const std::string& trace_type, const GateSampleTrace& trace) {
             gf << trace_type << "," << case_name << "," << mode_name << ","
@@ -2478,17 +2879,26 @@ RunResult RunCaseWithConfig(
                << trace.match_distance << "," << trace.match_ref << "," << trace.match_rel << ","
                << trace.risk_combo << ","
                << trace.xi_transport_norm << "," << trace.delta_xi_norm << ","
+               << trace.xi_prev_basis_t1 << "," << trace.xi_prev_basis_t2 << ","
+               << trace.xi_cur_basis_t1 << "," << trace.xi_cur_basis_t2 << ","
                << trace.xi_transport_dir_t1 << "," << trace.xi_transport_dir_t2 << ","
                << trace.delta_xi_dir_t1 << "," << trace.delta_xi_dir_t2 << ","
-               << trace.direction_consistency << "," << trace.gate_before_direction << "," << trace.gate_after_direction << ","
+               << trace.basis_distortion << "," << trace.direction_consistency << "," << trace.direction_pollution << ","
+               << trace.gate_before_direction << "," << trace.gate_after_direction << ","
+               << trace.gate_before_pollution << "," << trace.gate_after_pollution << ","
+               << trace.gate_before_unified << "," << trace.gate_after_unified << ","
+               << trace.tau_hist_z << "," << trace.tau_ref_z << ","
                << trace.w_theta << "," << trace.w_match << "," << trace.w_topo << ","
-               << trace.w_slip << "," << trace.w_tail << "," << trace.w_dir << "," << trace.validity_gate << ","
+               << trace.w_slip << "," << trace.w_tail << "," << trace.w_dir << "," << trace.w_pollution << "," << trace.w_unified << "," << trace.validity_gate << ","
                << trace.v21_abs_w_theta << "," << trace.v21_abs_w_match << "," << trace.v21_abs_gate << ","
                << trace.raw_transport_norm << "," << trace.limited_transport_norm << ","
                << trace.ft_trial_mag << "," << trace.friction_limit << "," << trace.stick_or_slip << "," << trace.ft_final_mag << ","
                << trace.score << std::endl;
         };
-        write_gate_trace((transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV22) ? "high_direction_inconsistency" : "high_risk", gate_sample_trace);
+        write_gate_trace((transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV24) ? "high_basis_distortion_pollution" :
+                         ((transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV23) ? "high_direction_pollution" :
+                          ((transport_cfg.carry_strategy == CarryOverStrategy::AdaptiveV22) ? "high_direction_inconsistency" : "high_risk")),
+                         gate_sample_trace);
         write_gate_trace("normal_retention", gate_normal_sample_trace);
         gf.close();
     }
@@ -2504,6 +2914,70 @@ RunResult RunCaseWithConfig(
     return result;
 }
 
+static ChVector3d RotateAroundAxis(const ChVector3d& value, const ChVector3d& axis, double angle) {
+    ChVector3d a = SafeNormalize(axis, ChVector3d(0, 0, 1));
+    double c = std::cos(angle);
+    double s = std::sin(angle);
+    return value * c + a.Cross(value) * s + a * (a.Dot(value) * (1.0 - c));
+}
+
+static void WriteTangentialTheoryDiagnostics(const std::string& out_dir) {
+    const ChVector3d n0(0, 1, 0);
+    const ChVector3d xi0(0.01, 0, 0);
+    const ChVector3d axis(0, 0, 1);
+    const ChVector3d q_axis(1, 2, 3);
+    const double q_angle = 0.73;
+
+    std::string csv_path = out_dir + "/sdf_patch_tangential_transport_theory.csv";
+    std::ofstream csv(csv_path);
+    csv << "angle_rad,projection_norm,minrot_norm,expected_norm,"
+        << "projection_parallel_error,minrot_parallel_error,minrot_objectivity_error" << std::endl;
+
+    double max_projection_error = 0.0;
+    double max_minrot_error = 0.0;
+    double max_objectivity_error = 0.0;
+
+    for (int i = 0; i <= 24; i++) {
+        double angle = (0.5 * M_PI) * static_cast<double>(i) / 24.0;
+        ChVector3d n1 = RotateAroundAxis(n0, axis, angle);
+        ChVector3d expected = RotateAroundAxis(xi0, axis, angle);
+        ChVector3d projection_transport = ProjectToTangent(xi0, n1);
+        ChVector3d minrot_transport = TransportElasticStateToCurrentTangent(xi0, n0, n1);
+
+        double projection_error = (projection_transport - expected).Length();
+        double minrot_error = (minrot_transport - expected).Length();
+
+        ChVector3d q_n0 = RotateAroundAxis(n0, q_axis, q_angle);
+        ChVector3d q_n1 = RotateAroundAxis(n1, q_axis, q_angle);
+        ChVector3d q_xi0 = RotateAroundAxis(xi0, q_axis, q_angle);
+        ChVector3d q_transport_expected = RotateAroundAxis(minrot_transport, q_axis, q_angle);
+        ChVector3d q_transport_actual = TransportElasticStateToCurrentTangent(q_xi0, q_n0, q_n1);
+        double objectivity_error = (q_transport_actual - q_transport_expected).Length();
+
+        max_projection_error = std::max(max_projection_error, projection_error);
+        max_minrot_error = std::max(max_minrot_error, minrot_error);
+        max_objectivity_error = std::max(max_objectivity_error, objectivity_error);
+
+        csv << std::fixed << std::setprecision(10)
+            << angle << ","
+            << projection_transport.Length() << ","
+            << minrot_transport.Length() << ","
+            << expected.Length() << ","
+            << projection_error << ","
+            << minrot_error << ","
+            << objectivity_error << std::endl;
+    }
+    csv.close();
+
+    std::ofstream summary(out_dir + "/sdf_patch_tangential_theory_summary.csv");
+    summary << "metric,value" << std::endl;
+    summary << std::fixed << std::setprecision(10)
+            << "max_projection_parallel_error," << max_projection_error << std::endl
+            << "max_minrot_parallel_error," << max_minrot_error << std::endl
+            << "max_minrot_objectivity_error," << max_objectivity_error << std::endl;
+    summary.close();
+}
+
 // =============================================================================
 // Main simulation
 // =============================================================================
@@ -2515,6 +2989,7 @@ int main(int argc, char* argv[]) {
     std::string project_root = GetProjectRoot();
     std::string out_dir = project_root + "/out/milestone_13";
     EnsureDir(out_dir);
+    WriteTangentialTheoryDiagnostics(out_dir);
 
     // ========================================================================
     // Baseline Reference
@@ -2602,8 +3077,17 @@ int main(int argc, char* argv[]) {
     TransportConfig cfg_C_adaptive_v21 = {"C-adaptive-v2.1", false, false, CarryOverStrategy::AdaptiveV21, 0.01, 5.0, 0.0, adaptive_alpha_base, adaptive_theta_scale, adaptive_match_scale, 0.5};
     TransportConfig cfg_C_adaptive_v21b = {"C-adaptive-v2.1b", false, false, CarryOverStrategy::AdaptiveV21b, 0.01, 5.0, 0.0, adaptive_alpha_base, v21b_theta_rel_scale, v21b_match_rel_scale, 0.05};
     TransportConfig cfg_C_adaptive_v22 = {"C-adaptive-v2.2", false, false, CarryOverStrategy::AdaptiveV22, 0.01, 5.0, 0.0, adaptive_alpha_base, v21b_theta_rel_scale, v21b_match_rel_scale, 0.05};
+    TransportConfig cfg_C_adaptive_v23 = {"C-adaptive-v2.3", false, false, CarryOverStrategy::AdaptiveV23, 0.01, 5.0, 0.0, adaptive_alpha_base, v21b_theta_rel_scale, v21b_match_rel_scale, 0.05};
+    TransportConfig cfg_C_adaptive_v24 = {"C-adaptive-v2.4", false, false, CarryOverStrategy::AdaptiveV24, 0.01, 5.0, 0.0, adaptive_alpha_base, v21b_theta_rel_scale, v21b_match_rel_scale, 0.05};
 
-    std::vector<TransportConfig> configs = {cfg_C_fixed, cfg_C_adaptive_v1, cfg_C_adaptive_v21b, cfg_C_adaptive_v22};
+    std::vector<TransportConfig> configs = {
+        cfg_A,
+        cfg_C_fixed,
+        cfg_C_adaptive_v1,
+        cfg_C_adaptive_v21b,
+        cfg_C_adaptive_v23,
+        cfg_C_adaptive_v24
+    };
 
     // ========================================================================
     // Run all cases
@@ -2634,14 +3118,18 @@ int main(int argc, char* argv[]) {
             std::cout << "    Max Theta: " << result.max_theta << " rad" << std::endl;
             std::cout << "    Avg Match Distance: " << result.avg_match_distance << " m" << std::endl;
             std::cout << "    Avg Theta Rel / Match Rel: " << result.avg_theta_rel << " / " << result.avg_match_rel << std::endl;
-            std::cout << "    Avg Gate Components (theta, match, topo, slip, tail, dir): "
+            std::cout << "    Avg Gate Components (theta, match, topo, slip, tail, dir, pollution, unified): "
                       << result.avg_gate_w_theta << ", "
                       << result.avg_gate_w_match << ", "
                       << result.avg_gate_w_topo << ", "
                       << result.avg_gate_w_slip << ", "
                       << result.avg_gate_w_tail << ", "
-                      << result.avg_gate_w_dir << std::endl;
+                      << result.avg_gate_w_dir << ", "
+                      << result.avg_gate_w_pollution << ", "
+                      << result.avg_gate_w_unified << std::endl;
             std::cout << "    Avg Direction Consistency: " << result.avg_direction_consistency << std::endl;
+            std::cout << "    Avg Basis Distortion: " << result.avg_basis_distortion << std::endl;
+            std::cout << "    Avg Direction Pollution: " << result.avg_direction_pollution << std::endl;
             std::cout << "    Birth Events: " << result.total_birth_events << std::endl;
             std::cout << "    Stable: " << (result.is_stable ? "YES" : "NO") << std::endl;
         }
@@ -2655,7 +3143,7 @@ int main(int argc, char* argv[]) {
 
     // Case A output
     std::ofstream case_A_file(out_dir + "/sdf_patch_adaptive_carryover_case_A.csv");
-    case_A_file << "config,clamp,attenuation,carry_strategy,final_y,expected_y,y_error,avg_force_y,force_std_dev,avg_torque_x,avg_torque_y,avg_torque_z,torque_std_dev,max_patch_count,avg_patch_count,multi_patch_ratio,avg_tangential_force_norm,max_tangential_force_norm,avg_tangential_force_ratio,avg_tangential_displacement_norm,avg_raw_transport_norm,avg_limited_transport_norm,avg_transport_attenuation,avg_carry_over_factor,min_carry_over_factor,max_carry_over_factor,avg_adaptive_alpha,min_adaptive_alpha,max_adaptive_alpha,avg_theta,max_theta,avg_match_distance,theta_p50,theta_p95,match_distance_p50,match_distance_p95,avg_theta_rel,theta_rel_p50,theta_rel_p95,theta_rel_p99,max_theta_rel,avg_match_rel,match_rel_p50,match_rel_p95,match_rel_p99,max_match_rel,avg_risk_combo,risk_combo_p50,risk_combo_p95,risk_combo_p99,max_risk_combo,avg_gate_w_theta,avg_gate_w_match,avg_gate_w_topo,avg_gate_w_slip,avg_gate_w_tail,avg_gate_w_dir,avg_direction_consistency,direction_consistency_p50,direction_consistency_p95,direction_consistency_p99,direction_bad_gate_before_avg,direction_bad_gate_after_avg,high_risk_gate_avg,high_risk_v21_gate_avg,median_risk_gate_avg,median_risk_v21_gate_avg,total_birth_events,total_transport_clamp_hits,clamp_trigger_count,clamp_pre_norm_avg,clamp_post_norm_avg,clamp_max_pre_norm,clamp_max_post_norm,stick_steps,slip_steps,stick_to_slip_transitions,stable" << std::endl;
+    case_A_file << "config,clamp,attenuation,carry_strategy,final_y,expected_y,y_error,avg_force_y,force_std_dev,avg_torque_x,avg_torque_y,avg_torque_z,torque_std_dev,max_patch_count,avg_patch_count,multi_patch_ratio,avg_tangential_force_norm,max_tangential_force_norm,avg_tangential_force_ratio,avg_tangential_displacement_norm,avg_raw_transport_norm,avg_limited_transport_norm,avg_transport_attenuation,avg_carry_over_factor,min_carry_over_factor,max_carry_over_factor,avg_adaptive_alpha,min_adaptive_alpha,max_adaptive_alpha,avg_theta,max_theta,avg_match_distance,theta_p50,theta_p95,match_distance_p50,match_distance_p95,avg_theta_rel,theta_rel_p50,theta_rel_p95,theta_rel_p99,max_theta_rel,avg_match_rel,match_rel_p50,match_rel_p95,match_rel_p99,max_match_rel,avg_risk_combo,risk_combo_p50,risk_combo_p95,risk_combo_p99,max_risk_combo,avg_gate_w_theta,avg_gate_w_match,avg_gate_w_topo,avg_gate_w_slip,avg_gate_w_tail,avg_gate_w_dir,avg_direction_consistency,direction_consistency_p50,direction_consistency_p95,direction_consistency_p99,avg_basis_distortion,basis_distortion_p50,basis_distortion_p95,basis_distortion_p99,avg_gate_w_unified,basis_gate_before_avg,basis_gate_after_avg,avg_direction_pollution,direction_pollution_p50,direction_pollution_p95,direction_pollution_p99,avg_gate_w_pollution,pollution_gate_before_avg,pollution_gate_after_avg,direction_bad_gate_before_avg,direction_bad_gate_after_avg,high_risk_gate_avg,high_risk_v21_gate_avg,median_risk_gate_avg,median_risk_v21_gate_avg,total_birth_events,total_transport_clamp_hits,clamp_trigger_count,clamp_pre_norm_avg,clamp_post_norm_avg,clamp_max_pre_norm,clamp_max_post_norm,stick_steps,slip_steps,stick_to_slip_transitions,stable" << std::endl;
     for (const auto& r : all_results[0]) {
         std::string carry_str = CarryOverStrategyName(r.carry_strategy);
         case_A_file << r.config_name << ","
@@ -2720,6 +3208,20 @@ int main(int argc, char* argv[]) {
                     << r.direction_consistency_p50 << ","
                     << r.direction_consistency_p95 << ","
                     << r.direction_consistency_p99 << ","
+                    << r.avg_basis_distortion << ","
+                    << r.basis_distortion_p50 << ","
+                    << r.basis_distortion_p95 << ","
+                    << r.basis_distortion_p99 << ","
+                    << r.avg_gate_w_unified << ","
+                    << r.basis_gate_before_avg << ","
+                    << r.basis_gate_after_avg << ","
+                    << r.avg_direction_pollution << ","
+                    << r.direction_pollution_p50 << ","
+                    << r.direction_pollution_p95 << ","
+                    << r.direction_pollution_p99 << ","
+                    << r.avg_gate_w_pollution << ","
+                    << r.pollution_gate_before_avg << ","
+                    << r.pollution_gate_after_avg << ","
                     << r.direction_bad_gate_before_avg << ","
                     << r.direction_bad_gate_after_avg << ","
                     << r.high_risk_gate_avg << ","
@@ -2742,7 +3244,7 @@ int main(int argc, char* argv[]) {
 
     // Case B output
     std::ofstream case_B_file(out_dir + "/sdf_patch_adaptive_carryover_case_B.csv");
-    case_B_file << "config,clamp,attenuation,carry_strategy,final_y,expected_y,y_error,avg_force_y,force_std_dev,avg_torque_x,avg_torque_y,avg_torque_z,torque_std_dev,max_patch_count,avg_patch_count,multi_patch_ratio,avg_tangential_force_norm,max_tangential_force_norm,avg_tangential_force_ratio,avg_tangential_displacement_norm,avg_raw_transport_norm,avg_limited_transport_norm,avg_transport_attenuation,avg_carry_over_factor,min_carry_over_factor,max_carry_over_factor,avg_adaptive_alpha,min_adaptive_alpha,max_adaptive_alpha,avg_theta,max_theta,avg_match_distance,theta_p50,theta_p95,match_distance_p50,match_distance_p95,avg_theta_rel,theta_rel_p50,theta_rel_p95,theta_rel_p99,max_theta_rel,avg_match_rel,match_rel_p50,match_rel_p95,match_rel_p99,max_match_rel,avg_risk_combo,risk_combo_p50,risk_combo_p95,risk_combo_p99,max_risk_combo,avg_gate_w_theta,avg_gate_w_match,avg_gate_w_topo,avg_gate_w_slip,avg_gate_w_tail,avg_gate_w_dir,avg_direction_consistency,direction_consistency_p50,direction_consistency_p95,direction_consistency_p99,direction_bad_gate_before_avg,direction_bad_gate_after_avg,high_risk_gate_avg,high_risk_v21_gate_avg,median_risk_gate_avg,median_risk_v21_gate_avg,total_birth_events,total_transport_clamp_hits,clamp_trigger_count,clamp_pre_norm_avg,clamp_post_norm_avg,clamp_max_pre_norm,clamp_max_post_norm,stick_steps,slip_steps,stick_to_slip_transitions,stable" << std::endl;
+    case_B_file << "config,clamp,attenuation,carry_strategy,final_y,expected_y,y_error,avg_force_y,force_std_dev,avg_torque_x,avg_torque_y,avg_torque_z,torque_std_dev,max_patch_count,avg_patch_count,multi_patch_ratio,avg_tangential_force_norm,max_tangential_force_norm,avg_tangential_force_ratio,avg_tangential_displacement_norm,avg_raw_transport_norm,avg_limited_transport_norm,avg_transport_attenuation,avg_carry_over_factor,min_carry_over_factor,max_carry_over_factor,avg_adaptive_alpha,min_adaptive_alpha,max_adaptive_alpha,avg_theta,max_theta,avg_match_distance,theta_p50,theta_p95,match_distance_p50,match_distance_p95,avg_theta_rel,theta_rel_p50,theta_rel_p95,theta_rel_p99,max_theta_rel,avg_match_rel,match_rel_p50,match_rel_p95,match_rel_p99,max_match_rel,avg_risk_combo,risk_combo_p50,risk_combo_p95,risk_combo_p99,max_risk_combo,avg_gate_w_theta,avg_gate_w_match,avg_gate_w_topo,avg_gate_w_slip,avg_gate_w_tail,avg_gate_w_dir,avg_direction_consistency,direction_consistency_p50,direction_consistency_p95,direction_consistency_p99,avg_basis_distortion,basis_distortion_p50,basis_distortion_p95,basis_distortion_p99,avg_gate_w_unified,basis_gate_before_avg,basis_gate_after_avg,avg_direction_pollution,direction_pollution_p50,direction_pollution_p95,direction_pollution_p99,avg_gate_w_pollution,pollution_gate_before_avg,pollution_gate_after_avg,direction_bad_gate_before_avg,direction_bad_gate_after_avg,high_risk_gate_avg,high_risk_v21_gate_avg,median_risk_gate_avg,median_risk_v21_gate_avg,total_birth_events,total_transport_clamp_hits,clamp_trigger_count,clamp_pre_norm_avg,clamp_post_norm_avg,clamp_max_pre_norm,clamp_max_post_norm,stick_steps,slip_steps,stick_to_slip_transitions,stable" << std::endl;
     for (const auto& r : all_results[1]) {
         std::string carry_str = CarryOverStrategyName(r.carry_strategy);
         case_B_file << r.config_name << ","
@@ -2807,6 +3309,20 @@ int main(int argc, char* argv[]) {
                     << r.direction_consistency_p50 << ","
                     << r.direction_consistency_p95 << ","
                     << r.direction_consistency_p99 << ","
+                    << r.avg_basis_distortion << ","
+                    << r.basis_distortion_p50 << ","
+                    << r.basis_distortion_p95 << ","
+                    << r.basis_distortion_p99 << ","
+                    << r.avg_gate_w_unified << ","
+                    << r.basis_gate_before_avg << ","
+                    << r.basis_gate_after_avg << ","
+                    << r.avg_direction_pollution << ","
+                    << r.direction_pollution_p50 << ","
+                    << r.direction_pollution_p95 << ","
+                    << r.direction_pollution_p99 << ","
+                    << r.avg_gate_w_pollution << ","
+                    << r.pollution_gate_before_avg << ","
+                    << r.pollution_gate_after_avg << ","
                     << r.direction_bad_gate_before_avg << ","
                     << r.direction_bad_gate_after_avg << ","
                     << r.high_risk_gate_avg << ","
@@ -2926,6 +3442,8 @@ int main(int argc, char* argv[]) {
     std::cout << "  " << out_dir + "/sdf_patch_adaptive_carryover_case_B.csv" << std::endl;
     std::cout << "  " << out_dir + "/sdf_patch_adaptive_carryover_summary.csv" << std::endl;
     std::cout << "  " << out_dir + "/sdf_patch_adaptive_carryover_diagnostics.csv" << std::endl;
+    std::cout << "  " << out_dir + "/sdf_patch_tangential_transport_theory.csv" << std::endl;
+    std::cout << "  " << out_dir + "/sdf_patch_tangential_theory_summary.csv" << std::endl;
 
     return 0;
 }
