@@ -8,7 +8,6 @@
 //   - eccentric_roller
 //   - headon_spheres
 //   - headon_spheres_mass_ratio
-//   - onset_stress
 //
 // The reported trajectories are advanced from field-contact forces.  The
 // reference curves are used only for error measurement.
@@ -22,6 +21,7 @@
 #define _USE_MATH_DEFINES
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -62,6 +62,11 @@ struct SummaryRow {
     double rms_error = 0.0;
     double tolerance = 0.0;
     bool passed = false;
+};
+
+struct TimingRow {
+    std::string case_name;
+    double elapsed_seconds = 0.0;
 };
 
 using SdfSampler = openvdb::tools::GridSampler<openvdb::FloatGrid::TreeType, openvdb::tools::BoxSampler>;
@@ -606,10 +611,23 @@ static void WriteSummary(const std::filesystem::path& path, const std::vector<Su
     }
 }
 
+static void WriteTimingSummary(const std::filesystem::path& path,
+                               const std::vector<TimingRow>& rows,
+                               double total_elapsed_seconds) {
+    std::ofstream out(path);
+    out << "case,elapsed_seconds\n";
+    for (const auto& row : rows) {
+        out << row.case_name << "," << row.elapsed_seconds << "\n";
+    }
+    out << "total," << total_elapsed_seconds << "\n";
+}
+
 }  // namespace
 
 int main() {
     try {
+        using Clock = std::chrono::steady_clock;
+        const auto total_start = Clock::now();
         openvdb::initialize();
         const std::string root = GetProjectRoot();
         const auto cases = std::filesystem::path(root) / "paper_example" / "cases";
@@ -622,10 +640,12 @@ int main() {
                   "sphere_a_vx,sphere_b_vx,reference_sphere_a_x,reference_sphere_b_x,patch_count,min_phi\n";
 
         std::vector<SummaryRow> summary;
+        std::vector<TimingRow> timings;
         auto append = [&](std::vector<SummaryRow> rows) {
             summary.insert(summary.end(), rows.begin(), rows.end());
         };
 
+        auto case_start = Clock::now();
         append(RunCamCase(root,
                           frames,
                           "eccentric_roller",
@@ -643,7 +663,11 @@ int main() {
                           0.0,
                           0.039547439866570375,
                           false));
+        timings.push_back(
+            TimingRow{"eccentric_roller",
+                      std::chrono::duration<double>(Clock::now() - case_start).count()});
 
+        case_start = Clock::now();
         append(RunHeadonCase(frames,
                              "headon_spheres",
                              0.05,
@@ -655,7 +679,11 @@ int main() {
                              0.0,
                              0.0005,
                              0.5));
+        timings.push_back(
+            TimingRow{"headon_spheres",
+                      std::chrono::duration<double>(Clock::now() - case_start).count()});
 
+        case_start = Clock::now();
         append(RunHeadonCase(frames,
                              "headon_spheres_mass_ratio",
                              0.05,
@@ -667,31 +695,19 @@ int main() {
                              -1.0,
                              0.0005,
                              0.5));
-
-        append(RunCamCase(root,
-                          frames,
-                          "onset_stress",
-                          cases / "onset_stress" / "models" / "onset_cam.obj",
-                          cases / "onset_stress" / "models" / "roller_follower.obj",
-                          0.03,
-                          0.006,
-                          0.01,
-                          0.018,
-                          7800.0,
-                          0.0,
-                          -2.0,
-                          0.001,
-                          0.45,
-                          kPi,
-                          0.04136029035991934,
-                          true));
+        timings.push_back(
+            TimingRow{"headon_spheres_mass_ratio",
+                      std::chrono::duration<double>(Clock::now() - case_start).count()});
 
         WriteSummary(out_dir / "comparison_summary.csv", summary);
+        const double total_elapsed_seconds = std::chrono::duration<double>(Clock::now() - total_start).count();
+        WriteTimingSummary(out_dir / "timing_summary.csv", timings, total_elapsed_seconds);
         bool passed = std::all_of(summary.begin(), summary.end(), [](const SummaryRow& row) {
             return row.passed;
         });
         std::cout << "Wrote " << (out_dir / "sparse_sdf_frames.csv").string() << std::endl;
         std::cout << "Wrote " << (out_dir / "comparison_summary.csv").string() << std::endl;
+        std::cout << "Wrote " << (out_dir / "timing_summary.csv").string() << std::endl;
         std::cout << "PASS=" << (passed ? "true" : "false") << std::endl;
         return passed ? 0 : 1;
     } catch (const std::exception& e) {

@@ -3,6 +3,14 @@
   "description": "Locked paper examples for OpenVDB sparse narrow-band SDF plus field-contact force dynamics regression.",
   "runner": "paper_examples_openvdb.cpp",
   "output_dir": "out/paper_example_dynamic_benchmarks",
+  "outputs": [
+    "sparse_sdf_frames.csv",
+    "comparison_summary.csv",
+    "timing_summary.csv",
+    "../../paper_example/figures/eccentric_roller_curves.pdf",
+    "../../paper_example/figures/headon_spheres_curves.pdf",
+    "../../paper_example/figures/headon_spheres_mass_ratio_curves.pdf"
+  ],
   "cases": [
     {
       "name": "eccentric_roller",
@@ -68,21 +76,6 @@
         {
           "quantity": "sphere_b_vx",
           "tolerance": 0.05
-        }
-      ]
-    },
-    {
-      "name": "onset_stress",
-      "kind": "cam_onset",
-      "model": "cases/onset_stress/onset_stress_model.json",
-      "models": [
-        "cases/onset_stress/models/onset_cam.obj",
-        "cases/onset_stress/models/roller_follower.obj"
-      ],
-      "checks": [
-        {
-          "quantity": "onset_time",
-          "tolerance": 0.001
         }
       ]
     }

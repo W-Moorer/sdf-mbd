@@ -86,6 +86,17 @@ def validate_frames(manifest, rows):
         raise AssertionError("No contact patches were reported for cases: " + ", ".join(sorted(inactive)))
 
 
+def validate_outputs(project_root, manifest):
+    output_dir = project_root / manifest["output_dir"]
+    missing = []
+    for rel in manifest.get("outputs", []):
+        path = output_dir / rel
+        if not path.exists():
+            missing.append(str(path))
+    if missing:
+        raise FileNotFoundError("Missing paper-example outputs:\n" + "\n".join(missing))
+
+
 def main():
     args = parse_args()
     project_root = Path(args.project_root).resolve()
@@ -98,6 +109,7 @@ def main():
     frames = load_frames(output_dir / "sparse_sdf_frames.csv")
     validate_summary(manifest, summary)
     validate_frames(manifest, frames)
+    validate_outputs(project_root, manifest)
 
     print("paper_example regression passed")
     return 0
