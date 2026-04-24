@@ -91,6 +91,11 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(BUILD_TESTING "Build unit tests" OFF)
 include(CTest)
+option(CH_ENABLE_FIELD_CONTACT_REGRESSION_TESTS
+       "Register standalone field-contact regression tests with CTest" ON)
+if(CH_ENABLE_FIELD_CONTACT_REGRESSION_TESTS)
+    enable_testing()
+endif()
 
 set(VALGRIND_COMMAND "/usr/bin/valgrind")
 set(VALGRIND_COMMAND_OPTIONS "-v --tool=memcheck --leak-check=full --track-fds=yes --num-callers=50 --show-reachable=yes --track-origins=yes --malloc-fill=0xff --free-fill=0xfe")

@@ -84,11 +84,45 @@ loop. The implementation now demonstrates:
 - primitive contact force and torque enter the rigid-body dynamics through the
   same accumulator path used by the earlier SDF contact demos.
 
+## Regression Checks
+
+`demo_CH_field_contact_regression` fixes the key primitive invariants as
+CI-checkable pass/fail metrics without requiring OpenVDB or GoogleTest:
+
+- Coulomb feasibility: the tangential update must project force into the
+  Coulomb disk and keep it tangent to the contact normal.
+- History non-amplification: aggregated inherited tangential energy must not
+  exceed the weighted source-history energy bound.
+- Merge classification: two previous primitives merging into one current
+  primitive must be detected with bounded source weights.
+- Split classification: two current children inheriting from one previous
+  primitive must be detected without total inherited source weight exceeding
+  one.
+
+Build and run directly:
+
+```powershell
+cmake --build build --config Release --target demo_CH_field_contact_regression
+.\build\bin\Release\demo_CH_field_contact_regression.exe
+```
+
+CTest entry when `CH_ENABLE_FIELD_CONTACT_REGRESSION_TESTS=ON`:
+
+```powershell
+ctest --test-dir build -C Release -R demo_CH_field_contact_regression --output-on-failure
+```
+
+A mirrored GoogleTest file also exists at
+`src/tests/unit_tests/collision/utest_COLL_field_contact_primitives.cpp`, but
+this workspace currently disables unit-test targets because the googletest
+submodule is unavailable. The standalone regression executable is therefore the
+robust CI gate for the current checkout.
+
 ## Remaining Work
 
 - Add external mesh asset loading instead of generated meshes.
 - Add bidirectional split/merge de-duplication across both bodies.
 - Replace the guide force with a controlled actuator or an unconstrained
   benchmark once the contact law is ready for full dynamics validation.
-- Add automated regression tests for objectivity, Coulomb feasibility,
-  non-amplification, and split/merge event classification.
+- Add automated objectivity regression once the transport/frame benchmark is
+  promoted from demo diagnostics to a stable numeric fixture.

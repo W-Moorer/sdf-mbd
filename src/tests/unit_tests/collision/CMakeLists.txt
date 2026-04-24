@@ -1,5 +1,6 @@
 set(TESTS
     utest_COLL_bullet_utils
+    utest_COLL_field_contact_primitives
 )
 
 if (CHRONO_THRUST_FOUND)
@@ -47,5 +48,4 @@ set(LIBS Chrono_core)
 
 MESSAGE(STATUS "Add unit test programs for COLLISION")
 build_utests(YES "${TESTS}" "collision" "${LIBS}" "${BULLET_FILES}")
-
 

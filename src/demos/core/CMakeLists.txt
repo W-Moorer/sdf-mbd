@@ -15,6 +15,7 @@ set(DEMOS
   demo_CH_filesystem
   demo_CH_baseline_contact
   demo_CH_sdf_point_contact
+  demo_CH_field_contact_regression
 )
 
 # OpenVDB probe demo is built separately below if OpenVDB is found
@@ -53,6 +54,13 @@ foreach(PROGRAM ${DEMOS})
 
     install(TARGETS ${PROGRAM} CONFIGURATIONS Release DESTINATION ${CH_INSTALL_DEMO})
 endforeach(PROGRAM)
+
+if(CH_ENABLE_FIELD_CONTACT_REGRESSION_TESTS)
+  add_test(NAME demo_CH_field_contact_regression
+           COMMAND "$<TARGET_FILE:demo_CH_field_contact_regression>")
+  set_tests_properties(demo_CH_field_contact_regression PROPERTIES
+                       LABELS "collision;field_contact")
+endif()
 
 #--------------------------------------------------------------
 # OpenVDB probe demo (separate target with OpenVDB + TBB + Imath deps)
