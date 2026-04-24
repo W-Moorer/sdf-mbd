@@ -10,7 +10,7 @@
 //
 // =============================================================================
 //
-// Milestone 21: multi-point sliding and interlock benchmarks.
+// Milestone 21/22: multi-point sliding, interlock, and paper baselines.
 //
 // This executable extends the Milestone 20 analytic feature-switching demo to
 // harder non-convex scenes:
@@ -18,10 +18,11 @@
 //   - nested/interlocking lips;
 //   - multi-patch rolling/sliding over staggered pads.
 //
-// It compares complete field primitives against two deliberately fragmented
-// baselines. The comparison surface is the Milestone 19 topology/response
-// metric summary: contact-set churn, normal jumps, force/torque oscillation,
-// Coulomb feasibility, and inherited-history energy.
+// It compares complete field primitives against deliberately fragmented,
+// convex-decomposition proxy, and Chrono-style point-manifold proxy baselines.
+// The comparison surface is the Milestone 19 topology/response metric summary:
+// contact-set churn, normal jumps, force/torque oscillation, Coulomb
+// feasibility, and inherited-history energy.
 //
 // Outputs:
 //   out/milestone_21/field_contact_multislip_interlock_frames.csv
@@ -61,7 +62,9 @@ enum class NonconvexScenario {
 enum class BenchmarkVariant {
     FieldPrimitive,
     RawSampleContacts,
-    NormalBinFragments
+    NormalBinFragments,
+    ConvexDecompositionProxy,
+    ChronoTraditionalProxy
 };
 
 struct ScenarioConfig {
@@ -118,6 +121,10 @@ static const char* VariantName(BenchmarkVariant variant) {
             return "raw_sample_contacts";
         case BenchmarkVariant::NormalBinFragments:
             return "normal_bin_fragments";
+        case BenchmarkVariant::ConvexDecompositionProxy:
+            return "convex_decomposition_proxy";
+        case BenchmarkVariant::ChronoTraditionalProxy:
+            return "chrono_traditional_proxy";
     }
     return "unknown";
 }
@@ -458,6 +465,111 @@ static std::vector<PrimitivePatch> BuildNormalBinPatches(const SurfaceGraph& gra
     return patches;
 }
 
+static int ConvexProxyPieceKey(const ChVector3d& local_pos) {
+    double angle = std::atan2(local_pos.z(), local_pos.x());
+    int sector = static_cast<int>(std::floor((angle + kPi) / (kPi / 3.0)));
+    sector = std::max(0, std::min(5, sector));
+    int lower_band = local_pos.y() < -0.070 ? 0 : 1;
+    return sector + 6 * lower_band;
+}
+
+static std::vector<PrimitivePatch> BuildConvexDecompositionProxyPatches(
+    const SurfaceGraph& graph,
+    const std::vector<FieldSampleQuery>& queries,
+    const PatchExtractionSettings& settings) {
+    std::vector<PrimitivePatch> patches;
+    std::vector<int> active = BuildActiveSet(queries, settings.activation_band);
+    std::vector<char> active_mask(graph.samples.size(), 0);
+    std::vector<int> piece(graph.samples.size(), -1);
+    for (int sid : active) {
+        if (sid >= 0 && sid < static_cast<int>(graph.samples.size())) {
+            active_mask[sid] = 1;
+            piece[sid] = ConvexProxyPieceKey(graph.samples[sid].local_pos);
+        }
+    }
+
+    std::vector<char> visited(graph.samples.size(), 0);
+    int primitive_id = 0;
+    for (int seed : active) {
+        if (seed < 0 || seed >= static_cast<int>(graph.samples.size()) || visited[seed] || !active_mask[seed]) {
+            continue;
+        }
+
+        std::vector<int> component;
+        std::vector<int> queue;
+        queue.push_back(seed);
+        visited[seed] = 1;
+        size_t head = 0;
+        while (head < queue.size()) {
+            int current = queue[head++];
+            component.push_back(current);
+            for (int neighbor : graph.samples[current].neighbors) {
+                if (neighbor < 0 || neighbor >= static_cast<int>(graph.samples.size())) {
+                    continue;
+                }
+                if (!visited[neighbor] && active_mask[neighbor] && piece[neighbor] == piece[seed]) {
+                    visited[neighbor] = 1;
+                    queue.push_back(neighbor);
+                }
+            }
+        }
+
+        if (!component.empty()) {
+            patches.push_back(BuildPatchFromSampleIds(graph, queries, component, primitive_id++, true));
+        }
+    }
+
+    return patches;
+}
+
+static std::vector<PrimitivePatch> BuildChronoTraditionalProxyPatches(
+    const SurfaceGraph& graph,
+    const std::vector<FieldSampleQuery>& queries,
+    const PatchExtractionSettings& settings) {
+    std::vector<int> active = BuildActiveSet(queries, settings.activation_band);
+    std::sort(active.begin(), active.end(), [&](int a, int b) {
+        return queries[a].phi < queries[b].phi;
+    });
+
+    std::vector<int> selected;
+    selected.reserve(10);
+    const int max_contacts = 10;
+    const double min_spacing = 0.038;
+
+    for (int sid : active) {
+        if (sid < 0 || sid >= static_cast<int>(graph.samples.size())) {
+            continue;
+        }
+        if (queries[sid].phi >= 0.0 && !selected.empty()) {
+            continue;
+        }
+
+        bool separated = true;
+        for (int previous : selected) {
+            if ((graph.samples[sid].local_pos - graph.samples[previous].local_pos).Length() < min_spacing) {
+                separated = false;
+                break;
+            }
+        }
+        if (!separated) {
+            continue;
+        }
+
+        selected.push_back(sid);
+        if (static_cast<int>(selected.size()) >= max_contacts) {
+            break;
+        }
+    }
+
+    std::vector<PrimitivePatch> patches;
+    patches.reserve(selected.size());
+    int primitive_id = 0;
+    for (int sid : selected) {
+        patches.push_back(BuildPatchFromSampleIds(graph, queries, std::vector<int>{sid}, primitive_id++, false));
+    }
+    return patches;
+}
+
 static FieldContactStepResult EvaluateVariant(VariantState& state,
                                               const SurfaceGraph& graph,
                                               const std::vector<FieldSampleQuery>& queries,
@@ -479,6 +591,17 @@ static FieldContactStepResult EvaluateVariant(VariantState& state,
         }
         patches = BuildNormalBinPatches(graph, binned_queries, settings.extraction);
         return state.tracker.EvaluatePatches(graph, binned_queries, patches, torque_reference, settings);
+    } else if (state.variant == BenchmarkVariant::ConvexDecompositionProxy) {
+        patches = BuildConvexDecompositionProxyPatches(graph, queries, settings.extraction);
+    } else if (state.variant == BenchmarkVariant::ChronoTraditionalProxy) {
+        std::vector<FieldSampleQuery> chrono_queries = queries;
+        for (auto& query : chrono_queries) {
+            if (query.phi < settings.extraction.activation_band) {
+                query.grad = SnapNormalToBin(query.grad);
+            }
+        }
+        patches = BuildChronoTraditionalProxyPatches(graph, chrono_queries, settings.extraction);
+        return state.tracker.EvaluatePatches(graph, chrono_queries, patches, torque_reference, settings);
     } else {
         patches = BuildNormalBinPatches(graph, queries, settings.extraction);
     }
@@ -712,6 +835,8 @@ int main() {
         BenchmarkVariant::FieldPrimitive,
         BenchmarkVariant::RawSampleContacts,
         BenchmarkVariant::NormalBinFragments,
+        BenchmarkVariant::ConvexDecompositionProxy,
+        BenchmarkVariant::ChronoTraditionalProxy,
     };
 
     std::vector<ScenarioVariantSummary> summaries;
