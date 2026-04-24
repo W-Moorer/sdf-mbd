@@ -13,12 +13,15 @@
 // Regression tests for field-based contact primitive invariants.
 // =============================================================================
 
+#include <algorithm>
+#include <cmath>
 #include <map>
 #include <numeric>
 #include <string>
 #include <vector>
 
-#include "chrono/collision/ChFieldContactPrimitives.h"
+#include "chrono/collision/ChFieldContactRuntime.h"
+#include "chrono/core/ChRotation.h"
 
 #include "gtest/gtest.h"
 
@@ -61,6 +64,21 @@ PrimitiveSnapshot MakeSnapshot(int persistent_id, std::vector<int> sample_ids) {
     snapshot.normal = ChVector3d(0, 1, 0);
     snapshot.area = static_cast<double>(sample_ids.size());
     return snapshot;
+}
+
+std::vector<FieldSampleQuery> MakeQueries(const SurfaceGraph& graph) {
+    std::vector<FieldSampleQuery> queries(graph.samples.size());
+    for (size_t i = 0; i < graph.samples.size(); i++) {
+        queries[i].phi = 0.01;
+        queries[i].grad = ChVector3d(0, 1, 0);
+        queries[i].world_pos = graph.samples[i].local_pos;
+        queries[i].world_vel = ChVector3d(0, 0, 0);
+    }
+    return queries;
+}
+
+ChVector3d ProjectionOnlyTransport(const ChVector3d& xi_elastic_world_prev, const ChVector3d& normal_cur) {
+    return ProjectToTangent(xi_elastic_world_prev, SafeNormalize(normal_cur, ChVector3d(0, 1, 0)));
 }
 
 double SourceWeightSum(const std::vector<HistorySource>& sources) {
@@ -226,4 +244,136 @@ TEST(FieldContactPrimitives, SplitEventReusesOnePreviousPrimitiveWithoutAmplifyi
     ASSERT_NEAR(classified[0].sources[0].weight, 0.5, 1.0e-12);
     ASSERT_NEAR(classified[1].sources[0].weight, 0.5, 1.0e-12);
     ASSERT_LE(classified[0].sources[0].weight + classified[1].sources[0].weight, 1.0 + 1.0e-12);
+}
+
+TEST(FieldContactPrimitives, RuntimeTrackerClassifiesMergeAndSplitEvents) {
+    SurfaceGraph graph = MakeIndexedGraph(4);
+    std::vector<FieldSampleQuery> queries = MakeQueries(graph);
+
+    FieldContactRuntimeSettings settings;
+    settings.inheritance.min_overlap = 0.01;
+    settings.inheritance.min_normal_dot = 0.1;
+    settings.inheritance.max_center_distance = 10.0;
+    settings.inheritance.geometry_fallback_weight = 0.0;
+
+    FieldContactPrimitiveTracker tracker;
+    tracker.EvaluatePatches(graph,
+                            queries,
+                            {MakePatch({0, 1, 2}), MakePatch({3})},
+                            ChVector3d(0, 0, 0),
+                            settings);
+    FieldContactStepResult merge =
+        tracker.EvaluatePatches(graph, queries, {MakePatch({0, 1, 2, 3})}, ChVector3d(0, 0, 0), settings);
+
+    ASSERT_EQ(merge.stats.patch_count, 1);
+    ASSERT_EQ(merge.stats.merge_count, 1);
+    ASSERT_EQ(merge.patches[0].event, FieldContactPrimitiveEvent::Merge);
+    ASSERT_EQ(merge.patches[0].sources.size(), 2);
+    ASSERT_LE(merge.patches[0].source_weight_sum, 1.0 + 1.0e-12);
+
+    tracker.Reset();
+    tracker.EvaluatePatches(graph, queries, {MakePatch({0, 1, 2, 3})}, ChVector3d(0, 0, 0), settings);
+    FieldContactStepResult split =
+        tracker.EvaluatePatches(graph,
+                                queries,
+                                {MakePatch({0, 1, 2}), MakePatch({3})},
+                                ChVector3d(0, 0, 0),
+                                settings);
+
+    ASSERT_EQ(split.stats.patch_count, 2);
+    ASSERT_EQ(split.stats.split_count, 2);
+    ASSERT_EQ(split.patches[0].event, FieldContactPrimitiveEvent::SplitPrimary);
+    ASSERT_EQ(split.patches[1].event, FieldContactPrimitiveEvent::Split);
+    ASSERT_EQ(split.patches[0].sources[0].persistent_id, split.patches[1].sources[0].persistent_id);
+    ASSERT_LE(split.patches[0].source_weight_sum + split.patches[1].source_weight_sum, 1.0 + 1.0e-12);
+}
+
+TEST(FieldContactPrimitives, TangentialUpdateIsGloballyRotationCovariant) {
+    TangentialContactSettings settings;
+    settings.stiffness = 250.0;
+    settings.damping = 3.0;
+    settings.friction_coefficient = 0.8;
+    settings.time_step = 0.01;
+
+    ChVector3d previous_normal = SafeNormalize(ChVector3d(0.15, 0.96, -0.23), ChVector3d(0, 1, 0));
+    ChVector3d current_normal = SafeNormalize(ChVector3d(-0.32, 0.89, 0.18), ChVector3d(0, 1, 0));
+
+    TangentialHistory previous;
+    previous.valid = true;
+    previous.normal = previous_normal;
+    previous.xi_elastic_world = ProjectToTangent(ChVector3d(0.012, -0.004, 0.006), previous_normal);
+
+    ChVector3d vt = ProjectToTangent(ChVector3d(0.08, -0.03, 0.05), current_normal);
+    TangentialUpdateResult base =
+        UpdateTangentialContact(&previous, current_normal, vt, 100.0, 0.85, settings);
+
+    ChQuaterniond q = QuatFromAngleAxis(0.73, SafeNormalize(ChVector3d(0.31, -0.72, 0.54), ChVector3d(1, 0, 0)));
+
+    TangentialHistory rotated_previous;
+    rotated_previous.valid = true;
+    rotated_previous.normal = q.Rotate(previous.normal);
+    rotated_previous.xi_elastic_world = q.Rotate(previous.xi_elastic_world);
+
+    TangentialUpdateResult rotated =
+        UpdateTangentialContact(&rotated_previous, q.Rotate(current_normal), q.Rotate(vt), 100.0, 0.85, settings);
+
+    ASSERT_NEAR((rotated.transported_xi - q.Rotate(base.transported_xi)).Length(), 0.0, 1.0e-12);
+    ASSERT_NEAR((rotated.gated_xi - q.Rotate(base.gated_xi)).Length(), 0.0, 1.0e-12);
+    ASSERT_NEAR((rotated.trial_xi - q.Rotate(base.trial_xi)).Length(), 0.0, 1.0e-12);
+    ASSERT_NEAR((rotated.force - q.Rotate(base.force)).Length(), 0.0, 1.0e-12);
+    ASSERT_NEAR((rotated.history.xi_elastic_world - q.Rotate(base.history.xi_elastic_world)).Length(), 0.0, 1.0e-12);
+    ASSERT_NEAR(rotated.final_force_norm, base.final_force_norm, 1.0e-12);
+    ASSERT_NEAR(rotated.stored_energy_after_gate, base.stored_energy_after_gate, 1.0e-12);
+    ASSERT_EQ(rotated.state, base.state);
+}
+
+TEST(FieldContactPrimitives, RotatingNormalWithoutSlipDoesNotCreateTangentialForce) {
+    TangentialContactSettings settings;
+    settings.stiffness = 1000.0;
+    settings.damping = 0.0;
+    settings.friction_coefficient = 0.5;
+    settings.time_step = 0.002;
+
+    TangentialHistory history;
+    history.valid = true;
+    history.normal = ChVector3d(0, 1, 0);
+    history.xi_elastic_world = ChVector3d(0, 0, 0);
+
+    double max_force = 0.0;
+    double max_history_norm = 0.0;
+    for (int i = 1; i <= 120; i++) {
+        double angle = 0.35 * static_cast<double>(i) / 120.0;
+        ChQuaterniond q = QuatFromAngleAxis(angle, ChVector3d(0, 0, 1));
+        ChVector3d normal = q.Rotate(ChVector3d(0, 1, 0));
+        TangentialUpdateResult result =
+            UpdateTangentialContact(&history, normal, ChVector3d(0, 0, 0), 20.0, 1.0, settings);
+
+        max_force = std::max(max_force, result.final_force_norm);
+        max_history_norm = std::max(max_history_norm, result.history.xi_elastic_world.Length());
+        history = result.history;
+    }
+
+    ASSERT_LE(max_force, 1.0e-12);
+    ASSERT_LE(max_history_norm, 1.0e-15);
+}
+
+TEST(FieldContactPrimitives, MinimalRotationTransportBeatsProjectionOnlyTransport) {
+    ChVector3d normal_prev(0, 1, 0);
+    ChVector3d xi_prev(0.001, 0, 0);
+    ChQuaterniond q = QuatFromAngleAxis(30.0 * CH_DEG_TO_RAD, ChVector3d(0, 0, 1));
+    ChVector3d normal_cur = q.Rotate(normal_prev);
+    ChVector3d expected = q.Rotate(xi_prev);
+
+    ChVector3d minimal = TransportElasticStateMinimalRotation(xi_prev, normal_prev, normal_cur);
+    ChVector3d projected = ProjectionOnlyTransport(xi_prev, normal_cur);
+
+    double xi_norm = expected.Length();
+    double minimal_error_ratio = (minimal - expected).Length() / xi_norm;
+    double projection_error_ratio = (projected - expected).Length() / xi_norm;
+    double projection_energy_ratio = projected.Dot(projected) / expected.Dot(expected);
+
+    ASSERT_LE(minimal_error_ratio, 1.0e-12);
+    ASSERT_GE(projection_error_ratio, 0.10);
+    ASSERT_LT(projection_energy_ratio, 0.90);
+    ASSERT_GT(projection_error_ratio, 1.0e8 * std::max(minimal_error_ratio, 1.0e-16));
 }

@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "chrono/collision/ChFieldContactRuntime.h"
+#include "chrono/core/ChRotation.h"
 
 using namespace chrono;
 using namespace chrono::fieldcontact;
@@ -43,6 +44,21 @@ void CheckNear(double value, double expected, double tolerance, const std::strin
                   << " tolerance=" << tolerance << std::endl;
         failures++;
     }
+}
+
+void CheckVectorNear(const ChVector3d& value,
+                     const ChVector3d& expected,
+                     double tolerance,
+                     const std::string& message) {
+    double error = (value - expected).Length();
+    if (error > tolerance) {
+        std::cerr << "FAILED: " << message << " error=" << error << " tolerance=" << tolerance << std::endl;
+        failures++;
+    }
+}
+
+ChVector3d ProjectionOnlyTransport(const ChVector3d& xi_elastic_world_prev, const ChVector3d& normal_cur) {
+    return ProjectToTangent(xi_elastic_world_prev, SafeNormalize(normal_cur, ChVector3d(0, 1, 0)));
 }
 
 SurfaceGraph MakeIndexedGraph(int count) {
@@ -299,6 +315,103 @@ void TestRuntimeTrackerClassifiesEvents() {
           "Runtime split source weights must be bounded");
 }
 
+void TestGlobalRotationCovariance() {
+    TangentialContactSettings settings;
+    settings.stiffness = 250.0;
+    settings.damping = 3.0;
+    settings.friction_coefficient = 0.8;
+    settings.time_step = 0.01;
+
+    ChVector3d previous_normal = SafeNormalize(ChVector3d(0.15, 0.96, -0.23), ChVector3d(0, 1, 0));
+    ChVector3d current_normal = SafeNormalize(ChVector3d(-0.32, 0.89, 0.18), ChVector3d(0, 1, 0));
+
+    TangentialHistory previous;
+    previous.valid = true;
+    previous.normal = previous_normal;
+    previous.xi_elastic_world = ProjectToTangent(ChVector3d(0.012, -0.004, 0.006), previous_normal);
+
+    ChVector3d vt = ProjectToTangent(ChVector3d(0.08, -0.03, 0.05), current_normal);
+    TangentialUpdateResult base =
+        UpdateTangentialContact(&previous, current_normal, vt, 100.0, 0.85, settings);
+
+    ChQuaterniond q = QuatFromAngleAxis(0.73, SafeNormalize(ChVector3d(0.31, -0.72, 0.54), ChVector3d(1, 0, 0)));
+
+    TangentialHistory rotated_previous;
+    rotated_previous.valid = true;
+    rotated_previous.normal = q.Rotate(previous.normal);
+    rotated_previous.xi_elastic_world = q.Rotate(previous.xi_elastic_world);
+
+    TangentialUpdateResult rotated =
+        UpdateTangentialContact(&rotated_previous, q.Rotate(current_normal), q.Rotate(vt), 100.0, 0.85, settings);
+
+    CheckVectorNear(rotated.transported_xi, q.Rotate(base.transported_xi), 1.0e-12,
+                    "Objective transport must be globally rotation covariant");
+    CheckVectorNear(rotated.gated_xi, q.Rotate(base.gated_xi), 1.0e-12,
+                    "Gated history must be globally rotation covariant");
+    CheckVectorNear(rotated.trial_xi, q.Rotate(base.trial_xi), 1.0e-12,
+                    "Trial tangential state must be globally rotation covariant");
+    CheckVectorNear(rotated.force, q.Rotate(base.force), 1.0e-12,
+                    "Tangential force must be globally rotation covariant");
+    CheckVectorNear(rotated.history.xi_elastic_world, q.Rotate(base.history.xi_elastic_world), 1.0e-12,
+                    "Updated elastic history must be globally rotation covariant");
+    CheckNear(rotated.final_force_norm, base.final_force_norm, 1.0e-12, "Objective final force norm");
+    CheckNear(rotated.stored_energy_after_gate, base.stored_energy_after_gate, 1.0e-12,
+              "Objective gated energy");
+    Check(rotated.state == base.state, "Objective stick/slip state");
+}
+
+void TestRotatingNormalWithoutSlipDoesNotCreateTangentialForce() {
+    TangentialContactSettings settings;
+    settings.stiffness = 1000.0;
+    settings.damping = 0.0;
+    settings.friction_coefficient = 0.5;
+    settings.time_step = 0.002;
+
+    TangentialHistory history;
+    history.valid = true;
+    history.normal = ChVector3d(0, 1, 0);
+    history.xi_elastic_world = ChVector3d(0, 0, 0);
+
+    double max_force = 0.0;
+    double max_history_norm = 0.0;
+    for (int i = 1; i <= 120; i++) {
+        double angle = 0.35 * static_cast<double>(i) / 120.0;
+        ChQuaterniond q = QuatFromAngleAxis(angle, ChVector3d(0, 0, 1));
+        ChVector3d normal = q.Rotate(ChVector3d(0, 1, 0));
+        TangentialUpdateResult result =
+            UpdateTangentialContact(&history, normal, ChVector3d(0, 0, 0), 20.0, 1.0, settings);
+
+        max_force = std::max(max_force, result.final_force_norm);
+        max_history_norm = std::max(max_history_norm, result.history.xi_elastic_world.Length());
+        history = result.history;
+    }
+
+    Check(max_force <= 1.0e-12, "Rotating normal with zero slip must not create tangential force");
+    Check(max_history_norm <= 1.0e-15, "Rotating normal with zero slip must keep zero elastic history");
+}
+
+void TestMinimalRotationBeatsProjectionTransport() {
+    ChVector3d normal_prev(0, 1, 0);
+    ChVector3d xi_prev(0.001, 0, 0);
+    ChQuaterniond q = QuatFromAngleAxis(30.0 * CH_DEG_TO_RAD, ChVector3d(0, 0, 1));
+    ChVector3d normal_cur = q.Rotate(normal_prev);
+    ChVector3d expected = q.Rotate(xi_prev);
+
+    ChVector3d minimal = TransportElasticStateMinimalRotation(xi_prev, normal_prev, normal_cur);
+    ChVector3d projected = ProjectionOnlyTransport(xi_prev, normal_cur);
+
+    double xi_norm = expected.Length();
+    double minimal_error_ratio = (minimal - expected).Length() / xi_norm;
+    double projection_error_ratio = (projected - expected).Length() / xi_norm;
+    double projection_energy_ratio = projected.Dot(projected) / expected.Dot(expected);
+
+    Check(minimal_error_ratio <= 1.0e-12, "Minimal-rotation transport should match rigid normal rotation");
+    Check(projection_error_ratio >= 0.10, "Projection-only transport should expose frame-rotation error");
+    Check(projection_energy_ratio < 0.90, "Projection-only transport should lose elastic energy in this ablation");
+    Check(projection_error_ratio > 1.0e8 * std::max(minimal_error_ratio, 1.0e-16),
+          "Minimal-rotation transport should dominate projection-only transport");
+}
+
 }  // namespace
 
 int main() {
@@ -307,6 +420,9 @@ int main() {
     TestMergeClassification();
     TestSplitClassification();
     TestRuntimeTrackerClassifiesEvents();
+    TestGlobalRotationCovariance();
+    TestRotatingNormalWithoutSlipDoesNotCreateTangentialForce();
+    TestMinimalRotationBeatsProjectionTransport();
 
     if (failures == 0) {
         std::cout << "Field contact primitive regression checks passed." << std::endl;
