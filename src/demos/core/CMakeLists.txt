@@ -19,10 +19,11 @@ set(DEMOS
   demo_CH_field_contact_feature_switching
   demo_CH_field_contact_multislip_interlock
   demo_CH_chrono_native_contact_baseline
+  demo_CH_friction_validation
 )
 
 # OpenVDB probe demo is built separately below if OpenVDB is found
-list(APPEND DEMOS_WITH_OPENVDB demo_CH_openvdb_probe demo_CH_sdf_point_contact_openvdb demo_CH_sdf_patch_contact_openvdb demo_CH_sdf_patch_force_openvdb demo_CH_sdf_patch_persistence_openvdb demo_CH_sdf_patch_constitutive_openvdb demo_CH_sdf_patch_constitutive_cases_openvdb demo_CH_sdf_patch_constitutive_tangential_openvdb demo_CH_sdf_patch_constitutive_stickslip_openvdb demo_CH_sdf_patch_constitutive_frame_openvdb demo_CH_sdf_patch_constitutive_transport_limited_openvdb demo_CH_sdf_patch_transport_ablation_openvdb demo_CH_sdf_patch_adaptive_carryover_openvdb demo_CH_sdf_patch_tangential_history_v1_openvdb demo_CH_field_contact_primitives_openvdb demo_CH_field_contact_split_merge_openvdb demo_CH_field_contact_mesh_sdf_nonconvex_openvdb demo_CH_field_contact_matched_mesh_native_openvdb demo_CH_field_contact_free_dynamics_openvdb demo_CH_field_contact_cad_mesh_case_study_openvdb demo_CH_field_contact_chrono_original_mesh_baseline_openvdb demo_CH_simple_gear_openvdb)
+list(APPEND DEMOS_WITH_OPENVDB demo_CH_openvdb_probe demo_CH_sdf_point_contact_openvdb demo_CH_sdf_patch_contact_openvdb demo_CH_sdf_patch_force_openvdb demo_CH_sdf_patch_persistence_openvdb demo_CH_sdf_patch_constitutive_openvdb demo_CH_sdf_patch_constitutive_cases_openvdb demo_CH_sdf_patch_constitutive_tangential_openvdb demo_CH_sdf_patch_constitutive_stickslip_openvdb demo_CH_sdf_patch_constitutive_frame_openvdb demo_CH_sdf_patch_constitutive_transport_limited_openvdb demo_CH_sdf_patch_transport_ablation_openvdb demo_CH_sdf_patch_adaptive_carryover_openvdb demo_CH_sdf_patch_tangential_history_v1_openvdb demo_CH_field_contact_primitives_openvdb demo_CH_field_contact_split_merge_openvdb demo_CH_field_contact_mesh_sdf_nonconvex_openvdb demo_CH_field_contact_matched_mesh_native_openvdb demo_CH_field_contact_free_dynamics_openvdb demo_CH_field_contact_cad_mesh_case_study_openvdb demo_CH_field_contact_chrono_original_mesh_baseline_openvdb demo_CH_simple_gear_openvdb demo_CH_rev_joint_clearance_openvdb)
 
 #--------------------------------------------------------------
 
@@ -63,6 +64,13 @@ if(CH_ENABLE_FIELD_CONTACT_REGRESSION_TESTS)
            COMMAND "$<TARGET_FILE:demo_CH_field_contact_regression>")
   set_tests_properties(demo_CH_field_contact_regression PROPERTIES
                        LABELS "collision;field_contact")
+
+  add_test(NAME demo_CH_friction_validation
+           COMMAND "$<TARGET_FILE:demo_CH_friction_validation>"
+                   "${CMAKE_SOURCE_DIR}/out/friction_validation")
+  set_tests_properties(demo_CH_friction_validation PROPERTIES
+                       LABELS "collision;field_contact;friction"
+                       TIMEOUT 60)
 
   find_package(Python3 COMPONENTS Interpreter QUIET)
   if(Python3_Interpreter_FOUND)
