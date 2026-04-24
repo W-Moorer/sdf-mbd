@@ -8,6 +8,7 @@
 //   - eccentric_roller
 //   - headon_spheres
 //   - headon_spheres_mass_ratio
+//   - simple_gear
 //
 // The reported trajectories are advanced from field-contact forces.  The
 // reference curves are used only for error measurement.
@@ -23,6 +24,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cctype>
+#include <cstddef>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -69,6 +72,64 @@ struct TimingRow {
     double elapsed_seconds = 0.0;
 };
 
+struct Mat3 {
+    double m[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+
+    ChVector3d operator*(const ChVector3d& v) const {
+        return ChVector3d(m[0][0] * v.x() + m[0][1] * v.y() + m[0][2] * v.z(),
+                          m[1][0] * v.x() + m[1][1] * v.y() + m[1][2] * v.z(),
+                          m[2][0] * v.x() + m[2][1] * v.y() + m[2][2] * v.z());
+    }
+};
+
+struct RmdBodyInfo {
+    ChVector3d cm_marker_mm = ChVector3d(0, 0, 0);
+    Mat3 part_rotation;
+    ChVector3d surface_ref_marker_mm = ChVector3d(0, 0, 0);
+    Mat3 surface_ref_rotation;
+    double inertia_x_kg_m2 = 0.0;
+    bool has_part = false;
+    bool has_cm = false;
+    bool has_surface_ref = false;
+    bool has_inertia = false;
+};
+
+struct GearPose {
+    ChVector3d center = ChVector3d(0, 0, 0);
+    Mat3 initial_rotation;
+};
+
+struct GearReferenceRow {
+    double time = 0.0;
+    double omega_rx = 0.0;
+    double alpha_rx = 0.0;
+};
+
+struct RecurDynContactSettings {
+    double bpen = 1.0e-5;
+    double max_pen = 6.0e-5;
+    int korder = 2;
+    double recurdyn_k = 100000.0;
+    double recurdyn_c = 10.0;
+    double pressure_at_bpen = 2.0e5;
+    double damping_pressure = 1.0e8;
+};
+
+struct SimpleGearRmd {
+    RmdBodyInfo gear21;
+    RmdBodyInfo gear22;
+    RecurDynContactSettings contact;
+};
+
+struct DirectionalContactResult {
+    ChVector3d torque_on_surface = ChVector3d(0, 0, 0);
+    ChVector3d torque_on_target = ChVector3d(0, 0, 0);
+    double min_phi = std::numeric_limits<double>::max();
+    double max_effective_penetration = 0.0;
+    int active_samples = 0;
+    int patch_count = 0;
+};
+
 using SdfSampler = openvdb::tools::GridSampler<openvdb::FloatGrid::TreeType, openvdb::tools::BoxSampler>;
 
 static std::string GetProjectRoot() {
@@ -83,6 +144,74 @@ static std::string GetProjectRoot() {
         path = path.parent_path();
     }
     return std::filesystem::current_path().string();
+}
+
+static Mat3 Multiply(const Mat3& a, const Mat3& b) {
+    Mat3 out;
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            out.m[i][j] = 0.0;
+            for (int k = 0; k < 3; k++) {
+                out.m[i][j] += a.m[i][k] * b.m[k][j];
+            }
+        }
+    }
+    return out;
+}
+
+static Mat3 Transpose(const Mat3& a) {
+    Mat3 out;
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            out.m[i][j] = a.m[j][i];
+        }
+    }
+    return out;
+}
+
+static Mat3 RotX(double angle) {
+    Mat3 out;
+    double c = std::cos(angle);
+    double s = std::sin(angle);
+    out.m[1][1] = c;
+    out.m[1][2] = -s;
+    out.m[2][1] = s;
+    out.m[2][2] = c;
+    return out;
+}
+
+static Mat3 RotY(double angle) {
+    Mat3 out;
+    double c = std::cos(angle);
+    double s = std::sin(angle);
+    out.m[0][0] = c;
+    out.m[0][2] = s;
+    out.m[2][0] = -s;
+    out.m[2][2] = c;
+    return out;
+}
+
+static Mat3 RotZ(double angle) {
+    Mat3 out;
+    double c = std::cos(angle);
+    double s = std::sin(angle);
+    out.m[0][0] = c;
+    out.m[0][1] = -s;
+    out.m[1][0] = s;
+    out.m[1][1] = c;
+    return out;
+}
+
+static Mat3 RecurDynEuler(double rx, double ry, double rz) {
+    return Multiply(RotZ(rz), Multiply(RotY(ry), RotX(rx)));
+}
+
+static ChVector3d AngularVelocityXCross(double omega, const ChVector3d& r) {
+    return ChVector3d(0, -omega * r.z(), omega * r.y());
+}
+
+static Mat3 BodyRotation(const GearPose& pose, double theta_rx) {
+    return Multiply(RotX(theta_rx), pose.initial_rotation);
 }
 
 static Mesh LoadObj(const std::filesystem::path& path) {
@@ -121,6 +250,292 @@ static Mesh LoadObj(const std::filesystem::path& path) {
         }
     }
     return mesh;
+}
+
+static std::string Trim(std::string text) {
+    auto first = std::find_if_not(text.begin(), text.end(), [](unsigned char c) {
+        return std::isspace(c) != 0;
+    });
+    auto last = std::find_if_not(text.rbegin(), text.rend(), [](unsigned char c) {
+        return std::isspace(c) != 0;
+    }).base();
+    if (first >= last) {
+        return "";
+    }
+    return std::string(first, last);
+}
+
+static bool Contains(const std::string& text, const std::string& pattern) {
+    return text.find(pattern) != std::string::npos;
+}
+
+static std::string ExtractQuotedName(const std::string& line) {
+    size_t first = line.find('\'');
+    if (first == std::string::npos) {
+        return "";
+    }
+    size_t second = line.find('\'', first + 1);
+    if (second == std::string::npos) {
+        return "";
+    }
+    return line.substr(first + 1, second - first - 1);
+}
+
+static std::string CleanRmdNumberToken(std::string token) {
+    token = Trim(token);
+    while (!token.empty() && (token.back() == ',' || token.back() == ';')) {
+        token.pop_back();
+    }
+    for (size_t i = 0; i < token.size();) {
+        if (token[i] == 'D' || token[i] == 'd') {
+            if (i + 1 < token.size() &&
+                (token[i + 1] == '+' || token[i + 1] == '-' ||
+                 std::isdigit(static_cast<unsigned char>(token[i + 1])) != 0)) {
+                token[i] = 'E';
+                i++;
+            } else {
+                token.erase(token.begin() + static_cast<std::ptrdiff_t>(i));
+            }
+        } else {
+            i++;
+        }
+    }
+    return token;
+}
+
+static std::vector<double> ParseNumbersAfterEquals(const std::string& line) {
+    size_t eq = line.find('=');
+    if (eq == std::string::npos) {
+        return {};
+    }
+    std::string rhs = line.substr(eq + 1);
+    std::replace(rhs.begin(), rhs.end(), ',', ' ');
+    std::istringstream stream(rhs);
+    std::vector<double> values;
+    std::string token;
+    while (stream >> token) {
+        token = CleanRmdNumberToken(token);
+        if (token.empty()) {
+            continue;
+        }
+        try {
+            values.push_back(std::stod(token));
+        } catch (...) {
+        }
+    }
+    return values;
+}
+
+static ChVector3d ParseRmdTriple(const std::string& line) {
+    auto values = ParseNumbersAfterEquals(line);
+    if (values.size() < 3) {
+        throw std::runtime_error("Expected RMD triple in line: " + line);
+    }
+    return ChVector3d(values[0], values[1], values[2]);
+}
+
+static void RequireBodyInfo(const RmdBodyInfo& body, const std::string& name) {
+    if (!body.has_part || !body.has_cm || !body.has_surface_ref || !body.has_inertia) {
+        throw std::runtime_error("Incomplete RMD body data for " + name);
+    }
+}
+
+static SimpleGearRmd LoadSimpleGearRmd(const std::filesystem::path& path) {
+    std::ifstream in(path);
+    if (!in) {
+        throw std::runtime_error("Cannot open RMD: " + path.string());
+    }
+
+    enum class Block { None, Part, Marker, Contact };
+    Block block = Block::None;
+    SimpleGearRmd rmd;
+    std::string current_part_name;
+    std::string current_marker_name;
+
+    std::string line;
+    while (std::getline(in, line)) {
+        std::string trimmed = Trim(line);
+        if (trimmed.rfind("PART /", 0) == 0) {
+            block = Block::Part;
+            current_part_name.clear();
+            current_marker_name.clear();
+            continue;
+        }
+        if (trimmed.rfind("MARKER /", 0) == 0) {
+            block = Block::Marker;
+            current_part_name.clear();
+            current_marker_name.clear();
+            continue;
+        }
+        if (trimmed.rfind("GGEOMCONTACT /", 0) == 0) {
+            block = Block::Contact;
+            current_part_name.clear();
+            current_marker_name.clear();
+            continue;
+        }
+
+        if (Contains(trimmed, "NAME =")) {
+            std::string name = ExtractQuotedName(trimmed);
+            if (block == Block::Part) {
+                current_part_name = name;
+            } else if (block == Block::Marker) {
+                current_marker_name = name;
+            }
+        }
+
+        auto body_for_part = [&]() -> RmdBodyInfo* {
+            if (current_part_name == "GEAR21") {
+                return &rmd.gear21;
+            }
+            if (current_part_name == "GEAR22") {
+                return &rmd.gear22;
+            }
+            return nullptr;
+        };
+
+        if (block == Block::Part) {
+            if (Contains(trimmed, "IP =")) {
+                if (auto* body = body_for_part()) {
+                    auto values = ParseNumbersAfterEquals(trimmed);
+                    if (!values.empty()) {
+                        body->inertia_x_kg_m2 = values[0] * 1.0e-6;
+                        body->has_inertia = true;
+                    }
+                }
+            } else if (Contains(trimmed, "REULER =")) {
+                if (auto* body = body_for_part()) {
+                    ChVector3d euler = ParseRmdTriple(trimmed);
+                    body->part_rotation = RecurDynEuler(euler.x(), euler.y(), euler.z());
+                    body->has_part = true;
+                }
+            }
+        } else if (block == Block::Marker) {
+            RmdBodyInfo* cm_body = nullptr;
+            RmdBodyInfo* ref_body = nullptr;
+            if (current_marker_name == "GEAR21.CM") {
+                cm_body = &rmd.gear21;
+            } else if (current_marker_name == "GEAR22.CM") {
+                cm_body = &rmd.gear22;
+            } else if (Contains(current_marker_name, "GEAR21.BaseGSurfacePatchRefMarker")) {
+                ref_body = &rmd.gear21;
+            } else if (Contains(current_marker_name, "GEAR22.BaseGSurfacePatchRefMarker")) {
+                ref_body = &rmd.gear22;
+            }
+
+            if (Contains(trimmed, "QP =")) {
+                if (cm_body) {
+                    cm_body->cm_marker_mm = ParseRmdTriple(trimmed);
+                    cm_body->has_cm = true;
+                } else if (ref_body) {
+                    ref_body->surface_ref_marker_mm = ParseRmdTriple(trimmed);
+                    ref_body->has_surface_ref = true;
+                }
+            } else if (Contains(trimmed, "REULER =") && ref_body) {
+                ChVector3d euler = ParseRmdTriple(trimmed);
+                ref_body->surface_ref_rotation = RecurDynEuler(euler.x(), euler.y(), euler.z());
+            }
+        } else if (block == Block::Contact) {
+            auto values = ParseNumbersAfterEquals(trimmed);
+            if (values.empty()) {
+                continue;
+            }
+            if (Contains(trimmed, "BPEN =")) {
+                rmd.contact.bpen = values[0] * 1.0e-3;
+            } else if (Contains(trimmed, "MAXPEN =")) {
+                rmd.contact.max_pen = values[0] * 1.0e-3;
+            } else if (Contains(trimmed, "KORDER =")) {
+                rmd.contact.korder = std::max(1, static_cast<int>(std::lround(values[0])));
+            } else if (trimmed.rfind(", K =", 0) == 0 || trimmed.rfind("K =", 0) == 0) {
+                rmd.contact.recurdyn_k = values[0];
+            } else if (trimmed.rfind(", C =", 0) == 0 || trimmed.rfind("C =", 0) == 0) {
+                rmd.contact.recurdyn_c = values[0];
+            }
+        }
+    }
+
+    RequireBodyInfo(rmd.gear21, "GEAR21");
+    RequireBodyInfo(rmd.gear22, "GEAR22");
+    return rmd;
+}
+
+static Mesh LoadObjAsBodyLocal(const std::filesystem::path& path,
+                               const ChVector3d& surface_ref_marker_mm,
+                               const Mat3& surface_ref_rotation,
+                               const ChVector3d& body_cm_mm,
+                               const Mat3& body_initial_rotation) {
+    Mesh mesh;
+    std::ifstream in(path);
+    if (!in) {
+        throw std::runtime_error("Cannot open OBJ: " + path.string());
+    }
+
+    std::string line;
+    while (std::getline(in, line)) {
+        std::istringstream iss(line);
+        std::string tag;
+        iss >> tag;
+        if (tag == "v") {
+            double x = 0.0;
+            double y = 0.0;
+            double z = 0.0;
+            iss >> x >> y >> z;
+            ChVector3d world_mm = surface_ref_marker_mm + surface_ref_rotation * ChVector3d(x, y, z);
+            ChVector3d body_local_mm = Transpose(body_initial_rotation) * (world_mm - body_cm_mm);
+            mesh.vertices.emplace_back(body_local_mm * 1.0e-3);
+        } else if (tag == "f") {
+            std::vector<int> ids;
+            std::string token;
+            while (iss >> token) {
+                size_t slash = token.find('/');
+                std::string v = slash == std::string::npos ? token : token.substr(0, slash);
+                int idx = std::stoi(v);
+                if (idx < 0) {
+                    idx = static_cast<int>(mesh.vertices.size()) + idx + 1;
+                }
+                ids.push_back(idx - 1);
+            }
+            for (size_t i = 1; i + 1 < ids.size(); i++) {
+                mesh.faces.push_back(TriangleFace{ids[0], ids[i], ids[i + 1]});
+            }
+        }
+    }
+    return mesh;
+}
+
+static std::vector<std::string> SplitCsvLine(const std::string& line) {
+    std::vector<std::string> out;
+    std::string token;
+    std::istringstream stream(line);
+    while (std::getline(stream, token, ',')) {
+        out.push_back(token);
+    }
+    return out;
+}
+
+static std::vector<GearReferenceRow> LoadGear22Reference(const std::filesystem::path& path) {
+    std::ifstream in(path);
+    if (!in) {
+        throw std::runtime_error("Cannot open reference CSV: " + path.string());
+    }
+
+    std::string line;
+    std::getline(in, line);
+    std::vector<GearReferenceRow> rows;
+    while (std::getline(in, line)) {
+        if (line.empty()) {
+            continue;
+        }
+        auto cols = SplitCsvLine(line);
+        if (cols.size() < 10) {
+            continue;
+        }
+        GearReferenceRow row;
+        row.time = std::stod(cols[0]);
+        row.omega_rx = std::stod(cols[6]);
+        row.alpha_rx = std::stod(cols[9]);
+        rows.push_back(row);
+    }
+    return rows;
 }
 
 static Mesh BuildClosedSphereMesh(double radius, int rings, int sectors) {
@@ -200,6 +615,68 @@ static ChVector3d SDFGradient(const SparseSDF& sdf, SdfSampler& sampler, const C
                          SampleSDF(sdf, sampler, p - ChVector3d(0, 0, h))) /
                         (2.0 * h));
     return SafeNormalize(grad, ChVector3d(0, 1, 0));
+}
+
+static double RecurDynStylePressure(double effective_penetration,
+                                    double closing_normal_velocity,
+                                    const RecurDynContactSettings& settings) {
+    if (effective_penetration <= 0.0) {
+        return 0.0;
+    }
+    double x = std::min(effective_penetration, settings.max_pen) / settings.bpen;
+    double elastic = settings.pressure_at_bpen * std::pow(x, static_cast<double>(settings.korder));
+    double damping = settings.damping_pressure * x * std::max(-closing_normal_velocity, 0.0);
+    return elastic + damping;
+}
+
+static DirectionalContactResult EvaluateDirectionalContact(const SurfaceGraph& surface_graph,
+                                                           const SparseSDF& target_sdf,
+                                                           const GearPose& surface_pose,
+                                                           const GearPose& target_pose,
+                                                           double theta_surface,
+                                                           double theta_target,
+                                                           double omega_surface,
+                                                           double omega_target,
+                                                           const RecurDynContactSettings& settings) {
+    DirectionalContactResult result;
+    std::vector<int> active_indices;
+    active_indices.reserve(surface_graph.samples.size());
+    SdfSampler sampler(target_sdf.grid->tree(), target_sdf.grid->transform());
+
+    const Mat3 r_surface = BodyRotation(surface_pose, theta_surface);
+    const Mat3 r_target = BodyRotation(target_pose, theta_target);
+    const Mat3 r_target_t = Transpose(r_target);
+
+    for (const auto& sample : surface_graph.samples) {
+        ChVector3d r_surface_world = r_surface * sample.local_pos;
+        ChVector3d world_pos = surface_pose.center + r_surface_world;
+        ChVector3d r_target_world = world_pos - target_pose.center;
+        ChVector3d target_local = r_target_t * r_target_world;
+        double phi = SampleSDF(target_sdf, sampler, target_local);
+        result.min_phi = std::min(result.min_phi, phi);
+
+        double effective_penetration = std::min(std::max(settings.bpen - phi, 0.0), settings.max_pen);
+        if (effective_penetration <= 0.0 || sample.area <= 0.0) {
+            continue;
+        }
+
+        ChVector3d normal_world = SafeNormalize(r_target * SDFGradient(target_sdf, sampler, target_local),
+                                                SafeNormalize(r_target_world, ChVector3d(0, 0, 1)));
+        ChVector3d v_surface = AngularVelocityXCross(omega_surface, r_surface_world);
+        ChVector3d v_target = AngularVelocityXCross(omega_target, r_target_world);
+        double normal_velocity = (v_surface - v_target).Dot(normal_world);
+        double pressure = RecurDynStylePressure(effective_penetration, normal_velocity, settings);
+        ChVector3d dforce = normal_world * (pressure * sample.area);
+
+        result.torque_on_surface += r_surface_world.Cross(dforce);
+        result.torque_on_target += r_target_world.Cross(dforce * -1.0);
+        result.max_effective_penetration = std::max(result.max_effective_penetration, effective_penetration);
+        result.active_samples++;
+        active_indices.push_back(sample.id);
+    }
+
+    result.patch_count = static_cast<int>(surface_graph.FindConnectedComponents(active_indices).size());
+    return result;
 }
 
 static FieldContactRuntimeSettings MakeSettings(double dt,
@@ -602,6 +1079,137 @@ static std::vector<SummaryRow> RunHeadonCase(std::ofstream& frames,
     return out;
 }
 
+static double Rms(const std::vector<double>& values) {
+    if (values.empty()) {
+        return 0.0;
+    }
+    double sum = 0.0;
+    for (double value : values) {
+        sum += value * value;
+    }
+    return std::sqrt(sum / static_cast<double>(values.size()));
+}
+
+static std::vector<SummaryRow> RunSimpleGearCase(std::ofstream& frames,
+                                                 const std::string& case_name,
+                                                 const std::filesystem::path& case_dir) {
+    SimpleGearRmd rmd = LoadSimpleGearRmd(case_dir / "simple gear.rmd");
+    rmd.contact.pressure_at_bpen = 2.0e5;
+    rmd.contact.damping_pressure = 1.0e8;
+
+    GearPose pose21{rmd.gear21.cm_marker_mm * 1.0e-3, rmd.gear21.part_rotation};
+    GearPose pose22{rmd.gear22.cm_marker_mm * 1.0e-3, rmd.gear22.part_rotation};
+
+    Mesh gear21 = LoadObjAsBodyLocal(case_dir / "models" / "gear_21.obj",
+                                     rmd.gear21.surface_ref_marker_mm,
+                                     rmd.gear21.surface_ref_rotation,
+                                     rmd.gear21.cm_marker_mm,
+                                     rmd.gear21.part_rotation);
+    Mesh gear22 = LoadObjAsBodyLocal(case_dir / "models" / "gear_22.obj",
+                                     rmd.gear22.surface_ref_marker_mm,
+                                     rmd.gear22.surface_ref_rotation,
+                                     rmd.gear22.cm_marker_mm,
+                                     rmd.gear22.part_rotation);
+    SparseSDF gear21_sdf = BuildSDF(gear21, 2.5e-5, 20.0f);
+    SparseSDF gear22_sdf = BuildSDF(gear22, 2.5e-5, 20.0f);
+    SurfaceGraph gear21_graph = MakeTriangleMeshSurfaceGraph(gear21.vertices, gear21.faces);
+    SurfaceGraph gear22_graph = MakeTriangleMeshSurfaceGraph(gear22.vertices, gear22.faces);
+    auto reference = LoadGear22Reference(case_dir / "data" / "Gear22.csv");
+    if (reference.empty()) {
+        throw std::runtime_error("Simple gear reference is empty");
+    }
+
+    const double omega21 = 1.0;
+    const double dt = 5.0e-6;
+    const double startup_time = 0.02;
+    double theta21 = 0.0;
+    double theta22 = 0.0;
+    double omega22 = 0.0;
+    double time_integrated = 0.0;
+    double last_alpha = 0.0;
+    double last_torque = 0.0;
+    int last_patch_count = 0;
+    double last_min_phi = 0.0;
+
+    std::vector<double> all_errors;
+    std::vector<double> post_startup_errors;
+    std::vector<double> post_startup_jumps;
+    double previous_output_omega = omega22;
+    bool have_previous_output = false;
+    GearReferenceRow last_ref = reference.front();
+
+    for (const auto& ref : reference) {
+        while (time_integrated < ref.time - 1.0e-14) {
+            double step = std::min(dt, ref.time - time_integrated);
+            DirectionalContactResult gear22_on_gear21 =
+                EvaluateDirectionalContact(gear22_graph,
+                                           gear21_sdf,
+                                           pose22,
+                                           pose21,
+                                           theta22,
+                                           theta21,
+                                           omega22,
+                                           omega21,
+                                           rmd.contact);
+            DirectionalContactResult gear21_on_gear22 =
+                EvaluateDirectionalContact(gear21_graph,
+                                           gear22_sdf,
+                                           pose21,
+                                           pose22,
+                                           theta21,
+                                           theta22,
+                                           omega21,
+                                           omega22,
+                                           rmd.contact);
+
+            double torque_from_gear22_surface = gear22_on_gear21.torque_on_surface.x();
+            double torque_from_gear21_surface = gear21_on_gear22.torque_on_target.x();
+            last_torque = 0.5 * (torque_from_gear22_surface + torque_from_gear21_surface);
+            last_alpha = last_torque / rmd.gear22.inertia_x_kg_m2;
+            last_patch_count = gear22_on_gear21.patch_count + gear21_on_gear22.patch_count;
+            last_min_phi = std::min(gear22_on_gear21.min_phi, gear21_on_gear22.min_phi);
+
+            omega22 += last_alpha * step;
+            theta22 += omega22 * step;
+            theta21 += omega21 * step;
+            time_integrated += step;
+        }
+
+        double error = omega22 - ref.omega_rx;
+        all_errors.push_back(error);
+        if (ref.time >= startup_time) {
+            post_startup_errors.push_back(error);
+            if (have_previous_output) {
+                post_startup_jumps.push_back(std::abs(omega22 - previous_output_omega));
+            }
+        }
+        have_previous_output = true;
+        previous_output_omega = omega22;
+        last_ref = ref;
+
+        frames << case_name << "," << ref.time << ",sparse_sdf_contact_force_dynamics,"
+               << omega22 << "," << ref.omega_rx << "," << error << ","
+               << "0,0,0,0,0,0," << last_patch_count << "," << last_min_phi << "\n";
+        (void)last_alpha;
+        (void)last_torque;
+    }
+
+    const double final_error = std::abs(omega22 - last_ref.omega_rx);
+    const double rms_after_startup = Rms(post_startup_errors);
+    const double max_jump_after_startup =
+        post_startup_jumps.empty() ? 0.0 : *std::max_element(post_startup_jumps.begin(), post_startup_jumps.end());
+
+    std::vector<SummaryRow> out;
+    out.push_back(SummaryRow{case_name, "gear22_rx_final", final_error, final_error, 2.0e-2,
+                             final_error <= 2.0e-2});
+    out.push_back(SummaryRow{case_name, "gear22_rx_rms_t_ge_0p02", rms_after_startup, rms_after_startup,
+                             9.0e-2, rms_after_startup <= 9.0e-2});
+    out.push_back(SummaryRow{case_name, "gear22_rx_max_jump_t_ge_0p02", max_jump_after_startup,
+                             max_jump_after_startup, 1.5e-1, max_jump_after_startup <= 1.5e-1});
+    (void)all_errors;
+    return out;
+}
+
 static void WriteSummary(const std::filesystem::path& path, const std::vector<SummaryRow>& rows) {
     std::ofstream out(path);
     out << "case,quantity,max_abs_error,rms_error,tolerance,passed\n";
@@ -697,6 +1305,14 @@ int main() {
                              0.5));
         timings.push_back(
             TimingRow{"headon_spheres_mass_ratio",
+                      std::chrono::duration<double>(Clock::now() - case_start).count()});
+
+        case_start = Clock::now();
+        append(RunSimpleGearCase(frames,
+                                 "simple_gear",
+                                 cases / "simple_gear"));
+        timings.push_back(
+            TimingRow{"simple_gear",
                       std::chrono::duration<double>(Clock::now() - case_start).count()});
 
         WriteSummary(out_dir / "comparison_summary.csv", summary);

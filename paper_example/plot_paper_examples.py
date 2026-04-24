@@ -155,6 +155,43 @@ def plot_headon_case(rows, model, case_name, output_dir):
     save_figure(fig, output_dir / f"{case_name}_curves")
 
 
+def plot_simple_gear_case(rows, case_name, output_dir):
+    times = col(rows, "time")
+    omega = col(rows, "backend_y")
+    reference = col(rows, "reference_y")
+    error = col(rows, "y_error")
+    patch_count = col(rows, "patch_count")
+
+    fig, axes = plt.subplots(4, 1, figsize=(9.0, 9.5), sharex=False)
+    axes[0].plot(times, omega, label="backend dynamic", linewidth=1.6)
+    axes[0].plot(times, reference, "--", label="reference", linewidth=1.4)
+    axes[0].set_ylabel(r"GEAR22 $\omega_x$ (rad/s)")
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+
+    zoom_rows = [i for i, time in enumerate(times) if time <= 0.05]
+    axes[1].plot([times[i] for i in zoom_rows], [omega[i] for i in zoom_rows],
+                 label="backend dynamic", linewidth=1.6)
+    axes[1].plot([times[i] for i in zoom_rows], [reference[i] for i in zoom_rows],
+                 "--", label="reference", linewidth=1.4)
+    axes[1].set_ylabel(r"0-0.05 s $\omega_x$")
+    axes[1].grid(True, alpha=0.3)
+
+    axes[2].plot(times, error, color="#b7410e", linewidth=1.2)
+    axes[2].axhline(0.0, color="black", linewidth=0.8)
+    axes[2].set_ylabel("error (rad/s)")
+    axes[2].grid(True, alpha=0.3)
+
+    axes[3].step(times, patch_count, where="post", color="#2f6f4e", linewidth=1.2)
+    axes[3].set_xlabel("time (s)")
+    axes[3].set_ylabel("patch count")
+    axes[3].grid(True, alpha=0.3)
+
+    fig.suptitle(case_name)
+    fig.tight_layout()
+    save_figure(fig, output_dir / f"{case_name}_curves")
+
+
 def main():
     args = parse_args()
     project_root = Path(args.project_root).resolve()
@@ -170,6 +207,8 @@ def main():
     for case_name in ("headon_spheres", "headon_spheres_mass_ratio"):
         model = load_json(paper_dir / "cases" / case_name / f"{case_name}_model.json")
         plot_headon_case(rows_for(frames, case_name), model, case_name, figure_dir)
+
+    plot_simple_gear_case(rows_for(frames, "simple_gear"), "simple_gear", figure_dir)
 
     print(f"Wrote figures to {figure_dir}")
 

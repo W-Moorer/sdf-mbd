@@ -9,7 +9,8 @@
     "timing_summary.csv",
     "../../paper_example/figures/eccentric_roller_curves.pdf",
     "../../paper_example/figures/headon_spheres_curves.pdf",
-    "../../paper_example/figures/headon_spheres_mass_ratio_curves.pdf"
+    "../../paper_example/figures/headon_spheres_mass_ratio_curves.pdf",
+    "../../paper_example/figures/simple_gear_curves.pdf"
   ],
   "cases": [
     {
@@ -76,6 +77,31 @@
         {
           "quantity": "sphere_b_vx",
           "tolerance": 0.05
+        }
+      ]
+    },
+    {
+      "name": "simple_gear",
+      "kind": "simple_gear",
+      "model": "cases/simple_gear/simple_gear_model.json",
+      "models": [
+        "cases/simple_gear/simple gear.rmd",
+        "cases/simple_gear/models/gear_21.obj",
+        "cases/simple_gear/models/gear_22.obj",
+        "cases/simple_gear/data/Gear22.csv"
+      ],
+      "checks": [
+        {
+          "quantity": "gear22_rx_final",
+          "tolerance": 0.02
+        },
+        {
+          "quantity": "gear22_rx_rms_t_ge_0p02",
+          "tolerance": 0.09
+        },
+        {
+          "quantity": "gear22_rx_max_jump_t_ge_0p02",
+          "tolerance": 0.15
         }
       ]
     }

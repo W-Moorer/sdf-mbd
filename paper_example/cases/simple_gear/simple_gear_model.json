@@ -1,0 +1,13 @@
+{
+  "description": "RecurDyn simple gear benchmark locked for bidirectional sparse-SDF contact dynamics.",
+  "rmd": "simple gear.rmd",
+  "gear21_obj": "models/gear_21.obj",
+  "gear22_obj": "models/gear_22.obj",
+  "gear22_reference_csv": "data/Gear22.csv",
+  "drive_omega21_rx": 1.0,
+  "duration": 1.0,
+  "dt": 5.0e-6,
+  "pressure_at_bpen": 200000.0,
+  "damping_pressure": 100000000.0,
+  "startup_time_for_regression": 0.02
+}

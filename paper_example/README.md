@@ -7,6 +7,7 @@ The examples are self-contained here:
 - `cases/eccentric_roller`
 - `cases/headon_spheres`
 - `cases/headon_spheres_mass_ratio`
+- `cases/simple_gear`
 
 The executable source is `paper_examples_openvdb.cpp`. It uses the project backend (`chrono::fieldcontact` plus OpenVDB sparse narrow-band SDF) and writes:
 
@@ -25,3 +26,5 @@ python paper_example\check_paper_examples.py --project-root .
 ```
 
 When field-contact regression tests are enabled in CMake, CTest runs the executable and then validates the summary against `manifest.json`.
+
+The `simple_gear` case locks the RecurDyn RMD, GEAR21/GEAR22 OBJ surfaces, and the GEAR22 RX reference curve. Its regression checks verify the final driven-wheel angular speed, post-startup RMS error, and post-startup adjacent-sample jump for the bidirectional sparse-SDF contact response.
