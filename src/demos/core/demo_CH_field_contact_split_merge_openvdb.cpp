@@ -36,7 +36,7 @@
 #include <string>
 #include <vector>
 
-#include "chrono/collision/ChFieldContactPrimitives.h"
+#include "chrono/collision/ChFieldContactRuntime.h"
 #include "chrono/physics/ChBody.h"
 #include "chrono/physics/ChSystemSMC.h"
 
@@ -207,10 +207,16 @@ static openvdb::FloatGrid::Ptr BuildLevelSetFromTriangleMesh(const DemoTriangleM
 
 static std::string GetProjectRoot() {
     auto path = std::filesystem::current_path();
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 8; i++) {
+        if (std::filesystem::exists(path / "src") && std::filesystem::exists(path / "paper")) {
+            return path.string();
+        }
+        if (!path.has_parent_path() || path == path.parent_path()) {
+            break;
+        }
         path = path.parent_path();
     }
-    return path.string();
+    return std::filesystem::current_path().string();
 }
 
 static std::string JoinSourceIds(const std::vector<HistorySource>& sources) {
@@ -297,6 +303,13 @@ int main(int argc, char* argv[]) {
     inheritance_settings.max_center_distance = 0.18;
     inheritance_settings.geometry_fallback_weight = 0.05;
 
+    FieldContactRuntimeSettings contact_settings;
+    contact_settings.extraction = extract_settings;
+    contact_settings.normal = normal_settings;
+    contact_settings.tangential = tangential_settings;
+    contact_settings.inheritance = inheritance_settings;
+    FieldContactPrimitiveTracker contact_tracker;
+
     ChSystemSMC sys;
     sys.SetGravitationalAcceleration(ChVector3d(0, 0, 0));
     sys.SetSolverType(ChSolver::Type::PSOR);
@@ -331,10 +344,6 @@ int main(int argc, char* argv[]) {
               << "source_count,source_weight_sum,sources,normal_force,tangential_force,friction_limit,"
               << "tangent_ratio,energy_before_gate,energy_after_gate,energy_gate_ratio,"
               << "source_energy_bound,inherited_energy,inherited_energy_ratio,stick_slip" << std::endl;
-
-    std::vector<PrimitiveSnapshot> previous_snapshots;
-    std::map<int, TangentialHistory> history_store;
-    int next_persistent_id = 0;
 
     int frames_with_two = 0;
     int frames_with_one = 0;
@@ -383,188 +392,55 @@ int main(int argc, char* argv[]) {
             queries[si] = target_sdf.Query(world_pos, world_vel);
         }
 
-        std::vector<int> active = BuildActiveSet(queries, extract_settings.activation_band);
-        std::vector<PrimitivePatch> patches = ExtractPrimitives(plane_graph, queries, active, extract_settings);
+        FieldContactStepResult contact_step =
+            contact_tracker.Evaluate(plane_graph, queries, body_pos, contact_settings);
 
-        struct PatchCandidate {
-            std::vector<HistorySource> sources;
-            int persistent_id = -1;
-            std::string event = "stable";
-        };
+        const auto& stats = contact_step.stats;
+        int newborn_count = stats.newborn_count;
+        int merge_count = stats.merge_count;
+        int split_count = stats.split_count;
+        int death_count = stats.death_count;
+        int max_source_count = stats.max_source_count;
+        int max_previous_reuse = stats.max_previous_reuse;
+        ChVector3d total_force = contact_step.total_force;
+        ChVector3d total_torque = contact_step.total_torque;
+        double max_tangent_ratio = stats.max_tangential_force_ratio;
+        double max_energy_gate_ratio = stats.max_energy_gate_ratio;
+        double max_inherited_energy_ratio = stats.max_inherited_energy_ratio;
 
-        std::vector<PatchCandidate> candidates(patches.size());
-        std::map<int, std::vector<int>> primary_users;
-        std::set<int> referenced_previous;
-
-        for (size_t pi = 0; pi < patches.size(); pi++) {
-            candidates[pi].sources = ComputeHistorySources(patches[pi], previous_snapshots, plane_graph, inheritance_settings);
-            if (!candidates[pi].sources.empty()) {
-                int primary = candidates[pi].sources.front().persistent_id;
-                primary_users[primary].push_back(static_cast<int>(pi));
-                for (const auto& source : candidates[pi].sources) {
-                    referenced_previous.insert(source.persistent_id);
-                }
-            }
-        }
-
-        for (auto& entry : primary_users) {
-            auto& users = entry.second;
-            std::sort(users.begin(), users.end(), [&](int a, int b) {
-                double wa = candidates[a].sources.empty() ? 0.0 : candidates[a].sources.front().weight;
-                double wb = candidates[b].sources.empty() ? 0.0 : candidates[b].sources.front().weight;
-                return wa > wb;
-            });
-        }
-
-        int newborn_count = 0;
-        int merge_count = 0;
-        int split_count = 0;
-        int max_source_count = 0;
-        int max_previous_reuse = 0;
-        for (const auto& entry : primary_users) {
-            max_previous_reuse = std::max(max_previous_reuse, static_cast<int>(entry.second.size()));
-        }
-
-        for (size_t pi = 0; pi < patches.size(); pi++) {
-            auto& candidate = candidates[pi];
-            max_source_count = std::max(max_source_count, static_cast<int>(candidate.sources.size()));
-
-            if (candidate.sources.empty()) {
-                candidate.persistent_id = next_persistent_id++;
-                candidate.event = "newborn";
-                newborn_count++;
-                total_newborn++;
-                continue;
-            }
-
-            int primary = candidate.sources.front().persistent_id;
-            const auto& users = primary_users[primary];
-            bool split_child = users.size() > 1 && users.front() != static_cast<int>(pi);
-            bool merge_patch = candidate.sources.size() > 1;
-
-            if (split_child) {
-                candidate.persistent_id = next_persistent_id++;
-                candidate.event = merge_patch ? "split_merge" : "split";
-                split_count++;
-                total_split_patches++;
-            } else {
-                candidate.persistent_id = primary;
-                if (merge_patch) {
-                    candidate.event = "merge";
-                    merge_count++;
-                    total_merge_patches++;
-                } else if (users.size() > 1) {
-                    candidate.event = "split_primary";
-                    split_count++;
-                    total_split_patches++;
-                } else {
-                    candidate.event = "stable";
-                }
-            }
-        }
-
-        int death_count = 0;
-        for (const auto& prev : previous_snapshots) {
-            if (!referenced_previous.count(prev.persistent_id)) {
-                death_count++;
-            }
-        }
+        total_newborn += newborn_count;
         total_death += death_count;
+        total_merge_patches += merge_count;
+        total_split_patches += split_count;
 
-        std::vector<PrimitiveSnapshot> current_snapshots;
-        std::map<int, TangentialHistory> new_history_store;
-        ChVector3d total_force(0, 0, 0);
-        ChVector3d total_torque(0, 0, 0);
-        double max_tangent_ratio = 0.0;
-        double max_energy_gate_ratio = 0.0;
-        double max_inherited_energy_ratio = 0.0;
-
-        for (size_t pi = 0; pi < patches.size(); pi++) {
-            auto& patch = patches[pi];
-            auto& candidate = candidates[pi];
-
-            ApplyNormalContactIntegral(patch, plane_graph, queries, body_pos, normal_settings);
-
-            std::vector<WeightedTangentialHistorySource> weighted_history_sources;
-            double source_weight_sum = 0.0;
-            double source_energy_bound = 0.0;
-            for (const auto& source : candidate.sources) {
-                source_weight_sum += source.weight;
-                auto hist_it = history_store.find(source.persistent_id);
-                if (hist_it != history_store.end() && hist_it->second.valid) {
-                    WeightedTangentialHistorySource weighted_source;
-                    weighted_source.history = hist_it->second;
-                    weighted_source.weight = source.weight;
-                    weighted_history_sources.push_back(weighted_source);
-
-                    ChVector3d source_xi = TransportElasticStateMinimalRotation(hist_it->second.xi_elastic_world,
-                                                                                hist_it->second.normal,
-                                                                                patch.normal);
-                    source_energy_bound += source.weight * 0.5 * tangential_settings.stiffness * source_xi.Dot(source_xi);
-                }
-            }
-
-            TangentialHistory aggregated_history =
-                AggregateTangentialHistorySources(weighted_history_sources, patch.normal, candidate.persistent_id);
-            const TangentialHistory* previous_history = aggregated_history.valid ? &aggregated_history : nullptr;
-            double inherited_energy = 0.5 * tangential_settings.stiffness *
-                                      aggregated_history.xi_elastic_world.Dot(aggregated_history.xi_elastic_world);
-            double inherited_energy_ratio = source_energy_bound > 1.0e-16 ?
-                                                inherited_energy / source_energy_bound :
-                                                0.0;
-
-            ChVector3d vt = ProjectToTangent(patch.representative_velocity, patch.normal);
-            TangentialUpdateResult tangential =
-                UpdateTangentialContact(previous_history,
-                                        patch.normal,
-                                        vt,
-                                        patch.normal_force.Length(),
-                                        previous_history ? 1.0 : 0.0,
-                                        tangential_settings);
-            tangential.history.persistent_id = candidate.persistent_id;
-            new_history_store[candidate.persistent_id] = tangential.history;
-
-            patch.tangential_force = tangential.force;
-            patch.force = patch.normal_force + patch.tangential_force;
-            patch.torque += (patch.center - body_pos).Cross(patch.tangential_force);
-
-            total_force += patch.force;
-            total_torque += patch.torque;
-            current_snapshots.push_back(MakeSnapshot(patch, candidate.persistent_id));
-
-            double tangent_ratio = tangential.friction_limit > 1.0e-12 ?
-                                       tangential.final_force_norm / tangential.friction_limit :
-                                       0.0;
-            double energy_ratio = tangential.stored_energy_before_gate > 1.0e-16 ?
-                                      tangential.stored_energy_after_gate / tangential.stored_energy_before_gate :
-                                      0.0;
-            max_tangent_ratio = std::max(max_tangent_ratio, tangent_ratio);
-            max_energy_gate_ratio = std::max(max_energy_gate_ratio, energy_ratio);
-            max_inherited_energy_ratio = std::max(max_inherited_energy_ratio, inherited_energy_ratio);
+        for (size_t pi = 0; pi < contact_step.patches.size(); pi++) {
+            const auto& patch_result = contact_step.patches[pi];
+            const auto& patch = patch_result.patch;
+            const auto& tangential = patch_result.tangential;
 
             patch_csv << frame << ","
                       << std::fixed << std::setprecision(8)
                       << time << ","
                       << pi << ","
-                      << candidate.persistent_id << ","
-                      << candidate.event << ","
+                      << patch_result.persistent_id << ","
+                      << FieldContactPrimitiveEventName(patch_result.event) << ","
                       << patch.area << ","
                       << patch.center.x() << ","
                       << patch.center.y() << ","
                       << patch.center.z() << ","
-                      << candidate.sources.size() << ","
-                      << source_weight_sum << ","
-                      << JoinSourceIds(candidate.sources) << ","
+                      << patch_result.sources.size() << ","
+                      << patch_result.source_weight_sum << ","
+                      << JoinSourceIds(patch_result.sources) << ","
                       << patch.normal_force.Length() << ","
                       << tangential.final_force_norm << ","
                       << tangential.friction_limit << ","
-                      << tangent_ratio << ","
+                      << patch_result.tangential_force_ratio << ","
                       << tangential.stored_energy_before_gate << ","
                       << tangential.stored_energy_after_gate << ","
-                      << energy_ratio << ","
-                      << source_energy_bound << ","
-                      << inherited_energy << ","
-                      << inherited_energy_ratio << ","
+                      << patch_result.energy_gate_ratio << ","
+                      << patch_result.source_energy_bound << ","
+                      << patch_result.inherited_energy << ","
+                      << patch_result.inherited_energy_ratio << ","
                       << (tangential.state == StickSlipState::Stick ? "stick" : "slip") << std::endl;
         }
 
@@ -582,7 +458,7 @@ int main(int argc, char* argv[]) {
         previous_total_force = total_force;
         previous_total_torque = total_torque;
 
-        max_patch_count = std::max(max_patch_count, static_cast<int>(patches.size()));
+        max_patch_count = std::max(max_patch_count, stats.patch_count);
         max_source_count_all = std::max(max_source_count_all, max_source_count);
         max_previous_reuse_all = std::max(max_previous_reuse_all, max_previous_reuse);
         max_tangent_ratio_all = std::max(max_tangent_ratio_all, max_tangent_ratio);
@@ -593,10 +469,10 @@ int main(int argc, char* argv[]) {
         max_tracking_error = std::max(max_tracking_error, (body_pos - desired_pos).Length());
         max_contact_force = std::max(max_contact_force, total_force.Length());
         max_guide_force = std::max(max_guide_force, guide_force.Length());
-        if (patches.size() == 1) {
+        if (stats.patch_count == 1) {
             frames_with_one++;
         }
-        if (patches.size() == 2) {
+        if (stats.patch_count == 2) {
             frames_with_two++;
         }
         if (merge_count > 0) {
@@ -610,7 +486,7 @@ int main(int argc, char* argv[]) {
                   << std::fixed << std::setprecision(8)
                   << time << ","
                   << body_pos.y() << ","
-                  << patches.size() << ","
+                  << stats.patch_count << ","
                   << newborn_count << ","
                   << merge_count << ","
                   << split_count << ","
@@ -638,8 +514,6 @@ int main(int argc, char* argv[]) {
                   << max_energy_gate_ratio << ","
                   << max_inherited_energy_ratio << std::endl;
 
-        previous_snapshots = current_snapshots;
-        history_store = new_history_store;
         sys.DoStepDynamics(dt);
     }
 

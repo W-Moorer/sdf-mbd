@@ -21,7 +21,7 @@
 #include <string>
 #include <vector>
 
-#include "chrono/collision/ChFieldContactPrimitives.h"
+#include "chrono/collision/ChFieldContactRuntime.h"
 
 using namespace chrono;
 using namespace chrono::fieldcontact;
@@ -79,6 +79,17 @@ PrimitiveSnapshot MakeSnapshot(int persistent_id, std::vector<int> sample_ids) {
     snapshot.normal = ChVector3d(0, 1, 0);
     snapshot.area = static_cast<double>(sample_ids.size());
     return snapshot;
+}
+
+std::vector<FieldSampleQuery> MakeQueries(const SurfaceGraph& graph) {
+    std::vector<FieldSampleQuery> queries(graph.samples.size());
+    for (size_t i = 0; i < graph.samples.size(); i++) {
+        queries[i].phi = 0.01;
+        queries[i].grad = ChVector3d(0, 1, 0);
+        queries[i].world_pos = graph.samples[i].local_pos;
+        queries[i].world_vel = ChVector3d(0, 0, 0);
+    }
+    return queries;
 }
 
 double SourceWeightSum(const std::vector<HistorySource>& sources) {
@@ -244,6 +255,50 @@ void TestSplitClassification() {
           "Split child source weights must be bounded");
 }
 
+void TestRuntimeTrackerClassifiesEvents() {
+    SurfaceGraph graph = MakeIndexedGraph(4);
+    std::vector<FieldSampleQuery> queries = MakeQueries(graph);
+
+    FieldContactRuntimeSettings settings;
+    settings.inheritance.min_overlap = 0.01;
+    settings.inheritance.min_normal_dot = 0.1;
+    settings.inheritance.max_center_distance = 10.0;
+    settings.inheritance.geometry_fallback_weight = 0.0;
+
+    FieldContactPrimitiveTracker tracker;
+    tracker.EvaluatePatches(graph,
+                            queries,
+                            {MakePatch({0, 1, 2}), MakePatch({3})},
+                            ChVector3d(0, 0, 0),
+                            settings);
+    FieldContactStepResult merge =
+        tracker.EvaluatePatches(graph, queries, {MakePatch({0, 1, 2, 3})}, ChVector3d(0, 0, 0), settings);
+
+    Check(merge.stats.patch_count == 1, "Runtime merge should have one patch");
+    Check(merge.stats.merge_count == 1, "Runtime tracker should classify a merge");
+    Check(merge.patches[0].event == FieldContactPrimitiveEvent::Merge, "Runtime merge event kind");
+    Check(merge.patches[0].sources.size() == 2, "Runtime merge should have two sources");
+    Check(merge.patches[0].source_weight_sum <= 1.0 + 1.0e-12, "Runtime merge source weight bound");
+
+    tracker.Reset();
+    tracker.EvaluatePatches(graph, queries, {MakePatch({0, 1, 2, 3})}, ChVector3d(0, 0, 0), settings);
+    FieldContactStepResult split =
+        tracker.EvaluatePatches(graph,
+                                queries,
+                                {MakePatch({0, 1, 2}), MakePatch({3})},
+                                ChVector3d(0, 0, 0),
+                                settings);
+
+    Check(split.stats.patch_count == 2, "Runtime split should have two patches");
+    Check(split.stats.split_count == 2, "Runtime tracker should classify split primary and child");
+    Check(split.patches[0].event == FieldContactPrimitiveEvent::SplitPrimary, "Runtime split primary event kind");
+    Check(split.patches[1].event == FieldContactPrimitiveEvent::Split, "Runtime split child event kind");
+    Check(split.patches[0].sources[0].persistent_id == split.patches[1].sources[0].persistent_id,
+          "Runtime split children should inherit from same parent");
+    Check(split.patches[0].source_weight_sum + split.patches[1].source_weight_sum <= 1.0 + 1.0e-12,
+          "Runtime split source weights must be bounded");
+}
+
 }  // namespace
 
 int main() {
@@ -251,6 +306,7 @@ int main() {
     TestHistoryNonAmplification();
     TestMergeClassification();
     TestSplitClassification();
+    TestRuntimeTrackerClassifiesEvents();
 
     if (failures == 0) {
         std::cout << "Field contact primitive regression checks passed." << std::endl;
