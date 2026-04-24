@@ -100,6 +100,33 @@ struct FieldContactStepResult {
     ChVector3d total_torque = ChVector3d(0, 0, 0);
 };
 
+struct FieldContactBodyWrench {
+    ChVector3d force = ChVector3d(0, 0, 0);
+    ChVector3d torque = ChVector3d(0, 0, 0);
+};
+
+struct FieldContactPairSettings {
+    double active_force_tolerance = 1.0e-14;
+    double contact_point_weight_tolerance = 1.0e-14;
+};
+
+struct FieldContactPairResult {
+    FieldContactBodyWrench on_a;
+    FieldContactBodyWrench on_b;
+    ChVector3d application_point = ChVector3d(0, 0, 0);
+    ChVector3d force_residual = ChVector3d(0, 0, 0);
+    ChVector3d torque_residual = ChVector3d(0, 0, 0);
+    double force_residual_norm = 0.0;
+    double torque_residual_norm = 0.0;
+    double raw_force_a_norm = 0.0;
+    double raw_force_b_norm = 0.0;
+    double symmetric_force_norm = 0.0;
+    double force_amplification_ratio = 0.0;
+    double max_tangential_force_ratio = 0.0;
+    bool used_a_to_b = false;
+    bool used_b_to_a = false;
+};
+
 class FieldContactPrimitiveTracker {
   public:
     void Reset(int next_persistent_id = 0) {
@@ -317,6 +344,88 @@ class FieldContactPrimitiveTracker {
     std::vector<PrimitiveSnapshot> m_previous_snapshots;
     std::map<int, TangentialHistory> m_history_store;
 };
+
+inline ChVector3d EstimateFieldContactApplicationPoint(const FieldContactStepResult& step,
+                                                       double weight_tolerance) {
+    ChVector3d weighted_point(0, 0, 0);
+    double weight_sum = 0.0;
+
+    for (const auto& patch_result : step.patches) {
+        double weight = patch_result.patch.force.Length();
+        if (weight <= weight_tolerance) {
+            weight = patch_result.patch.normal_force.Length();
+        }
+        if (weight <= weight_tolerance) {
+            weight = patch_result.patch.area;
+        }
+        if (weight <= weight_tolerance) {
+            continue;
+        }
+
+        weighted_point += patch_result.patch.center * weight;
+        weight_sum += weight;
+    }
+
+    return weight_sum > weight_tolerance ? weighted_point / weight_sum : ChVector3d(0, 0, 0);
+}
+
+inline FieldContactPairResult CombineBidirectionalFieldContactPair(
+    const FieldContactStepResult& a_surface_on_b,
+    const ChVector3d& reference_a,
+    const FieldContactStepResult& b_surface_on_a,
+    const ChVector3d& reference_b,
+    const FieldContactPairSettings& settings = FieldContactPairSettings()) {
+    FieldContactPairResult result;
+    result.raw_force_a_norm = a_surface_on_b.total_force.Length();
+    result.raw_force_b_norm = b_surface_on_a.total_force.Length();
+    result.used_a_to_b = result.raw_force_a_norm > settings.active_force_tolerance;
+    result.used_b_to_a = result.raw_force_b_norm > settings.active_force_tolerance;
+    result.max_tangential_force_ratio = std::max(a_surface_on_b.stats.max_tangential_force_ratio,
+                                                 b_surface_on_a.stats.max_tangential_force_ratio);
+
+    ChVector3d force_on_a(0, 0, 0);
+    if (result.used_a_to_b && result.used_b_to_a) {
+        force_on_a = 0.5 * (a_surface_on_b.total_force - b_surface_on_a.total_force);
+    } else if (result.used_a_to_b) {
+        force_on_a = a_surface_on_b.total_force;
+    } else if (result.used_b_to_a) {
+        force_on_a = -b_surface_on_a.total_force;
+    }
+
+    ChVector3d point_a = EstimateFieldContactApplicationPoint(a_surface_on_b,
+                                                              settings.contact_point_weight_tolerance);
+    ChVector3d point_b = EstimateFieldContactApplicationPoint(b_surface_on_a,
+                                                              settings.contact_point_weight_tolerance);
+    if (result.used_a_to_b && result.used_b_to_a) {
+        result.application_point = 0.5 * (point_a + point_b);
+    } else if (result.used_a_to_b) {
+        result.application_point = point_a;
+    } else if (result.used_b_to_a) {
+        result.application_point = point_b;
+    } else {
+        result.application_point = 0.5 * (reference_a + reference_b);
+    }
+
+    result.on_a.force = force_on_a;
+    result.on_b.force = -force_on_a;
+    result.on_a.torque = (result.application_point - reference_a).Cross(result.on_a.force);
+    result.on_b.torque = (result.application_point - reference_b).Cross(result.on_b.force);
+
+    result.force_residual = result.on_a.force + result.on_b.force;
+    ChVector3d pair_reference = 0.5 * (reference_a + reference_b);
+    result.torque_residual = result.on_a.torque + (reference_a - pair_reference).Cross(result.on_a.force) +
+                             result.on_b.torque + (reference_b - pair_reference).Cross(result.on_b.force);
+    result.force_residual_norm = result.force_residual.Length();
+    result.torque_residual_norm = result.torque_residual.Length();
+    result.symmetric_force_norm = result.on_a.force.Length();
+
+    double max_raw_force = std::max(result.raw_force_a_norm, result.raw_force_b_norm);
+    result.force_amplification_ratio = max_raw_force > settings.active_force_tolerance ?
+                                           result.symmetric_force_norm / max_raw_force :
+                                           0.0;
+
+    return result;
+}
 
 }  // namespace fieldcontact
 }  // namespace chrono

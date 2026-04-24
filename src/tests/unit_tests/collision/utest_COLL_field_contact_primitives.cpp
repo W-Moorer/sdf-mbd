@@ -22,6 +22,7 @@
 
 #include "chrono/collision/ChFieldContactRuntime.h"
 #include "chrono/core/ChRotation.h"
+#include "chrono/physics/ChBody.h"
 
 #include "gtest/gtest.h"
 
@@ -75,6 +76,24 @@ std::vector<FieldSampleQuery> MakeQueries(const SurfaceGraph& graph) {
         queries[i].world_vel = ChVector3d(0, 0, 0);
     }
     return queries;
+}
+
+FieldContactStepResult MakeOneSidedPairStep(const ChVector3d& force,
+                                            const ChVector3d& contact_point,
+                                            double tangent_ratio) {
+    FieldContactStepResult step;
+    FieldContactPatchRuntimeResult patch_result;
+    patch_result.patch.center = contact_point;
+    patch_result.patch.force = force;
+    patch_result.patch.normal_force = force;
+    patch_result.patch.area = 1.0;
+    patch_result.tangential_force_ratio = tangent_ratio;
+
+    step.patches.push_back(patch_result);
+    step.stats.patch_count = 1;
+    step.stats.max_tangential_force_ratio = tangent_ratio;
+    step.total_force = force;
+    return step;
 }
 
 ChVector3d ProjectionOnlyTransport(const ChVector3d& xi_elastic_world_prev, const ChVector3d& normal_cur) {
@@ -376,4 +395,107 @@ TEST(FieldContactPrimitives, MinimalRotationTransportBeatsProjectionOnlyTranspor
     ASSERT_GE(projection_error_ratio, 0.10);
     ASSERT_LT(projection_energy_ratio, 0.90);
     ASSERT_GT(projection_error_ratio, 1.0e8 * std::max(minimal_error_ratio, 1.0e-16));
+}
+
+TEST(FieldContactPrimitives, BidirectionalPairConservesAndDeduplicatesForces) {
+    ChVector3d reference_a(-0.4, 0.1, -0.2);
+    ChVector3d reference_b(0.6, -0.15, 0.25);
+    ChVector3d contact_point(0.1, 0.05, 0.2);
+
+    FieldContactStepResult a_to_b = MakeOneSidedPairStep(ChVector3d(12, 30, -4), contact_point, 0.72);
+    FieldContactStepResult b_to_a = MakeOneSidedPairStep(ChVector3d(-10, -34, 3), contact_point, 0.91);
+
+    FieldContactPairResult pair =
+        CombineBidirectionalFieldContactPair(a_to_b, reference_a, b_to_a, reference_b);
+
+    ASSERT_NEAR(pair.force_residual.Length(), 0.0, 1.0e-12);
+    ASSERT_NEAR(pair.torque_residual.Length(), 0.0, 1.0e-12);
+    ASSERT_LE(pair.force_amplification_ratio, 1.0 + 1.0e-12);
+    ASSERT_LT(pair.symmetric_force_norm, a_to_b.total_force.Length() + b_to_a.total_force.Length());
+    ASSERT_NEAR(pair.max_tangential_force_ratio, 0.91, 1.0e-12);
+    ASSERT_LE(pair.max_tangential_force_ratio, 1.0 + 1.0e-12);
+}
+
+TEST(FieldContactPrimitives, BidirectionalRuntimeEvaluatesBothSurfaceFieldDirections) {
+    SurfaceGraph graph_a = MakeIndexedGraph(1);
+    SurfaceGraph graph_b = MakeIndexedGraph(1);
+    ChVector3d reference_a(-0.5, 0, 0);
+    ChVector3d reference_b(0.5, 0, 0);
+    ChVector3d contact_point(0, 0.1, 0);
+
+    std::vector<FieldSampleQuery> queries_a(1);
+    queries_a[0].phi = -0.01;
+    queries_a[0].grad = ChVector3d(1, 0, 0);
+    queries_a[0].world_pos = contact_point;
+    queries_a[0].world_vel = ChVector3d(0, 0, 0);
+
+    std::vector<FieldSampleQuery> queries_b(1);
+    queries_b[0].phi = -0.01;
+    queries_b[0].grad = ChVector3d(-1, 0, 0);
+    queries_b[0].world_pos = contact_point;
+    queries_b[0].world_vel = ChVector3d(0, 0, 0);
+
+    FieldContactRuntimeSettings settings;
+    settings.extraction.activation_band = 0.0;
+    settings.extraction.min_samples = 1;
+    settings.extraction.min_area = 0.0;
+    settings.normal.stiffness = 1000.0;
+    settings.normal.damping = 0.0;
+    settings.tangential.stiffness = 100.0;
+    settings.tangential.damping = 0.0;
+    settings.tangential.friction_coefficient = 0.5;
+    settings.tangential.time_step = 0.001;
+
+    FieldContactPrimitiveTracker tracker_a;
+    FieldContactPrimitiveTracker tracker_b;
+    FieldContactStepResult a_to_b = tracker_a.Evaluate(graph_a, queries_a, reference_a, settings);
+    FieldContactStepResult b_to_a = tracker_b.Evaluate(graph_b, queries_b, reference_b, settings);
+    FieldContactPairResult pair =
+        CombineBidirectionalFieldContactPair(a_to_b, reference_a, b_to_a, reference_b);
+
+    ASSERT_EQ(a_to_b.stats.patch_count, 1);
+    ASSERT_EQ(b_to_a.stats.patch_count, 1);
+    ASSERT_NEAR((a_to_b.total_force - ChVector3d(10, 0, 0)).Length(), 0.0, 1.0e-12);
+    ASSERT_NEAR((b_to_a.total_force - ChVector3d(-10, 0, 0)).Length(), 0.0, 1.0e-12);
+    ASSERT_NEAR(pair.force_residual.Length(), 0.0, 1.0e-12);
+    ASSERT_NEAR(pair.torque_residual.Length(), 0.0, 1.0e-12);
+    ASSERT_NEAR(pair.force_amplification_ratio, 1.0, 1.0e-12);
+    ASSERT_LE(pair.max_tangential_force_ratio, 1.0 + 1.0e-12);
+}
+
+TEST(FieldContactPrimitives, SymmetricPairWrenchCanBeAppliedToTwoBodies) {
+    ChVector3d reference_a(-0.25, 0, 0);
+    ChVector3d reference_b(0.25, 0, 0);
+    ChVector3d contact_point(0.0, 0.2, -0.1);
+
+    FieldContactStepResult a_to_b = MakeOneSidedPairStep(ChVector3d(0, 18, 4), contact_point, 0.4);
+    FieldContactStepResult b_to_a = MakeOneSidedPairStep(ChVector3d(0, -18, -4), contact_point, 0.5);
+    FieldContactPairResult pair =
+        CombineBidirectionalFieldContactPair(a_to_b, reference_a, b_to_a, reference_b);
+
+    ChBody body_a;
+    ChBody body_b;
+    body_a.SetRot(ChQuaterniond(1, 0, 0, 0));
+    body_b.SetRot(ChQuaterniond(1, 0, 0, 0));
+    body_a.SetPos(reference_a);
+    body_b.SetPos(reference_b);
+
+    unsigned int acc_a = body_a.AddAccumulator();
+    unsigned int acc_b = body_b.AddAccumulator();
+    body_a.EmptyAccumulator(acc_a);
+    body_b.EmptyAccumulator(acc_b);
+
+    body_a.AccumulateForce(acc_a, pair.on_a.force, reference_a, false);
+    body_a.AccumulateTorque(acc_a, pair.on_a.torque, false);
+    body_b.AccumulateForce(acc_b, pair.on_b.force, reference_b, false);
+    body_b.AccumulateTorque(acc_b, pair.on_b.torque, false);
+
+    ChVector3d accumulated_force_residual = body_a.GetAccumulatedForce(acc_a) + body_b.GetAccumulatedForce(acc_b);
+    ChVector3d pair_reference = 0.5 * (reference_a + reference_b);
+    ChVector3d accumulated_torque_residual =
+        body_a.GetAccumulatedTorque(acc_a) + (reference_a - pair_reference).Cross(body_a.GetAccumulatedForce(acc_a)) +
+        body_b.GetAccumulatedTorque(acc_b) + (reference_b - pair_reference).Cross(body_b.GetAccumulatedForce(acc_b));
+
+    ASSERT_NEAR(accumulated_force_residual.Length(), 0.0, 1.0e-12);
+    ASSERT_NEAR(accumulated_torque_residual.Length(), 0.0, 1.0e-12);
 }
