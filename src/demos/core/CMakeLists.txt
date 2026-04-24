@@ -16,6 +16,8 @@ set(DEMOS
   demo_CH_baseline_contact
   demo_CH_sdf_point_contact
   demo_CH_field_contact_regression
+  demo_CH_field_contact_feature_switching
+  demo_CH_field_contact_multislip_interlock
 )
 
 # OpenVDB probe demo is built separately below if OpenVDB is found
