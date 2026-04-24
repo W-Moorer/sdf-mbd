@@ -1,0 +1,31 @@
+{
+  "cam_radius": 0.03,
+  "cam_eccentricity": 0.006,
+  "cam_thickness": 0.02,
+  "roller_radius": 0.01,
+  "roller_thickness": 0.018,
+  "cam_segments": 160,
+  "roller_segments": 128,
+  "cam_init_pos": [
+    0.0,
+    0.0,
+    0.0
+  ],
+  "motor_joint_pos": [
+    0.0,
+    0.0,
+    0.0
+  ],
+  "gravity_y": -9.81,
+  "density": 7800.0,
+  "friction": 0.0,
+  "restitution": 0.0,
+  "motor_speed": -2.0,
+  "step_size": 0.002,
+  "total_time": 1.5707963267948966,
+  "follower_init_pos": [
+    0.0,
+    0.039547439866570375,
+    0.0
+  ]
+}

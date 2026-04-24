@@ -136,6 +136,21 @@ if(OpenVDB_FOUND)
     install(TARGETS ${PROGRAM} CONFIGURATIONS Release DESTINATION ${CH_INSTALL_DEMO})
   endforeach()
 
+  add_executable(demo_CH_paper_examples_openvdb "${CMAKE_SOURCE_DIR}/paper_example/paper_examples_openvdb.cpp")
+  source_group("" FILES "${CMAKE_SOURCE_DIR}/paper_example/paper_examples_openvdb.cpp")
+  set_target_properties(demo_CH_paper_examples_openvdb PROPERTIES FOLDER demos)
+  set_property(TARGET demo_CH_paper_examples_openvdb PROPERTY VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_DIR:demo_CH_paper_examples_openvdb>")
+  target_link_libraries(demo_CH_paper_examples_openvdb ${LIBS} ${OPENVDB_LIBS})
+  target_include_directories(demo_CH_paper_examples_openvdb PRIVATE ${OpenVDB_INCLUDE_DIRS})
+  target_compile_definitions(demo_CH_paper_examples_openvdb PRIVATE IMATH_DLL)
+  if(TBB_LIB_DIR)
+    target_link_directories(demo_CH_paper_examples_openvdb PRIVATE "${TBB_LIB_DIR}")
+  endif()
+  if(MSVC)
+    set_target_properties(demo_CH_paper_examples_openvdb PROPERTIES MSVC_RUNTIME_LIBRARY ${CH_MSVC_RUNTIME_LIBRARY})
+  endif()
+  install(TARGETS demo_CH_paper_examples_openvdb CONFIGURATIONS Release DESTINATION ${CH_INSTALL_DEMO})
+
   if(CH_ENABLE_FIELD_CONTACT_REGRESSION_TESTS)
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
@@ -201,6 +216,22 @@ if(OpenVDB_FOUND)
       set_tests_properties(demo_CH_field_contact_chrono_original_mesh_regression PROPERTIES
                            LABELS "collision;field_contact;chrono_original_mesh;acceptance"
                            FIXTURES_REQUIRED chrono_original_mesh_baseline
+                           TIMEOUT 60)
+
+      add_test(NAME demo_CH_paper_examples_dynamic
+               COMMAND "$<TARGET_FILE:demo_CH_paper_examples_openvdb>")
+      set_tests_properties(demo_CH_paper_examples_dynamic PROPERTIES
+                           LABELS "collision;field_contact;paper_examples"
+                           FIXTURES_SETUP paper_examples_dynamic
+                           TIMEOUT 420)
+
+      add_test(NAME demo_CH_paper_examples_regression
+               COMMAND "${Python3_EXECUTABLE}"
+                       "${CMAKE_SOURCE_DIR}/paper_example/check_paper_examples.py"
+                       --project-root "${CMAKE_SOURCE_DIR}")
+      set_tests_properties(demo_CH_paper_examples_regression PROPERTIES
+                           LABELS "collision;field_contact;paper_examples;acceptance"
+                           FIXTURES_REQUIRED paper_examples_dynamic
                            TIMEOUT 60)
     else()
       message(STATUS "Python3 interpreter not found - skipping OpenVDB field-contact regression tests")

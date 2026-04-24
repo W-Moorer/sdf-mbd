@@ -1,0 +1,43 @@
+{
+    "case_name": "cam_baseline",
+    "bodies": {
+        "cam": {
+            "mesh": "assets/cam/models/cam_body1.obj",
+            "density": 7800.0,
+            "is_fixed": false,
+            "initial_pos": [-0.320462025491936, -0.325583626629385, -0.116],
+            "initial_rot": [1.0, 0.0, 0.0, 0.0]
+        },
+        "follower": {
+            "mesh": "assets/cam/models/cam_body2.obj",
+            "density": 7800.0,
+            "is_fixed": false,
+            "initial_pos": [-0.1662, 0.2338, -0.0662],
+            "initial_rot": [1.0, 0.0, 0.0, 0.0]
+        }
+    },
+    "joints": [
+        {
+            "type": "revolute_motor",
+            "body1": "cam",
+            "body2": "ground",
+            "origin": [0.0, 0.0, 0.0],
+            "axis": [0.0, 0.0, 1.0],
+            "speed_rad_s": 3.1415926
+        },
+        {
+            "type": "translational",
+            "body1": "follower",
+            "body2": "ground",
+            "origin": [0.0, 0.0, 0.0],
+            "axis": [0.0, 1.0, 0.0]
+        }
+    ],
+    "material": {
+        "friction": 0.2,
+        "restitution": 0.0
+    },
+    "environment": {
+        "gravity": [0.0, -9.81, 0.0]
+    }
+}

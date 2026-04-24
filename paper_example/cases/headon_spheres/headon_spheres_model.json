@@ -1,0 +1,31 @@
+{
+  "sphere_radius": 0.05,
+  "sphere_a_density": 1000.0,
+  "sphere_b_density": 1000.0,
+  "sphere_mesh": "models/ball_sphere.obj",
+  "sphere_a_init_pos": [
+    -0.15,
+    0.0,
+    0.0
+  ],
+  "sphere_b_init_pos": [
+    0.15,
+    0.0,
+    0.0
+  ],
+  "sphere_a_init_vel": [
+    1.0,
+    0.0,
+    0.0
+  ],
+  "sphere_b_init_vel": [
+    0.0,
+    0.0,
+    0.0
+  ],
+  "gravity_y": 0.0,
+  "friction": 0.0,
+  "restitution": 1.0,
+  "step_size": 0.0005,
+  "total_time": 0.5
+}

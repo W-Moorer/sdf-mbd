@@ -1,0 +1,36 @@
+{
+  "sphere_radius": 0.05,
+  "sphere_a_density": 1000.0,
+  "sphere_b_density": 2000.0,
+  "sphere_mesh": "models/ball_sphere.obj",
+  "sphere_a_init_pos": [
+    -0.15,
+    0.0,
+    0.0
+  ],
+  "sphere_b_init_pos": [
+    0.15,
+    0.0,
+    0.0
+  ],
+  "sphere_a_init_vel": [
+    0.0,
+    0.0,
+    0.0
+  ],
+  "sphere_b_init_vel": [
+    -1.0,
+    0.0,
+    0.0
+  ],
+  "gravity_y": 0.0,
+  "friction": 0.0,
+  "restitution": 1.0,
+  "step_size": 0.0005,
+  "total_time": 0.5,
+  "analytic_solution": {
+    "description": "1D elastic head-on collision, equal radii, m_B = 2 m_A, B moving left with speed 1 m/s",
+    "sphere_a_postimpact_vx": -1.3333333333333333,
+    "sphere_b_postimpact_vx": -0.3333333333333333
+  }
+}

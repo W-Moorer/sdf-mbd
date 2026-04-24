@@ -1,0 +1,38 @@
+{
+  "##GSURFACE##_Body1.Subtract1": {
+    "obj": "assets/rev_joint_clearance/models/body1_subtract1.obj",
+    "id": 3,
+    "no_patch": 4180,
+    "no_node": 2090,
+    "bbox": {
+      "min": [
+        0.2,
+        0.2,
+        0.2
+      ],
+      "max": [
+        2.2,
+        1.8,
+        1.8
+      ]
+    }
+  },
+  "##GSURFACE##_Body3.Cylinder1": {
+    "obj": "assets/rev_joint_clearance/models/body3_cylinder1.obj",
+    "id": 8,
+    "no_patch": 2362,
+    "no_node": 1183,
+    "bbox": {
+      "min": [
+        0.1,
+        0.1,
+        0.1
+      ],
+      "max": [
+        0.998378869844137,
+        0.999189069584213,
+        2.7
+      ]
+    }
+  }
+}

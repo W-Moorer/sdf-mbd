@@ -1,0 +1,90 @@
+{
+  "suite": "paper_examples_sparse_sdf_contact_force_dynamics",
+  "description": "Locked paper examples for OpenVDB sparse narrow-band SDF plus field-contact force dynamics regression.",
+  "runner": "paper_examples_openvdb.cpp",
+  "output_dir": "out/paper_example_dynamic_benchmarks",
+  "cases": [
+    {
+      "name": "eccentric_roller",
+      "kind": "cam_follower",
+      "model": "cases/eccentric_roller/eccentric_roller_model.json",
+      "models": [
+        "cases/eccentric_roller/models/eccentric_disk_cam.obj",
+        "cases/eccentric_roller/models/roller_follower.obj"
+      ],
+      "checks": [
+        {
+          "quantity": "follower_y",
+          "tolerance": 0.0006
+        }
+      ]
+    },
+    {
+      "name": "headon_spheres",
+      "kind": "headon_spheres",
+      "model": "cases/headon_spheres/headon_spheres_model.json",
+      "models": [
+        "cases/headon_spheres/models/ball_sphere.obj"
+      ],
+      "checks": [
+        {
+          "quantity": "sphere_a_x",
+          "tolerance": 0.002
+        },
+        {
+          "quantity": "sphere_b_x",
+          "tolerance": 0.002
+        },
+        {
+          "quantity": "sphere_a_vx",
+          "tolerance": 0.05
+        },
+        {
+          "quantity": "sphere_b_vx",
+          "tolerance": 0.05
+        }
+      ]
+    },
+    {
+      "name": "headon_spheres_mass_ratio",
+      "kind": "headon_spheres",
+      "model": "cases/headon_spheres_mass_ratio/headon_spheres_mass_ratio_model.json",
+      "models": [
+        "cases/headon_spheres_mass_ratio/models/ball_sphere.obj"
+      ],
+      "checks": [
+        {
+          "quantity": "sphere_a_x",
+          "tolerance": 0.002
+        },
+        {
+          "quantity": "sphere_b_x",
+          "tolerance": 0.002
+        },
+        {
+          "quantity": "sphere_a_vx",
+          "tolerance": 0.05
+        },
+        {
+          "quantity": "sphere_b_vx",
+          "tolerance": 0.05
+        }
+      ]
+    },
+    {
+      "name": "onset_stress",
+      "kind": "cam_onset",
+      "model": "cases/onset_stress/onset_stress_model.json",
+      "models": [
+        "cases/onset_stress/models/onset_cam.obj",
+        "cases/onset_stress/models/roller_follower.obj"
+      ],
+      "checks": [
+        {
+          "quantity": "onset_time",
+          "tolerance": 0.001
+        }
+      ]
+    }
+  ]
+}

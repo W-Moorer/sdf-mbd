@@ -1,0 +1,56 @@
+{
+  "body1_mesh_path": "assets/rev_joint_clearance/models/body1_subtract1_centered.obj",
+  "body3_mesh_path": "assets/rev_joint_clearance/models/body3_cylinder1_centered.obj",
+  "surface_rm_note": "Meshes are restored to the part frame using the RecurDyn surface RM marker transform.",
+  "body1_init_pos": [
+    0.0,
+    0.0,
+    0.0
+  ],
+  "body3_init_pos": [
+    0.0,
+    0.0,
+    0.0
+  ],
+  "body2_cm_offset": [
+    1.64388630568497e-06,
+    8.35588256883334e-05,
+    2.65983598394373
+  ],
+  "body3_mass": 12984.280977103,
+  "body3_inertia_xx": [
+    1314.65844893167,
+    7971.80750823384,
+    7971.80750823384
+  ],
+  "body3_inertia_xy": [
+    0.0,
+    3.02128692434659e-13,
+    0.0
+  ],
+  "body2_mass": 271.0,
+  "body2_inertia_xx": [
+    202.0,
+    359.0,
+    203.0
+  ],
+  "body2_inertia_xy": [
+    0.244945783962547,
+    -0.0295154838928402,
+    -1.39749450062735
+  ],
+  "gravity_y": -9.80665,
+  "friction": 0.0,
+  "restitution": 0.0,
+  "contact_compliance": 1e-09,
+  "contact_compliance_t": 1e-09,
+  "contact_damping_f": 1e-05,
+  "collision_envelope": 0.002,
+  "step_size": 0.001,
+  "total_time": 3.0,
+  "dynamics_substeps": 1,
+  "env_prefix": "SPCC_REVCLR",
+  "body2_reference_csv": "assets/rev_joint_clearance/data/body2.csv",
+  "body3_reference_csv": "assets/rev_joint_clearance/data/body3.csv",
+  "body2_ideal_csv": "assets/rev_joint_clearance/data/body2_ideal.csv"
+}
