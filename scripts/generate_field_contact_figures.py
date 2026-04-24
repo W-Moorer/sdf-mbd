@@ -344,10 +344,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, default=Path("out/milestone_21"), help="directory containing benchmark CSV files")
     parser.add_argument("--output", type=Path, default=Path("out/milestone_22/figures"), help="directory for generated SVG figures")
+    parser.add_argument(
+        "--prefix",
+        default="field_contact_multislip_interlock",
+        help="CSV file prefix, for example field_contact_multislip_interlock or mesh_sdf_nonconvex",
+    )
     args = parser.parse_args()
 
-    frames_path = args.input / "field_contact_multislip_interlock_frames.csv"
-    summary_path = args.input / "field_contact_multislip_interlock_summary.csv"
+    frames_path = args.input / f"{args.prefix}_frames.csv"
+    summary_path = args.input / f"{args.prefix}_summary.csv"
     if not frames_path.exists():
         raise FileNotFoundError(frames_path)
     if not summary_path.exists():
