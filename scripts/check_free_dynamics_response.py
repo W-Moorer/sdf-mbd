@@ -101,13 +101,60 @@ def check(args: argparse.Namespace) -> list[dict[str, str]]:
         results,
     )
 
-    max_final_delta = max(f(row, "trajectory_final_position_delta") for row in comparison)
+    regular_rows = [row for row in comparison if not row.get("scenario", "").startswith("free_chrono_original_")]
+    original_mesh_rows = [row for row in comparison if row.get("scenario", "").startswith("free_chrono_original_")]
+
+    max_final_delta = max(f(row, "trajectory_final_position_delta") for row in regular_rows or comparison)
     require(
         max_final_delta <= args.max_final_position_delta,
-        "trajectory_response_comparable",
-        f"max final field/native position delta={max_final_delta:.8f} <= {args.max_final_position_delta:.8f}",
+        "trajectory_response_comparable_for_controlled_meshes",
+        f"max regular-scene final field/native position delta={max_final_delta:.8f} "
+        f"<= {args.max_final_position_delta:.8f}",
         results,
     )
+
+    if original_mesh_rows:
+        max_original_delta = max(f(row, "trajectory_final_position_delta") for row in original_mesh_rows)
+        require(
+            max_original_delta <= args.max_original_mesh_final_position_delta,
+            "original_mesh_trajectory_divergence_bounded",
+            f"max original-mesh final field/native position delta={max_original_delta:.8f} "
+            f"<= {args.max_original_mesh_final_position_delta:.8f}",
+            results,
+        )
+
+        max_original_penetration_ratio = max(
+            f(row, "field_max_penetration") / max(1.0e-14, f(row, "native_max_penetration"))
+            for row in original_mesh_rows
+        )
+        require(
+            max_original_penetration_ratio <= args.max_original_mesh_penetration_ratio,
+            "original_mesh_field_penetration_lower",
+            f"max original-mesh field/native penetration ratio={max_original_penetration_ratio:.8f} "
+            f"<= {args.max_original_mesh_penetration_ratio:.8f}",
+            results,
+        )
+
+        max_original_accel_ratio = max(f(row, "field_to_native_acceleration_jump_ratio") for row in original_mesh_rows)
+        require(
+            max_original_accel_ratio <= args.max_original_mesh_acceleration_jump_ratio,
+            "original_mesh_field_acceleration_jump_lower",
+            f"max original-mesh field/native acceleration-jump ratio={max_original_accel_ratio:.8f} "
+            f"<= {args.max_original_mesh_acceleration_jump_ratio:.8f}",
+            results,
+        )
+
+        max_original_count_change_ratio = max(
+            f(row, "field_mean_abs_count_change") / max(1.0e-14, f(row, "native_mean_abs_count_change"))
+            for row in original_mesh_rows
+        )
+        require(
+            max_original_count_change_ratio <= args.max_original_mesh_count_change_ratio,
+            "original_mesh_field_contact_churn_lower",
+            f"max original-mesh field/native count-change ratio={max_original_count_change_ratio:.8f} "
+            f"<= {args.max_original_mesh_count_change_ratio:.8f}",
+            results,
+        )
 
     max_field_contact_work = max(
         f(row, "contact_work")
@@ -159,6 +206,10 @@ def main() -> int:
     parser.add_argument("--max-any-penetration", type=float, default=0.070)
     parser.add_argument("--max-acceleration-jump-ratio", type=float, default=0.15)
     parser.add_argument("--max-final-position-delta", type=float, default=0.080)
+    parser.add_argument("--max-original-mesh-final-position-delta", type=float, default=0.120)
+    parser.add_argument("--max-original-mesh-penetration-ratio", type=float, default=0.25)
+    parser.add_argument("--max-original-mesh-acceleration-jump-ratio", type=float, default=0.08)
+    parser.add_argument("--max-original-mesh-count-change-ratio", type=float, default=0.01)
     parser.add_argument("--max-positive-net-contact-work", type=float, default=0.02)
     parser.add_argument("--min-field-active-ratio", type=float, default=0.95)
     parser.add_argument("--max-stick-slip-switch-ratio", type=float, default=0.10)

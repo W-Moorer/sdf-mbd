@@ -35,6 +35,8 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -102,6 +104,8 @@ struct FreeDynamicsScenario {
     double max_lateral_force = 12.0;
     double voxel_size = 0.006;
     double native_mesh_radius = 0.0;
+    std::filesystem::path target_obj;
+    std::string source_demo;
 };
 
 struct SceneData {
@@ -233,6 +237,66 @@ static double Clamp(double value, double lo, double hi) {
     return std::max(lo, std::min(hi, value));
 }
 
+static int ParseObjIndex(const std::string& token, int vertex_count) {
+    std::string head = token;
+    size_t slash = head.find('/');
+    if (slash != std::string::npos) {
+        head = head.substr(0, slash);
+    }
+    if (head.empty()) {
+        return -1;
+    }
+    int raw = std::stoi(head);
+    if (raw > 0) {
+        return raw - 1;
+    }
+    if (raw < 0) {
+        return vertex_count + raw;
+    }
+    return -1;
+}
+
+static DemoTriangleMesh LoadObjTriangleMesh(const std::filesystem::path& path) {
+    DemoTriangleMesh mesh;
+    std::ifstream in(path);
+    if (!in) {
+        throw std::runtime_error("cannot open OBJ mesh: " + path.string());
+    }
+
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        std::istringstream iss(line);
+        std::string tag;
+        iss >> tag;
+        if (tag == "v") {
+            double x = 0.0;
+            double y = 0.0;
+            double z = 0.0;
+            iss >> x >> y >> z;
+            mesh.vertices.push_back(ChVector3d(x, y, z));
+        } else if (tag == "f") {
+            std::vector<int> ids;
+            std::string token;
+            while (iss >> token) {
+                int id = ParseObjIndex(token, static_cast<int>(mesh.vertices.size()));
+                if (id >= 0 && id < static_cast<int>(mesh.vertices.size())) {
+                    ids.push_back(id);
+                }
+            }
+            for (size_t i = 1; i + 1 < ids.size(); i++) {
+                mesh.faces.push_back({ids[0], ids[i], ids[i + 1]});
+            }
+        }
+    }
+    if (mesh.vertices.empty() || mesh.faces.empty()) {
+        throw std::runtime_error("OBJ mesh has no usable triangles: " + path.string());
+    }
+    return mesh;
+}
+
 static int AddDedupVertex(DemoTriangleMesh& mesh,
                           std::map<std::tuple<long long, long long, long long>, int>& index,
                           const ChVector3d& p) {
@@ -362,8 +426,12 @@ static openvdb::FloatGrid::Ptr BuildLevelSetFromTriangleMesh(const DemoTriangleM
 static SceneData BuildScene(const FreeDynamicsScenario& config) {
     SceneData scene;
     scene.sdf.voxel_size = config.voxel_size;
-    scene.target_mesh = config.scenario == FreeDynamicsScenarioType::UChannel ? BuildUChannelTarget() :
-                                                                             BuildStaggeredPadTarget();
+    if (!config.target_obj.empty()) {
+        scene.target_mesh = LoadObjTriangleMesh(config.target_obj);
+    } else {
+        scene.target_mesh = config.scenario == FreeDynamicsScenarioType::UChannel ? BuildUChannelTarget() :
+                                                                                 BuildStaggeredPadTarget();
+    }
     scene.moving_graph = MakeSphereSurfaceGraph(config.radius, 20, 40);
     scene.sdf.grid = BuildLevelSetFromTriangleMesh(scene.target_mesh, config.voxel_size, 7.0f);
     return scene;
@@ -900,7 +968,10 @@ int main() {
                    "rms_acceleration_jump,rms_lateral_velocity,final_x,final_y,final_z,total_stick_frames,"
                    "total_slip_frames,stick_slip_switches\n";
     WriteComparisonHeader(comparison_out);
-    geometry_out << "scenario,target_vertices,target_faces,moving_samples,voxel_size,active_voxels,native_mesh_radius\n";
+    geometry_out << "scenario,source_demo,target_obj,target_vertices,target_faces,moving_samples,voxel_size,"
+                    "active_voxels,native_mesh_radius\n";
+
+    const auto data_dir = std::filesystem::path(project_root) / "data" / "models";
 
     std::vector<FreeDynamicsScenario> scenarios = {
         {FreeDynamicsScenarioType::UChannel,
@@ -947,13 +1018,38 @@ int main() {
          10.0,
          0.006,
          0.0},
+        {FreeDynamicsScenarioType::StaggeredPadTrack,
+         "free_chrono_original_shoe_collision_slide",
+         ChVector3d(0.050, 0.128, -0.055),
+         ChVector3d(0.060, 0.0, 0.0),
+         0.055,
+         950.0,
+         5.0e-4,
+         1800,
+         0.120,
+         45.0,
+         8.0,
+         16.0,
+         5.0,
+         -0.055,
+         0.055,
+         0.012,
+         1.0,
+         35.0,
+         4.0,
+         7.0,
+         0.002,
+         0.0,
+         data_dir / "bulldozer" / "shoe_collision.obj",
+         "src/demos/mbs/demo_MBS_tracks.cpp"},
     };
 
     for (const auto& scenario : scenarios) {
         std::cout << "Scenario " << scenario.name << " (" << scenario.steps << " steps)" << std::endl;
         SceneData scene = BuildScene(scenario);
-        geometry_out << scenario.name << "," << scene.target_mesh.vertices.size() << "," << scene.target_mesh.faces.size()
-                     << "," << scene.moving_graph.samples.size() << "," << scene.sdf.voxel_size << ","
+        geometry_out << scenario.name << "," << scenario.source_demo << "," << scenario.target_obj.generic_string() << ","
+                     << scene.target_mesh.vertices.size() << "," << scene.target_mesh.faces.size() << ","
+                     << scene.moving_graph.samples.size() << "," << scene.sdf.voxel_size << ","
                      << scene.sdf.grid->activeVoxelCount() << "," << scenario.native_mesh_radius << "\n";
 
         DynamicsSummary field = RunFieldScenario(scenario, scene, frames_out);
