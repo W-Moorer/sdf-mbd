@@ -1133,6 +1133,17 @@ static double Rms(const std::vector<double>& values) {
     return std::sqrt(sum / static_cast<double>(values.size()));
 }
 
+static double Mean(const std::vector<double>& values) {
+    if (values.empty()) {
+        return 0.0;
+    }
+    double sum = 0.0;
+    for (double value : values) {
+        sum += value;
+    }
+    return sum / static_cast<double>(values.size());
+}
+
 static double MaxAbsValue(const std::vector<double>& values) {
     double out = 0.0;
     for (double value : values) {
@@ -1420,6 +1431,8 @@ struct GearAblationMetrics {
     double max_effective_penetration = 0.0;
     double max_penetration_to_bpen = 0.0;
     double max_penetration_to_voxel = 0.0;
+    double mean_force_norm = 0.0;
+    double mean_abs_torque = 0.0;
     double rms_torque = 0.0;
     double max_abs_torque = 0.0;
     double max_force_norm = 0.0;
@@ -1521,6 +1534,8 @@ static void RunSimpleGearAblation(const std::filesystem::path& case_dir,
         std::vector<double> torque_jumps;
         std::vector<double> patch_event_torque_jumps;
         std::vector<double> torques;
+        std::vector<double> abs_torques;
+        std::vector<double> force_norms;
         double patch_sum = 0.0;
         double active_sample_sum = 0.0;
         double max_pen_observed = 0.0;
@@ -1639,6 +1654,8 @@ static void RunSimpleGearAblation(const std::filesystem::path& case_dir,
                 abs_errors.push_back(std::abs(error));
                 patch_counts_for_errors.push_back(static_cast<double>(last_patch_count));
                 torques.push_back(last_torque);
+                abs_torques.push_back(std::abs(last_torque));
+                force_norms.push_back(last_force_norm);
                 if (have_previous_output) {
                     omega_jumps.push_back(std::abs(omega22 - previous_omega));
                     alpha_jumps.push_back(std::abs(last_alpha - previous_alpha));
@@ -1679,6 +1696,8 @@ static void RunSimpleGearAblation(const std::filesystem::path& case_dir,
         row.max_effective_penetration = max_pen_observed;
         row.max_penetration_to_bpen = rmd.contact.bpen > 0.0 ? max_pen_observed / rmd.contact.bpen : 0.0;
         row.max_penetration_to_voxel = gear21_sdf.voxel_size > 0.0 ? max_pen_observed / gear21_sdf.voxel_size : 0.0;
+        row.mean_force_norm = Mean(force_norms);
+        row.mean_abs_torque = Mean(abs_torques);
         row.rms_torque = Rms(torques);
         row.max_abs_torque = MaxAbsValue(torques);
         row.max_force_norm = max_force_norm;
@@ -1693,7 +1712,8 @@ static void RunSimpleGearAblation(const std::filesystem::path& case_dir,
     summary << "mode,duration,rms_error,max_abs_error,max_omega_jump,max_alpha_jump,max_torque_jump,"
                "max_patch_event_torque_jump,patch_count_abs_error_correlation,mean_patch_count,"
                "mean_active_samples,max_effective_penetration,max_penetration_to_bpen,max_penetration_to_voxel,"
-               "rms_torque,max_abs_torque,max_force_norm,net_contact_work,positive_contact_work,"
+               "mean_force_norm,mean_abs_torque,rms_torque,max_abs_torque,max_force_norm,"
+               "net_contact_work,positive_contact_work,"
                "elapsed_seconds\n";
     for (const auto& row : metrics) {
         summary << row.mode << "," << row.duration << "," << row.rms_error << "," << row.max_abs_error << ","
@@ -1701,8 +1721,9 @@ static void RunSimpleGearAblation(const std::filesystem::path& case_dir,
                 << row.max_patch_event_torque_jump << "," << row.patch_count_abs_error_correlation << ","
                 << row.mean_patch_count << "," << row.mean_active_samples << "," << row.max_effective_penetration
                 << "," << row.max_penetration_to_bpen << "," << row.max_penetration_to_voxel << ","
-                << row.rms_torque << "," << row.max_abs_torque << "," << row.max_force_norm << ","
-                << row.net_contact_work << "," << row.positive_contact_work << "," << row.elapsed_seconds << "\n";
+                << row.mean_force_norm << "," << row.mean_abs_torque << "," << row.rms_torque << ","
+                << row.max_abs_torque << "," << row.max_force_norm << "," << row.net_contact_work << ","
+                << row.positive_contact_work << "," << row.elapsed_seconds << "\n";
     }
 }
 
