@@ -20,6 +20,7 @@
 
 #include "chrono/collision/ChSdfNcpContact.h"
 
+using chrono::ChVector3d;
 using namespace chrono::sdfncp;
 
 namespace {
@@ -37,6 +38,17 @@ void CheckNear(double value, double expected, double tolerance, const std::strin
     if (std::abs(value - expected) > tolerance) {
         std::cerr << "FAILED: " << message << " value=" << value << " expected=" << expected
                   << " tolerance=" << tolerance << std::endl;
+        failures++;
+    }
+}
+
+void CheckVectorNear(const ChVector3d& value,
+                     const ChVector3d& expected,
+                     double tolerance,
+                     const std::string& message) {
+    const double error = (value - expected).Length();
+    if (error > tolerance) {
+        std::cerr << "FAILED: " << message << " error=" << error << " tolerance=" << tolerance << std::endl;
         failures++;
     }
 }
@@ -64,6 +76,31 @@ void TestFischerBurmeisterUtilities() {
     CheckNear(grad.dPhi_dlambda, fd_lambda, 1.0e-7, "FB dPhi/dlambda finite difference");
     Check(ComplementarityError(0.2, -0.1) > 0.0, "Negative lambda should produce complementarity error");
     Check(ComplementarityError(-0.1, 0.2) > 0.0, "Negative gap should produce complementarity error");
+}
+
+void TestSdfSurfacePlane() {
+    ChPlaneSdfSurface plane(ChVector3d(0, 2, 0), 0.0);
+
+    CheckNear(plane.Phi(ChVector3d(0, 1, 0)), 1.0, 1.0e-12, "Plane SDF phi above y=0");
+    CheckNear(plane.Phi(ChVector3d(0, -0.5, 0)), -0.5, 1.0e-12, "Plane SDF phi below y=0");
+    CheckVectorNear(plane.Grad(ChVector3d(3, 4, 5)), ChVector3d(0, 1, 0), 1.0e-12,
+                    "Plane SDF gradient should be normalized normal");
+}
+
+void TestSdfNcpContactConstraintEval() {
+    ChPlaneSdfSurface plane(ChVector3d(0, 1, 0), 0.0);
+
+    const ChSdfNcpContactConstraint open = EvaluateSdfNcpContact(plane, ChVector3d(0, 0.1, 0), 0.0, 1.0e-6);
+    Check(open.gap > 0.0, "Open SDF-NCP contact should have positive gap");
+    CheckNear(open.lambda_n, 0.0, 0.0, "Open SDF-NCP contact lambda");
+    CheckNear(open.complementarity_error, 0.0, 1.0e-12, "Open SDF-NCP complementarity error");
+    CheckVectorNear(open.jacobian_position, ChVector3d(0, 1, 0), 1.0e-12,
+                    "Point-contact Jacobian should equal plane normal");
+
+    const ChSdfNcpContactConstraint penetrating =
+        EvaluateSdfNcpContact(plane, ChVector3d(0, -0.1, 0), 0.0, 1.0e-6);
+    Check(penetrating.penetration > 0.0, "Penetrating SDF-NCP contact should report penetration");
+    Check(penetrating.complementarity_error > 0.0, "Penetrating contact should have complementarity error");
 }
 
 void TestPointMassPlaneStep() {
@@ -136,6 +173,78 @@ void TestPointMassPlaneRollout() {
     Check(max_residual_norm < 1.0e-8, "SDF-NCP rollout residual norm should stay small");
 }
 
+void TestSdfNcpPointMass3DPlaneStep() {
+    ChPlaneSdfSurface plane(ChVector3d(0, 1, 0), 0.0);
+
+    ChSdfNcpPointMassSettings settings;
+    settings.mass = 1.0;
+    settings.gravity = 9.81;
+    settings.dt = 1.0e-3;
+    settings.eps = 1.0e-6;
+    settings.tolerance = 1.0e-11;
+    settings.max_iterations = 40;
+
+    ChSdfNcpPointMassState state;
+    state.position = ChVector3d(0.0, 0.1, 0.0);
+    state.velocity = ChVector3d(0.0, -1.0, 0.0);
+
+    const ChSdfNcpPointMassStepResult step = SolveSdfNcpPointMassStep(plane, state, settings);
+
+    Check(step.diagnostics.success, "Generic 3D point-mass SDF-NCP step should converge");
+    Check(std::isfinite(step.diagnostics.residual_norm), "Generic 3D residual norm should be finite");
+    Check(std::isfinite(step.state.position.x()) && std::isfinite(step.state.position.y()) &&
+              std::isfinite(step.state.position.z()),
+          "Generic 3D point-mass step should not produce NaN position");
+    Check(step.diagnostics.lambda_n >= -1.0e-10, "Generic 3D lambda should not be significantly negative");
+}
+
+void TestSdfNcpPointMass3DPlaneRollout() {
+    ChPlaneSdfSurface plane(ChVector3d(0, 1, 0), 0.0);
+
+    ChSdfNcpPointMassSettings settings;
+    settings.mass = 1.0;
+    settings.gravity = 9.81;
+    settings.dt = 1.0e-3;
+    settings.eps = 1.0e-6;
+    settings.tolerance = 1.0e-11;
+    settings.max_iterations = 40;
+
+    ChSdfNcpPointMassState state;
+    state.position = ChVector3d(0.0, 1.0, 0.0);
+    state.velocity = ChVector3d(0.0, 0.0, 0.0);
+
+    const int steps = 1000;
+    double max_penetration = 0.0;
+    double min_lambda = 0.0;
+    double max_complementarity_error = 0.0;
+    double max_residual_norm = 0.0;
+    bool all_success = true;
+    bool all_finite = true;
+
+    for (int i = 0; i < steps; i++) {
+        const ChSdfNcpPointMassStepResult step = SolveSdfNcpPointMassStep(plane, state, settings);
+        state = step.state;
+
+        all_success = all_success && step.diagnostics.success;
+        all_finite = all_finite && std::isfinite(state.position.x()) && std::isfinite(state.position.y()) &&
+                     std::isfinite(state.position.z()) && std::isfinite(state.velocity.x()) &&
+                     std::isfinite(state.velocity.y()) && std::isfinite(state.velocity.z());
+        max_penetration = std::max(max_penetration, step.diagnostics.penetration);
+        min_lambda = std::min(min_lambda, step.diagnostics.lambda_n);
+        max_complementarity_error =
+            std::max(max_complementarity_error, step.diagnostics.complementarity_error);
+        max_residual_norm = std::max(max_residual_norm, step.diagnostics.residual_norm);
+    }
+
+    Check(all_success, "Generic 3D SDF-NCP rollout steps should converge");
+    Check(all_finite, "Generic 3D SDF-NCP rollout should not produce NaN or Inf");
+    Check(max_penetration < 1.0e-8, "Generic 3D SDF-NCP rollout penetration should stay small");
+    Check(min_lambda >= -1.0e-8, "Generic 3D SDF-NCP rollout lambda should not be significantly negative");
+    Check(max_complementarity_error < 1.0e-8,
+          "Generic 3D SDF-NCP rollout complementarity error should stay small");
+    Check(max_residual_norm < 1.0e-8, "Generic 3D SDF-NCP rollout residual norm should stay small");
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -144,14 +253,27 @@ int main(int argc, char* argv[]) {
     if (mode == "fb" || mode == "all") {
         TestFischerBurmeisterUtilities();
     }
+    if (mode == "surface" || mode == "all") {
+        TestSdfSurfacePlane();
+    }
+    if (mode == "constraint" || mode == "all") {
+        TestSdfNcpContactConstraintEval();
+    }
     if (mode == "step" || mode == "all") {
         TestPointMassPlaneStep();
     }
     if (mode == "rollout" || mode == "all") {
         TestPointMassPlaneRollout();
     }
+    if (mode == "step3d" || mode == "all") {
+        TestSdfNcpPointMass3DPlaneStep();
+    }
+    if (mode == "rollout3d" || mode == "all") {
+        TestSdfNcpPointMass3DPlaneRollout();
+    }
 
-    if (mode != "fb" && mode != "step" && mode != "rollout" && mode != "all") {
+    if (mode != "fb" && mode != "surface" && mode != "constraint" && mode != "step" &&
+        mode != "rollout" && mode != "step3d" && mode != "rollout3d" && mode != "all") {
         std::cerr << "Unknown mode: " << mode << std::endl;
         return 2;
     }

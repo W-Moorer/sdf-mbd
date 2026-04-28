@@ -216,7 +216,107 @@ The C++ version is intentionally a minimal numerical kernel and regression
 closure. It is not yet a replacement for `ChContactSMC`, `ChContactNSC`, or the
 field-contact runtime.
 
-## 9. Risks
+## 9. 通用 SDF-NCP contact assembly 层设计
+
+### Why `PointMassPlaneResidual` must be generalized
+
+The current `PointMassPlaneResidual` is useful as a first regression closure, but
+it hard-codes three assumptions:
+
+- the SDF is the plane `phi(q) = y`,
+- the contact normal and Jacobian are always `[0, 1]`,
+- the state is a 2D point mass.
+
+Those assumptions prevent reuse for later rigid-body, mesh-SDF, patch, and
+field-contact assembly experiments. The next layer should accept a generic
+surface query `phi(x)` and `grad phi(x)` plus a point kinematics map `x(q)`,
+then assemble the same NCP equation without knowing the specific surface type.
+
+### Proposed abstractions
+
+The first generic layer remains intentionally small:
+
+- SDF surface/provider:
+  - `ChSdfSurface`
+  - `Phi(x)` returns signed distance.
+  - `Grad(x)` returns the SDF gradient.
+  - First concrete implementation: `ChPlaneSdfSurface`.
+  - Optional analytical helper: `ChSphereSdfSurface`.
+
+- Contact kinematics:
+  - `ChSdfPointKinematicsState`
+  - `ChSdfPointKinematics`
+  - First implementation is point translation only, with `x(q) = q` and
+    `dx/dq = I`.
+  - Rigid-body orientation Jacobians are explicitly deferred.
+
+- Contact constraint:
+  - `ChSdfNcpContactConstraint`
+  - Stores gap, unit normal, point-position Jacobian row, normal multiplier,
+    smoothed FB residual, penetration, and complementarity error.
+  - For the point-translation case, `jacobian_position = normal`.
+
+- Contact assembly/problem:
+  - `ChSdfNcpPointMassState`
+  - `ChSdfNcpPointMassSettings`
+  - `ChSdfNcpPointMassResidual`
+  - `ComputeSdfNcpPointMassResidual(surface, state, settings, z)`
+  - `SolveSdfNcpPointMassStep(surface, state, settings)`
+
+This layer is a small assembly kernel, not a new Chrono solver path.
+
+### Why this phase still avoids `ChContactContainer`
+
+Chrono's production contact path requires descriptor bookkeeping, active
+constraint offsets, warm-start reaction transfer, solver coupling, and
+time-stepper interactions. Connecting a nonlinear smooth FB residual directly
+to those systems is a larger design decision. This phase avoids changing:
+
+- `ChSystem`,
+- `ChContactContainer`,
+- `ChContactSMC`,
+- `ChContactNSC`,
+- global solver descriptor assembly.
+
+Keeping the generic SDF-NCP layer independent lets the equations and tests
+stabilize before choosing how to integrate with Chrono's production contact
+container architecture.
+
+### Later integration path
+
+There are two plausible next integration paths:
+
+- NSC-like nonlinear constraint path:
+  - expose SDF gap and `J_phi(q)` as a normal unilateral constraint,
+  - add smooth FB residual evaluation around the normal multiplier,
+  - connect to descriptor-level unknowns and warm-started reactions.
+
+- Field-contact NCP container:
+  - reuse `FieldSampleQuery` and primitive/patch extraction,
+  - build one or more SDF-NCP constraints from patch centers or sample points,
+  - assemble the NCP residuals in a dedicated field-contact container.
+
+The current generic point-mass layer is meant to be the smallest common kernel
+for both paths.
+
+### Validation case for this phase
+
+The validation remains a single frictionless point mass against an SDF plane,
+but now uses:
+
+```text
+gap = surface.Phi(q_next)
+normal = normalize(surface.Grad(q_next))
+J = normal^T
+R_v = m(v_next - v) - dt(Q + normal * lambda)
+R_lambda = Phi_eps(gap, lambda)
+```
+
+The concrete regression uses `ChPlaneSdfSurface([0, 1, 0], 0)` and 3D point
+translation. Existing 2D `PointMassPlaneResidual` tests remain as backwards
+compatibility checks.
+
+## 10. Risks
 
 - Smooth FB with `eps > 0` approximates exact complementarity; open contact and
   closed contact may have tiny positive products of order `eps^2`.

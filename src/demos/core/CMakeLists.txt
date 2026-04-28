@@ -71,6 +71,16 @@ if(CH_ENABLE_FIELD_CONTACT_REGRESSION_TESTS)
   set_tests_properties(test_sdf_ncp_fb PROPERTIES
                        LABELS "collision;field_contact;sdf_ncp")
 
+  add_test(NAME test_sdf_surface_plane
+           COMMAND "$<TARGET_FILE:demo_CH_sdf_ncp_regression>" surface)
+  set_tests_properties(test_sdf_surface_plane PROPERTIES
+                       LABELS "collision;field_contact;sdf_ncp")
+
+  add_test(NAME test_sdf_ncp_contact_constraint_eval
+           COMMAND "$<TARGET_FILE:demo_CH_sdf_ncp_regression>" constraint)
+  set_tests_properties(test_sdf_ncp_contact_constraint_eval PROPERTIES
+                       LABELS "collision;field_contact;sdf_ncp")
+
   add_test(NAME test_sdf_ncp_point_mass_plane_step
            COMMAND "$<TARGET_FILE:demo_CH_sdf_ncp_regression>" step)
   set_tests_properties(test_sdf_ncp_point_mass_plane_step PROPERTIES
@@ -79,6 +89,17 @@ if(CH_ENABLE_FIELD_CONTACT_REGRESSION_TESTS)
   add_test(NAME test_sdf_ncp_point_mass_plane_rollout
            COMMAND "$<TARGET_FILE:demo_CH_sdf_ncp_regression>" rollout)
   set_tests_properties(test_sdf_ncp_point_mass_plane_rollout PROPERTIES
+                       LABELS "collision;field_contact;sdf_ncp"
+                       TIMEOUT 60)
+
+  add_test(NAME test_sdf_ncp_point_mass_3d_plane_step
+           COMMAND "$<TARGET_FILE:demo_CH_sdf_ncp_regression>" step3d)
+  set_tests_properties(test_sdf_ncp_point_mass_3d_plane_step PROPERTIES
+                       LABELS "collision;field_contact;sdf_ncp")
+
+  add_test(NAME test_sdf_ncp_point_mass_3d_plane_rollout
+           COMMAND "$<TARGET_FILE:demo_CH_sdf_ncp_regression>" rollout3d)
+  set_tests_properties(test_sdf_ncp_point_mass_3d_plane_rollout PROPERTIES
                        LABELS "collision;field_contact;sdf_ncp"
                        TIMEOUT 60)
 
