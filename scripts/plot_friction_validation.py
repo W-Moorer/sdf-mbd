@@ -9,6 +9,13 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 
+LINE_STACK = [
+    {"lw": 1.45, "ls": "-", "color": "#4D4D4D", "zorder": 1},
+    {"lw": 1.32, "ls": (0, (10, 4)), "color": "#E64B35", "zorder": 2},
+    {"lw": 1.22, "ls": (0, (10, 3, 2, 3)), "color": "#2CA02C", "zorder": 3},
+    {"lw": 1.05, "ls": (0, (6, 2, 1.5, 2)), "color": "#1F4EFA", "zorder": 5},
+]
+
 
 def read_csv(path: Path) -> list[dict[str, str]]:
     with path.open(newline="") as f:
@@ -23,15 +30,20 @@ def set_times_style() -> None:
     plt.rcParams.update(
         {
             "font.family": "serif",
-            "font.serif": ["Times New Roman", "Times", "DejaVu Serif"],
+            "font.serif": ["Times New Roman", "Times", "Nimbus Roman", "DejaVu Serif"],
             "mathtext.fontset": "stix",
             "pdf.fonttype": 42,
             "ps.fonttype": 42,
-            "axes.linewidth": 0.8,
+            "axes.linewidth": 0.9,
             "axes.labelsize": 9,
             "xtick.labelsize": 8,
             "ytick.labelsize": 8,
             "legend.fontsize": 8,
+            "xtick.direction": "in",
+            "ytick.direction": "in",
+            "xtick.major.width": 0.8,
+            "ytick.major.width": 0.8,
+            "savefig.dpi": 600,
             "figure.figsize": (6.6, 2.6),
         }
     )
@@ -99,20 +111,32 @@ def plot_transport(input_dir: Path, output_dir: Path) -> None:
     projected_energy = [f(r, "projected_naive_energy_ratio") for r in rows]
 
     fig, ax1 = plt.subplots(figsize=(4.2, 2.6))
-    ax1.semilogy(angle, minimal_norm_error, lw=1.1, label="Minimal-rotation norm error")
+    ax1.semilogy(angle, minimal_norm_error, label="Minimal-rotation norm error", **LINE_STACK[3])
     ax1.set_xlabel("Normal rotation angle (deg)")
     ax1.set_ylabel("Relative error")
     ax1.set_ylim(1e-17, 2.0)
 
     ax2 = ax1.twinx()
-    ax2.plot(angle, untransported_tangent, lw=1.0, ls="--", color="0.25", label="Untransported normal component")
-    ax2.plot(angle, projected_energy, lw=1.0, ls="-.", color="0.55", label="Projected-naive energy ratio")
+    ax2.plot(angle, untransported_tangent, label="Untransported normal component", **LINE_STACK[0])
+    ax2.plot(angle, projected_energy, label="Projected-naive energy ratio", **LINE_STACK[1])
     ax2.set_ylabel("Ratio")
     ax2.set_ylim(0.0, 1.05)
 
     lines = ax1.get_lines() + ax2.get_lines()
     labels = [line.get_label() for line in lines]
-    ax1.legend(lines, labels, frameon=False, loc="lower right")
+    ax1.legend(
+        lines,
+        labels,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 1.02),
+        ncol=1,
+        frameon=True,
+        facecolor="white",
+        edgecolor="0.55",
+        framealpha=1.0,
+        borderpad=0.35,
+        handlelength=2.8,
+    )
     fig.tight_layout(pad=0.35)
     fig.savefig(output_dir / "friction_objective_transport.pdf", bbox_inches="tight")
     plt.close(fig)

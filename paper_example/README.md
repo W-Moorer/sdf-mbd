@@ -27,4 +27,4 @@ python paper_example\check_paper_examples.py --project-root .
 
 When field-contact regression tests are enabled in CMake, CTest runs the executable and then validates the summary against `manifest.json`.
 
-The `simple_gear` case locks the RecurDyn RMD, GEAR21/GEAR22 OBJ surfaces, and the GEAR22 RX reference curve. Its regression checks verify the final driven-wheel angular speed, post-startup RMS error, and post-startup adjacent-sample jump for the bidirectional sparse-SDF contact response.
+The `simple_gear` case locks the commercial MBD model, the driver/follower OBJ surfaces, and the follower-gear RX reference curve. Its regression checks verify the final driven-wheel angular speed, post-startup RMS error, and post-startup adjacent-sample jump for the bidirectional sparse-SDF contact response.

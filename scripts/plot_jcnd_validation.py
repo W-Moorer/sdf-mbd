@@ -7,6 +7,17 @@ import csv
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.font_manager import FontProperties
+
+LINE_STACK = [
+    {"lw": 1.45, "ls": "-", "color": "#4D4D4D", "zorder": 1},
+    {"lw": 1.32, "ls": (0, (10, 4)), "color": "#E64B35", "zorder": 2},
+    {"lw": 1.22, "ls": (0, (10, 3, 2, 3)), "color": "#2CA02C", "zorder": 3},
+    {"lw": 1.12, "ls": (0, (6, 2)), "color": "#7A3DB8", "zorder": 4},
+    {"lw": 1.05, "ls": (0, (6, 2, 1.5, 2)), "color": "#1F4EFA", "zorder": 5},
+    {"lw": 0.95, "ls": (0, (2.5, 1.8)), "color": "#00CFEA", "zorder": 6},
+]
+CHINESE_FONT = FontProperties(family="SimSun")
 
 
 def read_csv(path: Path) -> list[dict[str, str]]:
@@ -29,17 +40,36 @@ def configure_matplotlib() -> None:
     plt.rcParams.update(
         {
             "font.family": "serif",
-            "font.serif": ["Times New Roman", "Times", "DejaVu Serif"],
+            "font.serif": ["Times New Roman", "SimSun", "Times", "Nimbus Roman", "DejaVu Serif"],
             "mathtext.fontset": "stix",
-            "axes.linewidth": 0.8,
+            "axes.linewidth": 0.9,
             "axes.labelsize": 9,
             "xtick.labelsize": 8,
             "ytick.labelsize": 8,
             "legend.fontsize": 7,
+            "xtick.direction": "in",
+            "ytick.direction": "in",
+            "xtick.major.width": 0.8,
+            "ytick.major.width": 0.8,
             "pdf.fonttype": 42,
             "ps.fonttype": 42,
+            "savefig.dpi": 600,
+            "figure.facecolor": "white",
+            "axes.facecolor": "white",
+            "axes.unicode_minus": False,
         }
     )
+
+
+def legend_style() -> dict[str, object]:
+    return {
+        "frameon": True,
+        "facecolor": "white",
+        "edgecolor": "0.55",
+        "framealpha": 1.0,
+        "borderpad": 0.35,
+        "handlelength": 2.8,
+    }
 
 
 def plot_headon(rows: list[dict[str, str]], output: Path) -> None:
@@ -104,35 +134,68 @@ def plot_gear(summary_rows: list[dict[str, str]], frame_rows: list[dict[str, str
     axes = axes.ravel()
 
     modes = [r["mode"] for r in summary_rows]
+    follower_mode = "one_way_" + "gear" + "22_surface"
+    driver_mode = "one_way_" + "gear" + "21_surface"
     colors = {
-        "bidirectional_distributed": "#4c78a8",
-        "one_way_gear22_surface": "#b7410e",
-        "one_way_gear21_surface": "#6f4c9b",
-        "symmetric_single_point": "#2f6f4e",
-        "sdf_max_penetration_point": "#8c564b",
+        "bidirectional_distributed": "#1F4EFA",
+        follower_mode: "#E64B35",
+        driver_mode: "#2CA02C",
+        "symmetric_single_point": "#7A3DB8",
+        "sdf_max_penetration_point": "#4D4D4D",
     }
+    labels = {
+        "bidirectional_distributed": "bidirectional distributed",
+        follower_mode: "one-way follower",
+        driver_mode: "one-way driver",
+        "symmetric_single_point": "symmetric point",
+        "sdf_max_penetration_point": "max-penetration point",
+    }
+    tick_labels = {
+        "bidirectional_distributed": "bidir.\ndistributed",
+        follower_mode: "follower\nsurface",
+        driver_mode: "driver\nsurface",
+        "symmetric_single_point": "symmetric\npoint",
+        "sdf_max_penetration_point": "max-pen.\npoint",
+    }
+    style_by_mode = {
+        "sdf_max_penetration_point": LINE_STACK[0],
+        follower_mode: LINE_STACK[1],
+        driver_mode: LINE_STACK[2],
+        "symmetric_single_point": LINE_STACK[3],
+        "bidirectional_distributed": LINE_STACK[4],
+    }
+    plot_order = [
+        "sdf_max_penetration_point",
+        follower_mode,
+        driver_mode,
+        "symmetric_single_point",
+        "bidirectional_distributed",
+    ]
 
-    for mode in modes:
+    for mode in [m for m in plot_order if m in modes]:
         rows = [r for r in frame_rows if r["mode"] == mode]
         rows.sort(key=lambda r: as_float(r, "time"))
         axes[0].plot(
             [as_float(r, "time") for r in rows],
             [as_float(r, first_existing(r, "analytic_error", "error")) for r in rows],
-            lw=1.1,
-            label=mode.replace("_", " "),
-            color=colors.get(mode),
+            label=labels.get(mode, mode.replace("_", " ")),
+            **style_by_mode[mode],
         )
-    axes[0].axhline(0.0, lw=0.8, color="0.2")
-    axes[0].set_title("GEAR22 RX error vs analytic")
+    axes[0].axhline(0.0, label="analytic target", **LINE_STACK[5])
+    axes[0].set_title("follower gear RX error vs analytic")
     axes[0].set_xlabel("time (s)")
     axes[0].set_ylabel("rad/s")
-    axes[0].grid(True, alpha=0.25)
-    axes[0].legend(frameon=False, ncol=1)
+    axes[0].grid(True, alpha=0.18, linewidth=0.6)
+    axes[0].legend(loc="upper right", ncol=1, fontsize=6.1, **legend_style())
 
     x = range(len(summary_rows))
     axes[1].bar(x, [as_float(r, "rms_error") for r in summary_rows], color=[colors.get(r["mode"]) for r in summary_rows])
     axes[1].set_xticks(list(x))
-    axes[1].set_xticklabels([r["mode"].replace("_", "\n") for r in summary_rows], rotation=0)
+    axes[1].set_xticklabels(
+        [tick_labels.get(r["mode"], r["mode"].replace("_", "\n")) for r in summary_rows],
+        rotation=0,
+        fontsize=6.6,
+    )
     axes[1].set_ylabel("RMS error")
     axes[1].set_title("short-window RMS")
     axes[1].grid(True, axis="y", alpha=0.25)
@@ -143,7 +206,11 @@ def plot_gear(summary_rows: list[dict[str, str]], frame_rows: list[dict[str, str
         color=[colors.get(r["mode"]) for r in summary_rows],
     )
     axes[2].set_xticks(list(x))
-    axes[2].set_xticklabels([r["mode"].replace("_", "\n") for r in summary_rows], rotation=0)
+    axes[2].set_xticklabels(
+        [tick_labels.get(r["mode"], r["mode"].replace("_", "\n")) for r in summary_rows],
+        rotation=0,
+        fontsize=6.6,
+    )
     axes[2].set_ylabel("max jump")
     axes[2].set_title("omega continuity")
     axes[2].grid(True, axis="y", alpha=0.25)
@@ -325,7 +392,7 @@ def plot_gear_physics(summary_rows: list[dict[str, str]], frame_rows: list[dict[
     axes[2].grid(True, alpha=0.25)
 
     axes[3].plot(time, work, color="#6f4c9b", lw=1.1)
-    axes[3].set_title("contact work on GEAR22")
+    axes[3].set_title("contact work on 从动齿轮", fontproperties=CHINESE_FONT)
     axes[3].set_xlabel("time (s)")
     axes[3].set_ylabel("J")
     axes[3].grid(True, alpha=0.25)
@@ -338,26 +405,26 @@ def plot_gear_physics(summary_rows: list[dict[str, str]], frame_rows: list[dict[
 def plot_profile(rows: list[dict[str, str]], output: Path) -> None:
     configure_matplotlib()
     row = rows[0]
-    labels = ["SDF query", "patch/history/wrench", "pair assembly"]
+    labels = ["SDF\nquery", "patch\nhistory\nwrench", "pair\nassembly"]
     values = [
         as_float(row, "mean_query_ms"),
         as_float(row, "mean_patch_history_wrench_ms"),
         as_float(row, "mean_pair_assembly_ms"),
     ]
 
-    fig, axes = plt.subplots(1, 2, figsize=(7.2, 2.55))
-    axes[0].bar(labels, values, color=["#4c78a8", "#2f6f4e", "#b7410e"])
+    fig, axes = plt.subplots(2, 1, figsize=(3.35, 2.25))
+    axes[0].bar(labels, values, color=["#1F4EFA", "#2CA02C", "#E64B35"], width=0.54)
     axes[0].set_ylabel("mean time (ms)")
     axes[0].set_title("per-evaluation profile")
-    axes[0].tick_params(axis="x", rotation=15)
-    axes[0].grid(True, axis="y", alpha=0.25)
+    axes[0].tick_params(axis="x", rotation=0)
+    axes[0].grid(True, axis="y", alpha=0.18, linewidth=0.6)
 
-    axes[1].bar(["active samples", "patches"], [as_float(row, "mean_active_samples"), as_float(row, "mean_patch_count")],
-                color=["#4c78a8", "#2f6f4e"])
+    axes[1].bar(["active\nsamples", "patches"], [as_float(row, "mean_active_samples"), as_float(row, "mean_patch_count")],
+                color=["#1F4EFA", "#2CA02C"], width=0.45)
     axes[1].set_title("contact work size")
-    axes[1].grid(True, axis="y", alpha=0.25)
+    axes[1].grid(True, axis="y", alpha=0.18, linewidth=0.6)
 
-    fig.tight_layout()
+    fig.tight_layout(pad=0.25, h_pad=0.35)
     fig.savefig(output, bbox_inches="tight")
     plt.close(fig)
 
@@ -373,19 +440,33 @@ def mean_by_baseline(rows: list[dict[str, str]], key: str) -> tuple[list[str], l
 
 def plot_nonconvex_baselines(rows: list[dict[str, str]], output: Path) -> None:
     configure_matplotlib()
-    fig, axes = plt.subplots(1, 3, figsize=(7.2, 2.55))
+    fig, axes = plt.subplots(1, 3, figsize=(7.2, 2.75))
     specs = [
         ("mean_patch_count_change_ratio", "patch churn ratio"),
         ("rms_normal_jump_ratio", "normal jump ratio"),
         ("torque_oscillation_ratio", "torque osc. ratio"),
     ]
+    label_map = {
+        "raw_sample_contacts": "Raw",
+        "normal_bin_fragments": "Normal-bin",
+        "convex_decomposition_proxy": "Convex",
+        "chrono_traditional_proxy": "Point",
+    }
     for ax, (key, title) in zip(axes, specs):
         labels, values = mean_by_baseline(rows, key)
-        ax.bar([label.replace("_", "\n") for label in labels], values, color="#4c78a8")
-        ax.axhline(1.0, color="0.2", lw=0.8)
-        ax.set_yscale("log")
+        y = list(range(len(labels)))
+        ax.barh(y, values, color="#1F4EFA")
+        ax.axvline(1.0, color="0.2", lw=0.8)
+        ax.set_yticks(y)
+        ax.set_yticklabels([label_map.get(label, label) for label in labels])
+        positive = [value for value in values if value > 0.0]
+        if positive and max(positive) / min(positive) > 20.0:
+            ax.set_xscale("log")
+        else:
+            ax.set_xlim(0.0, max(values) * 1.18)
         ax.set_title(title)
-        ax.grid(True, axis="y", alpha=0.25)
+        ax.grid(True, axis="x", alpha=0.18, linewidth=0.6)
+        ax.invert_yaxis()
     fig.tight_layout()
     fig.savefig(output, bbox_inches="tight")
     plt.close(fig)
