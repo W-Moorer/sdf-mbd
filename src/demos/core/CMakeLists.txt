@@ -18,6 +18,7 @@ set(DEMOS
   demo_CH_field_contact_regression
   demo_CH_field_contact_feature_switching
   demo_CH_field_contact_multislip_interlock
+  demo_CH_sdf_ncp_regression
   demo_CH_chrono_native_contact_baseline
   demo_CH_friction_validation
 )
@@ -64,6 +65,22 @@ if(CH_ENABLE_FIELD_CONTACT_REGRESSION_TESTS)
            COMMAND "$<TARGET_FILE:demo_CH_field_contact_regression>")
   set_tests_properties(demo_CH_field_contact_regression PROPERTIES
                        LABELS "collision;field_contact")
+
+  add_test(NAME test_sdf_ncp_fb
+           COMMAND "$<TARGET_FILE:demo_CH_sdf_ncp_regression>" fb)
+  set_tests_properties(test_sdf_ncp_fb PROPERTIES
+                       LABELS "collision;field_contact;sdf_ncp")
+
+  add_test(NAME test_sdf_ncp_point_mass_plane_step
+           COMMAND "$<TARGET_FILE:demo_CH_sdf_ncp_regression>" step)
+  set_tests_properties(test_sdf_ncp_point_mass_plane_step PROPERTIES
+                       LABELS "collision;field_contact;sdf_ncp")
+
+  add_test(NAME test_sdf_ncp_point_mass_plane_rollout
+           COMMAND "$<TARGET_FILE:demo_CH_sdf_ncp_regression>" rollout)
+  set_tests_properties(test_sdf_ncp_point_mass_plane_rollout PROPERTIES
+                       LABELS "collision;field_contact;sdf_ncp"
+                       TIMEOUT 60)
 
   add_test(NAME demo_CH_friction_validation
            COMMAND "$<TARGET_FILE:demo_CH_friction_validation>"

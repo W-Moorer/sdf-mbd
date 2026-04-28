@@ -699,6 +699,7 @@ set(Chrono_collision_HEADERS
     collision/ChConvexDecomposition.h
     collision/ChFieldContactPrimitives.h
     collision/ChFieldContactRuntime.h
+    collision/ChSdfNcpContact.h
     collision/ChCollisionShapes.h
     collision/ChCollisionShape.h
     collision/ChCollisionShapeArc2D.h
