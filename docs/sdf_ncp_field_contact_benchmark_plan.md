@@ -342,3 +342,42 @@ pressure-field / sdf-field contact 与 sdf-ncp 现在应保持后端分离：
 - benchmark 对比层负责把 SDF-NCP trajectory 与 RecurDyn reference CSV 对齐，输出 `comparison.csv` 和 `rmd_mapping.csv`。
 
 这保证 cam、gear、eccentric roller 等 asset 不需要各自实现不同 NCP 后端。case-specific 内容只允许存在于“资产实体名选择”和“reference 输出列定义”中；动力学约束、SDF query、patch assembly 和 NCP descriptor contact 必须走通用代码路径。
+
+## 2026-04-29 更新：AABB BVH 粗检测规划
+
+本轮加入的 AABB BVH 只服务于 SDF 前端候选筛选，不改变 SDF-NCP 后端 residual、Jacobian、FB complementarity 或 pressure/intensity 物理量。目标是减少每步对无关 surface samples 的 OpenVDB 查询次数，同时保持 active patch 的几何结果不变。
+
+### 分层查询路径
+
+```text
+OBJ / mesh vertices
+  -> ChSdfContactSurfaceGraph
+  -> ChSdfContactSampleBvh(AABB over local surface samples)
+  -> broad-phase candidate sample ids
+  -> phi-only OpenVDB narrow query for active-band decision
+  -> full OpenVDB phi + grad (+ Hessian where needed) only for active samples
+  -> generic SDF-NCP backend
+```
+
+### 设计原则
+
+1. BVH 放在 `ChSdfContactGeometry.h`，只依赖 sample position/area，不依赖 NCP 或 pressure-field。
+2. `ChOpenVdbSdfGrid` 保存 mesh local AABB，并提供 `QueryLocalPhiOnly` / `SamplePhi` 给 active-band 粗筛使用。
+3. `cam`、`eccentric_roller`、`onset_stress` 使用 follower sample BVH 与 cam SDF local bounds 做粗检测。
+4. `simple_gear` 使用 GEAR21 和 GEAR22 各自的 sample BVH，双向查询分别筛选：
+
+```text
+GEAR22 surface BVH vs GEAR21 SDF bounds
+GEAR21 surface BVH vs GEAR22 SDF bounds
+```
+
+5. 粗检测 AABB 使用 `max_activation_band + hysteresis + voxel padding` 扩张，避免漏掉 active band 内的 sample。
+6. 若 BVH 候选无法满足最小 patch 样本数，代码回退到全 sample phi-only 扫描，优先保证精度不损失。
+7. BVH 只减少候选搜索成本；真实接触力、力矩、NCP unknown、warm start 和 patch 权重仍由通用 SDF-NCP assembly 计算。
+
+### 验收标准
+
+1. `simple_gear_dt_001` 的 MAE/RMSE 不比引入 BVH 前变差。
+2. `simple_gear_dt_0005` 和 `simple_gear_dt_0001` 不发散，`success_rate = 1`。
+3. `max_penetration`、`ncp_residual`、`complementarity_error` 保持有界。
+4. `ctest -L sdf_ncp_benchmark`、`ctest -L sdf_ncp`、`ctest -L field_contact` 和 `pytest` 保持通过。

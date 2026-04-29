@@ -68,7 +68,9 @@ using chrono::ChVectorDynamic;
 using chrono::UpdateFlags;
 using chrono::sdfcontact::BuildOpenVdbLevelSetFromMesh;
 using chrono::sdfcontact::ChOpenVdbSdfGrid;
+using chrono::sdfcontact::ChSdfAabb;
 using chrono::sdfcontact::ChSdfContactSampleQuery;
+using chrono::sdfcontact::ChSdfContactSampleBvh;
 using chrono::sdfcontact::ChSdfContactSurfaceGraph;
 using chrono::sdfcontact::ChSdfTriangleMeshData;
 using chrono::sdfcontact::LoadWavefrontMeshForSdf;
@@ -238,6 +240,64 @@ ChVector3d AngularVelocityXCross(double omega, const ChVector3d& r) {
 
 ChVector3d UnitXCross(const ChVector3d& r) {
     return ChVector3d(0.0, -r.z(), r.y());
+}
+
+std::vector<ChVector3d> AabbCorners(const ChSdfAabb& bounds) {
+    if (!bounds.IsValid()) {
+        return {};
+    }
+    std::vector<ChVector3d> corners;
+    corners.reserve(8);
+    for (int ix = 0; ix < 2; ix++) {
+        for (int iy = 0; iy < 2; iy++) {
+            for (int iz = 0; iz < 2; iz++) {
+                corners.emplace_back(ix == 0 ? bounds.min.x() : bounds.max.x(),
+                                     iy == 0 ? bounds.min.y() : bounds.max.y(),
+                                     iz == 0 ? bounds.min.z() : bounds.max.z());
+            }
+        }
+    }
+    return corners;
+}
+
+ChSdfAabb ExpandedAabb(ChSdfAabb bounds, double padding) {
+    bounds.Expand(padding);
+    return bounds;
+}
+
+ChSdfAabb TransformAabbBetweenBodyFrames(const ChSdfAabb& target_local_bounds,
+                                         const Mat3& target_rotation,
+                                         const ChVector3d& target_center,
+                                         const Mat3& source_rotation,
+                                         const ChVector3d& source_center,
+                                         double padding) {
+    const ChSdfAabb padded = ExpandedAabb(target_local_bounds, padding);
+    ChSdfAabb source_bounds;
+    if (!padded.IsValid()) {
+        return source_bounds;
+    }
+
+    const Mat3 source_rotation_t = Transpose(source_rotation);
+    for (const auto& target_corner : AabbCorners(padded)) {
+        const ChVector3d world = target_center + target_rotation * target_corner;
+        const ChVector3d source_local = source_rotation_t * (world - source_center);
+        source_bounds.Include(source_local);
+    }
+    return source_bounds;
+}
+
+ChSdfAabb CamLocalAabbInFollowerLocal(const ChSdfAabb& cam_local_bounds, double follower_y, double theta_cam, double padding) {
+    const ChSdfAabb padded = ExpandedAabb(cam_local_bounds, padding);
+    ChSdfAabb follower_local_bounds;
+    if (!padded.IsValid()) {
+        return follower_local_bounds;
+    }
+
+    for (const auto& cam_corner : AabbCorners(padded)) {
+        const ChVector3d world = RotateZ(cam_corner, theta_cam);
+        follower_local_bounds.Include(world - ChVector3d(0, follower_y, 0));
+    }
+    return follower_local_bounds;
 }
 
 double NormDynamic(const std::vector<double>& values) {
@@ -1258,14 +1318,14 @@ CamLikeConfig MakeCamLikeConfig(const std::string& case_name) {
         config.follower_obj = config.asset_dir / "models" / "roller_follower.obj";
         config.notes =
             "full eccentric_roller OBJ/OpenVDB SDF; adaptive active-band connected patch SDF-NCP samples; "
-            "generic active-patch area-normalized SDF-NCP assembly";
+            "generic active-patch area-normalized SDF-NCP assembly; AABB BVH broad phase filters follower samples";
     } else if (case_name == "onset_stress") {
         model_json = ReadTextFile(config.asset_dir / "onset_stress_model.json");
         config.cam_obj = config.asset_dir / "models" / "onset_cam.obj";
         config.follower_obj = config.asset_dir / "models" / "roller_follower.obj";
         config.notes =
             "full onset_stress OBJ/OpenVDB SDF; adaptive active-band connected patch SDF-NCP samples; "
-            "generic active-patch area-normalized SDF-NCP assembly";
+            "generic active-patch area-normalized SDF-NCP assembly; AABB BVH broad phase filters follower samples";
     } else {
         throw std::invalid_argument("Unknown cam-like SDF-NCP benchmark: " + case_name);
     }
@@ -1308,6 +1368,17 @@ ChSdfContactSampleQuery QueryFollowerSampleAgainstCamLike(const ChOpenVdbSdfGrid
     return query;
 }
 
+double SampleFollowerPhiAgainstCamLike(const ChOpenVdbSdfGrid& cam_sdf,
+                                       const ChSdfContactSurfaceGraph& follower_graph,
+                                       int sample_id,
+                                       double follower_y,
+                                       double theta_cam) {
+    const auto& sample = follower_graph.samples.at(static_cast<size_t>(sample_id));
+    const ChVector3d world_pos = sample.local_pos + ChVector3d(0, follower_y, 0);
+    const ChVector3d cam_frame_pos = RotateZ(world_pos, -theta_cam);
+    return cam_sdf.SamplePhi(cam_frame_pos);
+}
+
 std::vector<int> BuildCamLikePatchSamples(const ChOpenVdbSdfGrid& cam_sdf,
                                           const ChSdfContactSurfaceGraph& follower_graph,
                                           double follower_y,
@@ -1317,19 +1388,62 @@ std::vector<int> BuildCamLikePatchSamples(const ChOpenVdbSdfGrid& cam_sdf,
                                           double activation_band,
                                           double max_activation_band,
                                           int min_patch_samples,
-                                          int* patch_count = nullptr) {
-    std::vector<std::pair<int, double>> sampled;
-    sampled.reserve(follower_graph.samples.size());
-    double min_phi = std::numeric_limits<double>::max();
-    for (const auto& sample : follower_graph.samples) {
-        if (sample.area <= 0.0) {
-            continue;
+                                          int* patch_count = nullptr,
+                                          const ChSdfContactSampleBvh* follower_bvh = nullptr,
+                                          const ChSdfAabb* cam_local_bounds = nullptr,
+                                          double broad_phase_padding = 0.0) {
+    (void)follower_vy;
+    (void)omega_cam;
+    auto all_sample_ids = [&]() {
+        std::vector<int> ids;
+        ids.reserve(follower_graph.samples.size());
+        for (const auto& sample : follower_graph.samples) {
+            if (sample.area > 0.0) {
+                ids.push_back(sample.id);
+            }
         }
-        const auto query = QueryFollowerSampleAgainstCamLike(
-            cam_sdf, follower_graph, sample.id, follower_y, follower_vy, theta_cam, omega_cam);
-        sampled.emplace_back(sample.id, query.phi);
-        min_phi = std::min(min_phi, query.phi);
+        return ids;
+    };
+
+    std::vector<int> candidate_ids;
+    if (follower_bvh && cam_local_bounds && !follower_bvh->Empty() && cam_local_bounds->IsValid()) {
+        const ChSdfAabb query_bounds =
+            CamLocalAabbInFollowerLocal(*cam_local_bounds, follower_y, theta_cam, broad_phase_padding);
+        candidate_ids = follower_bvh->Query(query_bounds);
+        std::sort(candidate_ids.begin(), candidate_ids.end());
+        candidate_ids.erase(std::unique(candidate_ids.begin(), candidate_ids.end()), candidate_ids.end());
+    } else {
+        candidate_ids = all_sample_ids();
     }
+
+    if (candidate_ids.empty()) {
+        if (patch_count) {
+            *patch_count = 0;
+        }
+        return {};
+    }
+
+    std::vector<std::pair<int, double>> sampled;
+    sampled.reserve(candidate_ids.size());
+    auto collect_sampled = [&](const std::vector<int>& ids, double& min_phi) {
+        sampled.clear();
+        min_phi = std::numeric_limits<double>::max();
+        for (int sample_id : ids) {
+            if (sample_id < 0 || sample_id >= static_cast<int>(follower_graph.samples.size())) {
+                continue;
+            }
+            const auto& sample = follower_graph.samples[static_cast<size_t>(sample_id)];
+            if (sample.area <= 0.0) {
+                continue;
+            }
+            const double phi = SampleFollowerPhiAgainstCamLike(cam_sdf, follower_graph, sample.id, follower_y, theta_cam);
+            sampled.emplace_back(sample.id, phi);
+            min_phi = std::min(min_phi, phi);
+        }
+    };
+
+    double min_phi = std::numeric_limits<double>::max();
+    collect_sampled(candidate_ids, min_phi);
     if (min_phi > std::max(activation_band, max_activation_band)) {
         if (patch_count) {
             *patch_count = 0;
@@ -1338,21 +1452,33 @@ std::vector<int> BuildCamLikePatchSamples(const ChOpenVdbSdfGrid& cam_sdf,
     }
 
     std::vector<int> active;
-    active.reserve(follower_graph.samples.size());
-    double band = std::max(activation_band, 0.0);
-    const double band_limit = std::max(band, max_activation_band);
-    for (;;) {
+    auto build_active = [&]() {
         active.clear();
-        const double threshold = min_phi + band;
-        for (const auto& item : sampled) {
-            if (item.second <= threshold) {
-                active.push_back(item.first);
+        double band = std::max(activation_band, 0.0);
+        const double band_limit = std::max(band, max_activation_band);
+        for (;;) {
+            active.clear();
+            const double threshold = min_phi + band;
+            for (const auto& item : sampled) {
+                if (item.second <= threshold) {
+                    active.push_back(item.first);
+                }
             }
+            if (static_cast<int>(active.size()) >= std::max(1, min_patch_samples) || band >= band_limit) {
+                break;
+            }
+            band = std::min(band_limit, std::max(2.0 * band, band + 1.0e-12));
         }
-        if (static_cast<int>(active.size()) >= std::max(1, min_patch_samples) || band >= band_limit) {
-            break;
-        }
-        band = std::min(band_limit, std::max(2.0 * band, band + 1.0e-12));
+    };
+    active.reserve(sampled.size());
+    build_active();
+
+    if (follower_bvh && active.size() < static_cast<size_t>(std::max(1, min_patch_samples)) &&
+        candidate_ids.size() < follower_graph.samples.size()) {
+        candidate_ids = all_sample_ids();
+        sampled.reserve(candidate_ids.size());
+        collect_sampled(candidate_ids, min_phi);
+        build_active();
     }
 
     const auto components = follower_graph.FindConnectedComponents(active);
@@ -1373,14 +1499,15 @@ double MinFollowerGapAgainstCamLike(const ChOpenVdbSdfGrid& cam_sdf,
                                     double follower_vy,
                                     double theta_cam,
                                     double omega_cam) {
+    (void)follower_vy;
+    (void)omega_cam;
     double min_gap = std::numeric_limits<double>::max();
     for (const auto& sample : follower_graph.samples) {
         if (sample.area <= 0.0) {
             continue;
         }
-        const auto query = QueryFollowerSampleAgainstCamLike(
-            cam_sdf, follower_graph, sample.id, follower_y, follower_vy, theta_cam, omega_cam);
-        min_gap = std::min(min_gap, query.phi);
+        min_gap = std::min(min_gap,
+                           SampleFollowerPhiAgainstCamLike(cam_sdf, follower_graph, sample.id, follower_y, theta_cam));
     }
     return min_gap;
 }
@@ -1504,7 +1631,10 @@ struct CamLikeStepResult {
 CamLikeStepResult SolveCamLikeStep(const ChOpenVdbSdfGrid& cam_sdf,
                                    const ChSdfContactSurfaceGraph& follower_graph,
                                    const CamLikeConfig& config,
-                                   const CamLikeState& state) {
+                                   const CamLikeState& state,
+                                   const ChSdfContactSampleBvh* follower_bvh = nullptr,
+                                   const ChSdfAabb* cam_local_bounds = nullptr,
+                                   double broad_phase_padding = 0.0) {
     CamLikeStepResult result;
     result.state = StepCamLikeFallback(config, state);
     const double theta_next = state.theta + config.dt * config.cam_motor_speed;
@@ -1520,7 +1650,10 @@ CamLikeStepResult SolveCamLikeStep(const ChOpenVdbSdfGrid& cam_sdf,
                                                                   config.activation_band,
                                                                   config.max_activation_band,
                                                                   config.min_patch_samples,
-                                                                  &patch_count);
+                                                                  &patch_count,
+                                                                  follower_bvh,
+                                                                  cam_local_bounds,
+                                                                  broad_phase_padding);
     if (sample_ids.empty()) {
         result.diagnostics.success = true;
         result.diagnostics.min_gap = MinFollowerGapAgainstCamLike(
@@ -1587,6 +1720,9 @@ int RunCamLikeFullGeometryCase(const std::string& case_name) {
     ChOpenVdbSdfGrid cam_sdf = BuildOpenVdbLevelSetFromMesh(
         cam_mesh, config.voxel_size, config.half_width_voxels);
     ChSdfContactSurfaceGraph follower_graph = MakeSurfaceGraphFromMeshForSdf(follower_mesh);
+    ChSdfContactSampleBvh follower_bvh(follower_graph);
+    const double broad_phase_padding =
+        std::max(config.activation_band, config.max_activation_band) + 8.0 * std::max(config.voxel_size, 1.0e-12);
 
     std::ofstream trajectory(out_dir / "trajectory.csv");
     std::ofstream comparison(out_dir / "comparison.csv");
@@ -1637,7 +1773,8 @@ int RunCamLikeFullGeometryCase(const std::string& case_name) {
 
     for (int i = 0; i <= steps; i++) {
         if (i > 0) {
-            const CamLikeStepResult step = SolveCamLikeStep(cam_sdf, follower_graph, config, state);
+            const CamLikeStepResult step =
+                SolveCamLikeStep(cam_sdf, follower_graph, config, state, &follower_bvh, &cam_sdf.local_bounds, broad_phase_padding);
             state = step.state;
             const double time = static_cast<double>(i) * config.dt;
             if (case_name == "onset_stress" && std::isnan(observed_onset) && previous_gap > 0.0 &&
@@ -1682,7 +1819,10 @@ int RunCamLikeFullGeometryCase(const std::string& case_name) {
                                                                    config.activation_band,
                                                                    config.max_activation_band,
                                                                    config.min_patch_samples,
-                                                                   &patch_count);
+                                                                   &patch_count,
+                                                                   &follower_bvh,
+                                                                   &cam_sdf.local_bounds,
+                                                                   broad_phase_padding);
             const MultiStepDiagnostics diag = EvaluateCamLikeState(cam_sdf, follower_graph, config, state, ids);
             if (diag.candidates.empty()) {
                 trajectory << "0,follower,0," << state.y << ",0,1,0,0,0,0," << state.vy
@@ -2443,6 +2583,36 @@ MultiContactCandidate QueryGear21SampleAgainstGear22(const ChOpenVdbSdfGrid& gea
     return candidate;
 }
 
+double SampleGear22PhiAgainstGear21(const ChOpenVdbSdfGrid& gear21_sdf,
+                                    const ChSdfContactSurfaceGraph& gear22_graph,
+                                    const GearPose& pose21,
+                                    const GearPose& pose22,
+                                    int sample_id,
+                                    double theta21,
+                                    double theta22) {
+    const auto& sample = gear22_graph.samples.at(static_cast<size_t>(sample_id));
+    const Mat3 r21 = GearBodyRotation(pose21, theta21);
+    const Mat3 r22 = GearBodyRotation(pose22, theta22);
+    const ChVector3d world_pos = pose22.center + r22 * sample.local_pos;
+    const ChVector3d gear21_local = Transpose(r21) * (world_pos - pose21.center);
+    return gear21_sdf.SamplePhi(gear21_local);
+}
+
+double SampleGear21PhiAgainstGear22(const ChOpenVdbSdfGrid& gear22_sdf,
+                                    const ChSdfContactSurfaceGraph& gear21_graph,
+                                    const GearPose& pose21,
+                                    const GearPose& pose22,
+                                    int sample_id,
+                                    double theta21,
+                                    double theta22) {
+    const auto& sample = gear21_graph.samples.at(static_cast<size_t>(sample_id));
+    const Mat3 r21 = GearBodyRotation(pose21, theta21);
+    const Mat3 r22 = GearBodyRotation(pose22, theta22);
+    const ChVector3d world_pos = pose21.center + r21 * sample.local_pos;
+    const ChVector3d gear22_local = Transpose(r22) * (world_pos - pose22.center);
+    return gear22_sdf.SamplePhi(gear22_local);
+}
+
 double SimpleGearJacobianTheta22Derivative(const ChOpenVdbSdfGrid& gear21_sdf,
                                            const ChOpenVdbSdfGrid& gear22_sdf,
                                            const ChSdfContactSurfaceGraph& gear21_graph,
@@ -2586,75 +2756,130 @@ std::vector<GearContactSampleRef> BuildGearBidirectionalPatchSamples(const ChOpe
                                                                      double theta21,
                                                                      double theta22,
                                                                      int* patch_count = nullptr,
-                                                                     GearPatchMemory* memory = nullptr) {
+                                                                     GearPatchMemory* memory = nullptr,
+                                                                     const ChSdfContactSampleBvh* gear21_bvh = nullptr,
+                                                                     const ChSdfContactSampleBvh* gear22_bvh = nullptr) {
     struct SamplePhi {
         int id = -1;
         double effective_gap = 0.0;
         double area = 0.0;
     };
 
-    auto build_direction = [&](int direction, const ChSdfContactSurfaceGraph& graph) {
-        std::vector<SamplePhi> sampled;
-        sampled.reserve(graph.samples.size());
-        double min_gap = std::numeric_limits<double>::max();
-        for (const auto& sample : graph.samples) {
-            if (sample.area <= 0.0) {
-                continue;
+    auto build_direction = [&](int direction, const ChSdfContactSurfaceGraph& graph, const ChSdfContactSampleBvh* bvh) {
+        auto all_sample_ids = [&]() {
+            std::vector<int> ids;
+            ids.reserve(graph.samples.size());
+            for (const auto& sample : graph.samples) {
+                if (sample.area > 0.0) {
+                    ids.push_back(sample.id);
+                }
             }
-            const auto candidate = direction == 0 ?
-                                       QueryGear22SampleAgainstGear21(gear21_sdf,
-                                                                      gear22_graph,
-                                                                      pose21,
-                                                                      pose22,
-                                                                      sample.id,
-                                                                      theta21,
-                                                                      theta22) :
-                                       QueryGear21SampleAgainstGear22(gear22_sdf,
-                                                                      gear21_graph,
-                                                                      pose21,
-                                                                      pose22,
-                                                                      sample.id,
-                                                                      theta21,
-                                                                      theta22);
-            const double effective_gap = candidate.gap - config.sdf_ncp_contact_offset;
-            sampled.push_back(SamplePhi{sample.id, effective_gap, sample.area});
-            min_gap = std::min(min_gap, effective_gap);
+            return ids;
+        };
+
+        std::vector<int> candidate_ids;
+        if (bvh && !bvh->Empty()) {
+            const double broad_padding = std::max(config.activation_band, config.max_activation_band) +
+                                         std::abs(config.sdf_ncp_contact_offset) +
+                                         std::max(0.0, config.active_band_hysteresis) +
+                                         8.0 * std::max(config.voxel_size, 1.0e-12);
+            const Mat3 r21 = GearBodyRotation(pose21, theta21);
+            const Mat3 r22 = GearBodyRotation(pose22, theta22);
+            const ChSdfAabb query_bounds =
+                direction == 0 ?
+                    TransformAabbBetweenBodyFrames(
+                        gear21_sdf.local_bounds, r21, pose21.center, r22, pose22.center, broad_padding) :
+                    TransformAabbBetweenBodyFrames(
+                        gear22_sdf.local_bounds, r22, pose22.center, r21, pose21.center, broad_padding);
+            candidate_ids = bvh->Query(query_bounds);
+            std::sort(candidate_ids.begin(), candidate_ids.end());
+            candidate_ids.erase(std::unique(candidate_ids.begin(), candidate_ids.end()), candidate_ids.end());
+        } else {
+            candidate_ids = all_sample_ids();
         }
 
-        std::vector<int> active;
-        if (sampled.empty()) {
+        if (candidate_ids.empty()) {
             return std::vector<GearContactSampleRef>{};
         }
-        if (min_gap <= std::max(config.activation_band, config.max_activation_band)) {
-            double band = std::max(config.activation_band, 0.0);
-            const double band_limit = std::max(band, config.max_activation_band);
-            for (;;) {
-                active.clear();
-                const double threshold = min_gap + band;
-                const double retained_threshold = min_gap + band + std::max(0.0, config.active_band_hysteresis);
+
+        std::vector<SamplePhi> sampled;
+        sampled.reserve(candidate_ids.size());
+        auto collect_sampled = [&](const std::vector<int>& ids, double& min_gap) {
+            sampled.clear();
+            min_gap = std::numeric_limits<double>::max();
+            for (int sample_id : ids) {
+                if (sample_id < 0 || sample_id >= static_cast<int>(graph.samples.size())) {
+                    continue;
+                }
+                const auto& sample = graph.samples[static_cast<size_t>(sample_id)];
+                if (sample.area <= 0.0) {
+                    continue;
+                }
+                const double gap = direction == 0 ?
+                                       SampleGear22PhiAgainstGear21(
+                                           gear21_sdf, gear22_graph, pose21, pose22, sample.id, theta21, theta22) :
+                                       SampleGear21PhiAgainstGear22(
+                                           gear22_sdf, gear21_graph, pose21, pose22, sample.id, theta21, theta22);
+                const double effective_gap = gap - config.sdf_ncp_contact_offset;
+                sampled.push_back(SamplePhi{sample.id, effective_gap, sample.area});
+                min_gap = std::min(min_gap, effective_gap);
+            }
+        };
+
+        double min_gap = std::numeric_limits<double>::max();
+        collect_sampled(candidate_ids, min_gap);
+
+        std::vector<int> active;
+        auto build_active = [&]() {
+            active.clear();
+            if (sampled.empty()) {
+                return;
+            }
+            if (min_gap <= std::max(config.activation_band, config.max_activation_band)) {
+                double band = std::max(config.activation_band, 0.0);
+                const double band_limit = std::max(band, config.max_activation_band);
+                for (;;) {
+                    active.clear();
+                    const double threshold = min_gap + band;
+                    const double retained_threshold = min_gap + band + std::max(0.0, config.active_band_hysteresis);
+                    for (const auto& item : sampled) {
+                        const int persistent_id = GearSamplePersistentId(direction, item.id);
+                        const bool retained =
+                            memory && memory->active_sample_ids.count(persistent_id) > 0 &&
+                            item.effective_gap <= retained_threshold;
+                        if (item.effective_gap <= threshold || retained) {
+                            active.push_back(item.id);
+                        }
+                    }
+                    if (static_cast<int>(active.size()) >= std::max(1, config.min_patch_samples) ||
+                        band >= band_limit) {
+                        break;
+                    }
+                    band = std::min(band_limit, std::max(2.0 * band, band + 1.0e-12));
+                }
+            } else if (memory) {
+                const double retained_threshold =
+                    min_gap + config.max_activation_band + std::max(0.0, config.active_band_hysteresis);
                 for (const auto& item : sampled) {
                     const int persistent_id = GearSamplePersistentId(direction, item.id);
-                    const bool retained =
-                        memory && memory->active_sample_ids.count(persistent_id) > 0 &&
-                        item.effective_gap <= retained_threshold;
-                    if (item.effective_gap <= threshold || retained) {
+                    if (memory->active_sample_ids.count(persistent_id) > 0 && item.effective_gap <= retained_threshold) {
                         active.push_back(item.id);
                     }
                 }
-                if (static_cast<int>(active.size()) >= std::max(1, config.min_patch_samples) || band >= band_limit) {
-                    break;
-                }
-                band = std::min(band_limit, std::max(2.0 * band, band + 1.0e-12));
             }
-        } else if (memory) {
-            const double retained_threshold =
-                min_gap + config.max_activation_band + std::max(0.0, config.active_band_hysteresis);
-            for (const auto& item : sampled) {
-                const int persistent_id = GearSamplePersistentId(direction, item.id);
-                if (memory->active_sample_ids.count(persistent_id) > 0 && item.effective_gap <= retained_threshold) {
-                    active.push_back(item.id);
-                }
-            }
+        };
+
+        if (sampled.empty()) {
+            return std::vector<GearContactSampleRef>{};
+        }
+        build_active();
+
+        if (bvh && active.size() < static_cast<size_t>(std::max(1, config.min_patch_samples)) &&
+            candidate_ids.size() < graph.samples.size()) {
+            candidate_ids = all_sample_ids();
+            sampled.reserve(candidate_ids.size());
+            collect_sampled(candidate_ids, min_gap);
+            build_active();
         }
 
         const auto components = graph.FindConnectedComponents(active);
@@ -2691,8 +2916,8 @@ std::vector<GearContactSampleRef> BuildGearBidirectionalPatchSamples(const ChOpe
         return refs;
     };
 
-    std::vector<GearContactSampleRef> refs22 = build_direction(0, gear22_graph);
-    std::vector<GearContactSampleRef> refs21 = build_direction(1, gear21_graph);
+    std::vector<GearContactSampleRef> refs22 = build_direction(0, gear22_graph, gear22_bvh);
+    std::vector<GearContactSampleRef> refs21 = build_direction(1, gear21_graph, gear21_bvh);
     std::vector<GearContactSampleRef> refs;
     refs.reserve(refs22.size() + refs21.size());
     refs.insert(refs.end(), refs22.begin(), refs22.end());
@@ -2756,9 +2981,9 @@ double MinGearGap(const ChOpenVdbSdfGrid& gear21_sdf,
         if (sample.area <= 0.0) {
             continue;
         }
-        const auto candidate = QueryGear22SampleAgainstGear21(
-            gear21_sdf, gear22_graph, pose21, pose22, sample.id, theta21, theta22);
-        min_gap = std::min(min_gap, candidate.gap);
+        min_gap = std::min(min_gap,
+                           SampleGear22PhiAgainstGear21(
+                               gear21_sdf, gear22_graph, pose21, pose22, sample.id, theta21, theta22));
     }
     return min_gap;
 }
@@ -2774,9 +2999,9 @@ double MinGearGapReverse(const ChOpenVdbSdfGrid& gear22_sdf,
         if (sample.area <= 0.0) {
             continue;
         }
-        const auto candidate = QueryGear21SampleAgainstGear22(
-            gear22_sdf, gear21_graph, pose21, pose22, sample.id, theta21, theta22);
-        min_gap = std::min(min_gap, candidate.gap);
+        min_gap = std::min(min_gap,
+                           SampleGear21PhiAgainstGear22(
+                               gear22_sdf, gear21_graph, pose21, pose22, sample.id, theta21, theta22));
     }
     return min_gap;
 }
@@ -3054,7 +3279,9 @@ GearStepResult SolveSimpleGearStep(const ChOpenVdbSdfGrid& gear21_sdf,
                                    const SimpleGearConfig& config,
                                    double inertia22,
                                    const GearState& state,
-                                   GearPatchMemory* memory = nullptr) {
+                                   GearPatchMemory* memory = nullptr,
+                                   const ChSdfContactSampleBvh* gear21_bvh = nullptr,
+                                   const ChSdfContactSampleBvh* gear22_bvh = nullptr) {
     GearStepResult result;
     result.state = state;
     const double theta21_free = state.theta21 + config.dt * config.omega21;
@@ -3071,7 +3298,9 @@ GearStepResult SolveSimpleGearStep(const ChOpenVdbSdfGrid& gear21_sdf,
                                                                                        theta21_free,
                                                                                        theta22_free,
                                                                                        &patch_count,
-                                                                                       &active_memory);
+                                                                                       &active_memory,
+                                                                                       gear21_bvh,
+                                                                                       gear22_bvh);
     std::map<int, double> warm_start = memory ? memory->warm_start_intensity : std::map<int, double>{};
     ChSdfNcpGeneralizedStepResult solved;
     const int active_set_limit =
@@ -3134,7 +3363,9 @@ GearStepResult SolveSimpleGearStep(const ChOpenVdbSdfGrid& gear21_sdf,
                                                                                          theta21_free,
                                                                                          theta22_solved,
                                                                                          &next_patch_count,
-                                                                                         &candidate_memory);
+                                                                                         &candidate_memory,
+                                                                                         gear21_bvh,
+                                                                                         gear22_bvh);
         if (SameGearSampleRefs(sample_refs, next_refs)) {
             active_memory = std::move(candidate_memory);
             warm_start = std::move(solved_warm_start);
@@ -3257,7 +3488,9 @@ GearStepResult SolveSimpleGearRecurDynGGeomContactLawStep(const ChOpenVdbSdfGrid
                                                           const SimpleGearGGeomContactLawSI& law,
                                                           double inertia22,
                                                           const GearState& state,
-                                                          GearPatchMemory* memory = nullptr) {
+                                                          GearPatchMemory* memory = nullptr,
+                                                          const ChSdfContactSampleBvh* gear21_bvh = nullptr,
+                                                          const ChSdfContactSampleBvh* gear22_bvh = nullptr) {
     GearStepResult result;
     result.state = state;
     const double theta21_free = state.theta21 + config.dt * config.omega21;
@@ -3273,7 +3506,9 @@ GearStepResult SolveSimpleGearRecurDynGGeomContactLawStep(const ChOpenVdbSdfGrid
                                                                                              theta21_free,
                                                                                              theta22_free,
                                                                                              &patch_count,
-                                                                                             memory);
+                                                                                             memory,
+                                                                                             gear21_bvh,
+                                                                                             gear22_bvh);
 
     auto residual = [&](double omega_next) {
         const double theta22_next = state.theta22 + config.dt * omega_next;
@@ -3529,6 +3764,8 @@ int RunSimpleGearFullGeometryCase(const std::string& result_case_name = "simple_
         gear22, config.voxel_size, config.half_width_voxels);
     ChSdfContactSurfaceGraph gear21_graph = MakeSurfaceGraphFromMeshForSdf(gear21);
     ChSdfContactSurfaceGraph gear22_graph = MakeSurfaceGraphFromMeshForSdf(gear22);
+    ChSdfContactSampleBvh gear21_bvh(gear21_graph);
+    ChSdfContactSampleBvh gear22_bvh(gear22_graph);
     const auto reference = LoadGear22Reference(asset_dir / "data" / "Gear22.csv");
 
     std::ofstream trajectory(out_dir / "trajectory.csv");
@@ -3564,8 +3801,8 @@ int RunSimpleGearFullGeometryCase(const std::string& result_case_name = "simple_
                       "full GEAR21/GEAR22 OBJ/OpenVDB SDF; bidirectional adaptive active-band tooth patch SDF-NCP "
                       "samples; connected-component patch partition; sample-level persistent warm start; "
                       "area-integrated local contact intensity SDF-NCP assembly; RecurDyn RevJoint1.RMotion driver "
-                      "and GGEOMCONTACT metadata parsed from simple gear.rmd; hard frictionless NCP does not apply "
-                      "RMD K/C/KORDER";
+                      "and GGEOMCONTACT metadata parsed from simple gear.rmd; AABB BVH broad phase filters source "
+                      "surface samples before exact OpenVDB query; hard frictionless NCP does not apply RMD K/C/KORDER";
     if (backend_mode == SimpleGearBackendMode::SdfNcp && config.use_impulse_mixed_ncp) {
         stats.notes +=
             "; dt-adaptive impulse/velocity-level mixed NCP enabled with AD Jacobian and dt-scaled impulse weights";
@@ -3593,7 +3830,9 @@ int RunSimpleGearFullGeometryCase(const std::string& result_case_name = "simple_
                                                                                               state.theta21,
                                                                                               state.theta22,
                                                                                               &patch_count,
-                                                                                              &patch_memory);
+                                                                                              &patch_memory,
+                                                                                              &gear21_bvh,
+                                                                                              &gear22_bvh);
             if (backend_mode == SimpleGearBackendMode::RecurDynGGeomContactLaw) {
                 EvaluateSimpleGearGGeomContactLaw(gear21_sdf,
                                                   gear22_sdf,
@@ -3648,7 +3887,9 @@ int RunSimpleGearFullGeometryCase(const std::string& result_case_name = "simple_
                                                                   ggeom_law,
                                                                   rmd.gear22.inertia_x_kg_m2,
                                                                   state,
-                                                                  &patch_memory);
+                                                                  &patch_memory,
+                                                                  &gear21_bvh,
+                                                                  &gear22_bvh);
             } else {
                 step = SolveSimpleGearStep(gear21_sdf,
                                            gear22_sdf,
@@ -3659,7 +3900,9 @@ int RunSimpleGearFullGeometryCase(const std::string& result_case_name = "simple_
                                            config,
                                            rmd.gear22.inertia_x_kg_m2,
                                            state,
-                                           &patch_memory);
+                                           &patch_memory,
+                                           &gear21_bvh,
+                                           &gear22_bvh);
             }
             state = step.state;
         }
@@ -3787,6 +4030,10 @@ int RunSimpleGearFullGeometryCase(const std::string& result_case_name = "simple_
                   "is reached\n";
     comparison << config.case_name << ",sdf_ncp_max_active_set_iterations,0," << config.max_active_set_iterations
                << "," << config.max_active_set_iterations << ",0,semismooth active patch iteration cap\n";
+    comparison << config.case_name << ",sdf_ncp_aabb_bvh_broadphase_enabled,0,1,1,0,"
+               << "backend-neutral AABB BVH filters source-surface samples before full OpenVDB SDF query\n";
+    comparison << config.case_name << ",sdf_ncp_aabb_bvh_leaf_size,0,16,16,0,"
+               << "default ChSdfContactSampleBvh leaf size used for benchmark sample graphs\n";
     if (analytic_stats.samples > 0) {
         const double denom = static_cast<double>(analytic_stats.samples);
         const double analytic_rmse = std::sqrt(analytic_stats.sum_sq_omega / denom);
@@ -3868,7 +4115,10 @@ std::vector<ChSdfNcpDescriptorContact> BuildCamDescriptorContacts(
     const std::shared_ptr<ChBodyAuxRef>& follower,
     const ChOpenVdbSdfGrid& cam_sdf,
     const ChSdfContactSurfaceGraph& follower_graph,
-    const CamLikeConfig& config) {
+    const CamLikeConfig& config,
+    const ChSdfContactSampleBvh* follower_bvh = nullptr,
+    const ChSdfAabb* cam_local_bounds = nullptr,
+    double broad_phase_padding = 0.0) {
     struct SamplePhi {
         int sample_id = -1;
         double phi = 0.0;
@@ -3883,7 +4133,41 @@ std::vector<ChSdfNcpDescriptorContact> BuildCamDescriptorContacts(
 
     const auto& follower_ref = follower->GetFrameRefToAbs();
     const auto& cam_ref = cam->GetFrameRefToAbs();
-    for (const auto& sample : follower_graph.samples) {
+    auto all_sample_ids = [&]() {
+        std::vector<int> ids;
+        ids.reserve(follower_graph.samples.size());
+        for (const auto& sample : follower_graph.samples) {
+            if (sample.area > 0.0) {
+                ids.push_back(sample.id);
+            }
+        }
+        return ids;
+    };
+
+    std::vector<int> candidate_ids;
+    if (follower_bvh && cam_local_bounds && !follower_bvh->Empty() && cam_local_bounds->IsValid()) {
+        ChSdfAabb padded = ExpandedAabb(*cam_local_bounds, broad_phase_padding);
+        ChSdfAabb query_bounds;
+        for (const auto& cam_corner : AabbCorners(padded)) {
+            const ChVector3d world = cam_ref.TransformPointLocalToParent(cam_corner);
+            query_bounds.Include(follower_ref.TransformPointParentToLocal(world));
+        }
+        candidate_ids = follower_bvh->Query(query_bounds);
+        std::sort(candidate_ids.begin(), candidate_ids.end());
+        candidate_ids.erase(std::unique(candidate_ids.begin(), candidate_ids.end()), candidate_ids.end());
+    } else {
+        candidate_ids = all_sample_ids();
+    }
+
+    if (candidate_ids.empty()) {
+        return {};
+    }
+
+    for (int sample_id : candidate_ids) {
+        if (sample_id < 0 || sample_id >= static_cast<int>(follower_graph.samples.size())) {
+            continue;
+        }
+        const auto& sample = follower_graph.samples[static_cast<size_t>(sample_id)];
         if (sample.area <= 0.0) {
             continue;
         }
@@ -3946,6 +4230,11 @@ std::vector<ChSdfNcpDescriptorContact> BuildCamDescriptorContacts(
                 }
             }
         }
+    }
+
+    if (follower_bvh && static_cast<int>(active.size()) < std::max(1, config.min_patch_samples) &&
+        candidate_ids.size() < follower_graph.samples.size()) {
+        return BuildCamDescriptorContacts(cam, follower, cam_sdf, follower_graph, config, nullptr, nullptr, 0.0);
     }
 
     double total_area = 0.0;
@@ -4147,6 +4436,7 @@ int RunCamChronoMbdCase(const std::string& output_case_name = "cam",
         LoadWavefrontMeshForSdf(asset_dir / "models" / "cam_body2.obj", 1.0, follower_surface_marker.qp);
     ChOpenVdbSdfGrid cam_sdf = BuildOpenVdbLevelSetFromMesh(cam_mesh, voxel_size, config.half_width_voxels);
     ChSdfContactSurfaceGraph follower_graph = MakeSurfaceGraphFromMeshForSdf(follower_mesh);
+    ChSdfContactSampleBvh follower_bvh(follower_graph);
     auto reference = LoadCamReference(asset_dir / "data" / "cam_data.csv");
 
     CamLikeConfig ncp_config;
@@ -4168,10 +4458,14 @@ int RunCamChronoMbdCase(const std::string& output_case_name = "cam",
     ncp_config.notes = use_recurdyn_solid_contact_law ?
                            "Chrono MBD path: ChSystemNSC + cam rotation motor + follower translational joint + "
                            "RMD SolidContact K/C/KORDER/BPEN force law; RMD part/marker/joint/surface mapping; "
-                           "full cam OBJ/OpenVDB geometry" :
+                           "full cam OBJ/OpenVDB geometry; AABB BVH broad phase filters follower samples" :
                            "Chrono MBD path: ChSystemNSC + cam rotation motor + follower translational joint + "
                            "descriptor-injected frictionless SDF-NCP unilateral constraints; "
-                           "RMD part/marker/joint/surface mapping; full cam OBJ/OpenVDB geometry";
+                           "RMD part/marker/joint/surface mapping; full cam OBJ/OpenVDB geometry; "
+                           "AABB BVH broad phase filters follower samples";
+    const double broad_phase_padding =
+        std::max(ncp_config.activation_band, ncp_config.max_activation_band) +
+        8.0 * std::max(ncp_config.voxel_size, 1.0e-12);
 
     ChSystemNSC sys;
     sys.SetGravitationalAcceleration(rmd.gravity);
@@ -4207,8 +4501,9 @@ int RunCamChronoMbdCase(const std::string& output_case_name = "cam",
 
     std::shared_ptr<ChSdfNcpConstraintContactSet> contact_item;
     std::shared_ptr<ChSdfPenaltyContactForceSet> penalty_item;
-    auto generator = [cam, follower, &cam_sdf, &follower_graph, ncp_config]() {
-        return BuildCamDescriptorContacts(cam, follower, cam_sdf, follower_graph, ncp_config);
+    auto generator = [cam, follower, &cam_sdf, &follower_graph, &follower_bvh, broad_phase_padding, ncp_config]() {
+        return BuildCamDescriptorContacts(
+            cam, follower, cam_sdf, follower_graph, ncp_config, &follower_bvh, &cam_sdf.local_bounds, broad_phase_padding);
     };
     if (use_recurdyn_solid_contact_law) {
         RecurDynSolidContactLaw law;
@@ -4360,7 +4655,8 @@ int RunCamFullGeometryCase() {
     ncp_config.cam_motor_speed = rmd_cam_motor_speed;
     ncp_config.notes =
         "full cam_body1/cam_body2 OBJ/OpenVDB SDF; adaptive active-band connected patch SDF-NCP samples; "
-        "generic active-patch area-normalized SDF-NCP assembly; cam speed from simple_cam.rmd";
+        "generic active-patch area-normalized SDF-NCP assembly; AABB BVH broad phase filters follower samples; "
+        "cam speed from simple_cam.rmd";
     const auto out_dir = root / "results" / "sdf_ncp_benchmarks" / "cam";
     std::filesystem::create_directories(out_dir);
 
@@ -4373,6 +4669,10 @@ int RunCamFullGeometryCase() {
     ChOpenVdbSdfGrid cam_sdf = BuildOpenVdbLevelSetFromMesh(
         cam_mesh, config.voxel_size, config.half_width_voxels);
     ChSdfContactSurfaceGraph follower_graph = MakeSurfaceGraphFromMeshForSdf(follower_mesh);
+    ChSdfContactSampleBvh follower_bvh(follower_graph);
+    const double broad_phase_padding =
+        std::max(ncp_config.activation_band, ncp_config.max_activation_band) +
+        8.0 * std::max(ncp_config.voxel_size, 1.0e-12);
     auto reference = LoadCamReference(asset_dir / "data" / "cam_data.csv");
 
     std::ofstream trajectory(out_dir / "trajectory.csv");
@@ -4400,7 +4700,8 @@ int RunCamFullGeometryCase() {
     for (int i = 0; i <= steps; i++) {
         MultiStepDiagnostics diag;
         if (i > 0) {
-            const CamLikeStepResult step = SolveCamLikeStep(cam_sdf, follower_graph, ncp_config, state);
+            const CamLikeStepResult step = SolveCamLikeStep(
+                cam_sdf, follower_graph, ncp_config, state, &follower_bvh, &cam_sdf.local_bounds, broad_phase_padding);
             state = step.state;
             diag = step.diagnostics;
         } else {
@@ -4414,7 +4715,10 @@ int RunCamFullGeometryCase() {
                                                                    ncp_config.activation_band,
                                                                    ncp_config.max_activation_band,
                                                                    ncp_config.min_patch_samples,
-                                                                   &patch_count);
+                                                                   &patch_count,
+                                                                   &follower_bvh,
+                                                                   &cam_sdf.local_bounds,
+                                                                   broad_phase_padding);
             diag = EvaluateCamLikeState(cam_sdf, follower_graph, ncp_config, state, ids);
             diag.patch_count = patch_count;
         }

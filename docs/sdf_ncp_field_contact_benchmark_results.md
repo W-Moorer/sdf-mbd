@@ -895,3 +895,47 @@ results/sdf_ncp_benchmarks/cam_recurdyn_solid_contact/figures/reference_comparis
 3. `cam_recurdyn_solid_contact` 使用同一套前端建模，并启用 RMD `SolidContact1` 的 `K/C/KORDER/BPEN` 力律；该基线与 RecurDyn 曲线重合最好，用于验证前端建模一致性。
 4. frictionless SDF-NCP descriptor path 与 RecurDyn SolidContact-law baseline 之间仍存在速度瞬态差异，这是接触律差异，不应再归因于前端建模不一致。
 5. SDF-NCP 后端保持通用：后端只接收 gap、normal、weight、body pair 和 unilateral normal constraint 数据；cam 相关内容限制在 RMD/OBJ/OpenVDB 前端映射与 reference 对比层。
+
+## 2026-04-29 更新：AABB BVH 粗检测结果
+
+本轮实现了 backend-neutral AABB BVH 粗检测层。它不改变 SDF-NCP 接触方程，只改变 active sample 候选生成方式：
+
+```text
+source surface sample BVH
+  -> transformed target SDF local bounds query
+  -> candidate sample ids
+  -> phi-only active-band scan
+  -> full OpenVDB query only for active samples
+```
+
+当前接入范围：
+
+1. `cam` descriptor path：follower surface samples 通过 BVH 与 cam OpenVDB bounds 做粗检测。
+2. `eccentric_roller` / `onset_stress` local rollout：roller follower samples 通过 BVH 与 cam-like OpenVDB bounds 做粗检测。
+3. `simple_gear`：GEAR22->GEAR21 和 GEAR21->GEAR22 两个方向均使用各自 source surface BVH。
+
+为避免精度损失，active band 的 AABB 查询使用 voxel/activation/hysteresis padding；当 BVH 候选不足以满足最小 patch 样本数时，回退到全 surface phi-only 扫描。
+
+### simple_gear dt sweep 结果
+
+重新运行：
+
+```text
+python scripts\validate_sdf_ncp_simple_gear_dt_sweep.py
+```
+
+得到：
+
+| case | dt | success_rate | max_penetration | MAE vs analytic | RMSE vs analytic | final omega22 | runtime_seconds |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `simple_gear_dt_001` | `0.001` | `1` | `8.2869746620417573e-09` | `0.065929736198861666` | `0.10246898597734395` | `-1.0511661888263963` | `12.344617400000001` |
+| `simple_gear_dt_0005` | `0.0005` | `1` | `1.0006613138102693e-07` | `0.063319570651797885` | `0.13101056370576455` | `-0.96574456900269146` | `11.5995366` |
+| `simple_gear_dt_0001` | `0.0001` | `1` | `1.0003219585996703e-07` | `0.055550703486665146` | `0.11795585683594351` | `-0.96901368213534234` | `55.016859500000002` |
+
+`dt=0.001` 的 MAE/RMSE 与 BVH 接入前的基线一致；因此本轮粗检测没有改变该算例的解析误差。墙钟耗时明显下降，主要原因是全 surface scan 不再对每个 sample 都计算 OpenVDB gradient/Hessian。
+
+### 当前限制
+
+1. BVH 仍是静态 local-space sample BVH，每步通过 transformed AABB 查询，不是连续碰撞检测。
+2. broad phase 只保证不会改变 active patch 的 intended band；极端高速运动仍需要后续 swept AABB 或时间连续 active set。
+3. 真正的 SDF-NCP 收敛精度仍由 active patch、SDF 离散化、接触律和 Newton/AD Jacobian 决定；BVH 只解决候选搜索效率。

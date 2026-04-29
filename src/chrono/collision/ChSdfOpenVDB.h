@@ -48,6 +48,7 @@ struct ChSdfTriangleMeshData {
 struct ChOpenVdbSdfGrid {
     openvdb::FloatGrid::Ptr grid;
     double voxel_size = 0.0;
+    ChSdfAabb local_bounds;
 
     bool Empty() const {
         return !grid;
@@ -141,6 +142,15 @@ struct ChOpenVdbSdfGrid {
         query.world_vel = local_vel;
         return query;
     }
+
+    ChSdfContactSampleQuery QueryLocalPhiOnly(const ChVector3d& local_pos,
+                                              const ChVector3d& local_vel = ChVector3d(0, 0, 0)) const {
+        ChSdfContactSampleQuery query;
+        query.phi = SamplePhi(local_pos);
+        query.world_pos = local_pos;
+        query.world_vel = local_vel;
+        return query;
+    }
 };
 
 inline ChSdfTriangleMeshData LoadWavefrontMeshForSdf(const std::filesystem::path& path,
@@ -222,6 +232,8 @@ inline ChOpenVdbSdfGrid BuildOpenVdbLevelSetFromMesh(const ChSdfTriangleMeshData
     ChOpenVdbSdfGrid out;
     out.grid = grid;
     out.voxel_size = voxel_size;
+    out.local_bounds = MakeAabbFromPoints(mesh.vertices);
+    out.local_bounds.Expand(voxel_size * static_cast<double>(half_width_voxels + 1.0f));
     return out;
 }
 

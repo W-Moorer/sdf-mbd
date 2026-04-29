@@ -28,6 +28,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
+#include <numeric>
 #include <vector>
 
 #include "chrono/core/ChVector3.h"
@@ -103,6 +105,208 @@ struct ChSdfContactSurfaceGraph {
 
         return components;
     }
+};
+
+inline double ChSdfAxisValue(const ChVector3d& v, int axis) {
+    return axis == 0 ? v.x() : (axis == 1 ? v.y() : v.z());
+}
+
+struct ChSdfAabb {
+    ChVector3d min = ChVector3d(std::numeric_limits<double>::max(),
+                                std::numeric_limits<double>::max(),
+                                std::numeric_limits<double>::max());
+    ChVector3d max = ChVector3d(-std::numeric_limits<double>::max(),
+                                -std::numeric_limits<double>::max(),
+                                -std::numeric_limits<double>::max());
+
+    bool IsValid() const {
+        return min.x() <= max.x() && min.y() <= max.y() && min.z() <= max.z();
+    }
+
+    void Reset() {
+        min = ChVector3d(std::numeric_limits<double>::max(),
+                         std::numeric_limits<double>::max(),
+                         std::numeric_limits<double>::max());
+        max = ChVector3d(-std::numeric_limits<double>::max(),
+                         -std::numeric_limits<double>::max(),
+                         -std::numeric_limits<double>::max());
+    }
+
+    void Include(const ChVector3d& p) {
+        min = ChVector3d(std::min(min.x(), p.x()), std::min(min.y(), p.y()), std::min(min.z(), p.z()));
+        max = ChVector3d(std::max(max.x(), p.x()), std::max(max.y(), p.y()), std::max(max.z(), p.z()));
+    }
+
+    void Include(const ChSdfAabb& other) {
+        if (!other.IsValid()) {
+            return;
+        }
+        Include(other.min);
+        Include(other.max);
+    }
+
+    void Expand(double padding) {
+        if (!IsValid()) {
+            return;
+        }
+        const double p = std::max(0.0, padding);
+        min -= ChVector3d(p, p, p);
+        max += ChVector3d(p, p, p);
+    }
+
+    bool Overlaps(const ChSdfAabb& other) const {
+        if (!IsValid() || !other.IsValid()) {
+            return false;
+        }
+        return min.x() <= other.max.x() && max.x() >= other.min.x() && min.y() <= other.max.y() &&
+               max.y() >= other.min.y() && min.z() <= other.max.z() && max.z() >= other.min.z();
+    }
+
+    ChVector3d Center() const {
+        return (min + max) * 0.5;
+    }
+
+    ChVector3d Extent() const {
+        return max - min;
+    }
+
+    int MaxExtentAxis() const {
+        const ChVector3d e = Extent();
+        if (e.x() >= e.y() && e.x() >= e.z()) {
+            return 0;
+        }
+        return e.y() >= e.z() ? 1 : 2;
+    }
+};
+
+inline ChSdfAabb MakeAabbFromPoints(const std::vector<ChVector3d>& points) {
+    ChSdfAabb bounds;
+    for (const auto& p : points) {
+        bounds.Include(p);
+    }
+    return bounds;
+}
+
+inline ChSdfAabb MakeAabbFromSurfaceGraph(const ChSdfContactSurfaceGraph& graph) {
+    ChSdfAabb bounds;
+    for (const auto& sample : graph.samples) {
+        if (sample.area > 0.0) {
+            bounds.Include(sample.local_pos);
+        }
+    }
+    return bounds;
+}
+
+class ChSdfContactSampleBvh {
+  public:
+    explicit ChSdfContactSampleBvh(const ChSdfContactSurfaceGraph& graph, int leaf_size = 16) {
+        Build(graph, leaf_size);
+    }
+
+    ChSdfContactSampleBvh() = default;
+
+    void Build(const ChSdfContactSurfaceGraph& graph, int leaf_size = 16) {
+        m_entries.clear();
+        m_nodes.clear();
+        m_leaf_size = std::max(1, leaf_size);
+        m_entries.reserve(graph.samples.size());
+        for (const auto& sample : graph.samples) {
+            if (sample.area <= 0.0) {
+                continue;
+            }
+            m_entries.push_back(Entry{sample.id, sample.local_pos});
+        }
+        if (!m_entries.empty()) {
+            BuildRecursive(0, static_cast<int>(m_entries.size()));
+        }
+    }
+
+    bool Empty() const {
+        return m_nodes.empty();
+    }
+
+    size_t Size() const {
+        return m_entries.size();
+    }
+
+    void Query(const ChSdfAabb& bounds, std::vector<int>& sample_ids) const {
+        if (m_nodes.empty() || !bounds.IsValid()) {
+            return;
+        }
+        QueryNode(0, bounds, sample_ids);
+    }
+
+    std::vector<int> Query(const ChSdfAabb& bounds) const {
+        std::vector<int> sample_ids;
+        Query(bounds, sample_ids);
+        return sample_ids;
+    }
+
+  private:
+    struct Entry {
+        int sample_id = -1;
+        ChVector3d pos = ChVector3d(0, 0, 0);
+    };
+
+    struct Node {
+        ChSdfAabb bounds;
+        int begin = 0;
+        int end = 0;
+        int left = -1;
+        int right = -1;
+
+        bool IsLeaf() const {
+            return left < 0 && right < 0;
+        }
+    };
+
+    int BuildRecursive(int begin, int end) {
+        Node node;
+        node.begin = begin;
+        node.end = end;
+        for (int i = begin; i < end; i++) {
+            node.bounds.Include(m_entries[static_cast<size_t>(i)].pos);
+        }
+
+        const int node_index = static_cast<int>(m_nodes.size());
+        m_nodes.push_back(node);
+
+        if (end - begin <= m_leaf_size) {
+            return node_index;
+        }
+
+        const int axis = node.bounds.MaxExtentAxis();
+        const int mid = begin + (end - begin) / 2;
+        std::nth_element(m_entries.begin() + begin,
+                         m_entries.begin() + mid,
+                         m_entries.begin() + end,
+                         [axis](const Entry& a, const Entry& b) {
+                             return ChSdfAxisValue(a.pos, axis) < ChSdfAxisValue(b.pos, axis);
+                         });
+
+        m_nodes[static_cast<size_t>(node_index)].left = BuildRecursive(begin, mid);
+        m_nodes[static_cast<size_t>(node_index)].right = BuildRecursive(mid, end);
+        return node_index;
+    }
+
+    void QueryNode(int node_index, const ChSdfAabb& bounds, std::vector<int>& sample_ids) const {
+        const Node& node = m_nodes[static_cast<size_t>(node_index)];
+        if (!node.bounds.Overlaps(bounds)) {
+            return;
+        }
+        if (node.IsLeaf()) {
+            for (int i = node.begin; i < node.end; i++) {
+                sample_ids.push_back(m_entries[static_cast<size_t>(i)].sample_id);
+            }
+            return;
+        }
+        QueryNode(node.left, bounds, sample_ids);
+        QueryNode(node.right, bounds, sample_ids);
+    }
+
+    std::vector<Entry> m_entries;
+    std::vector<Node> m_nodes;
+    int m_leaf_size = 16;
 };
 
 struct ChSdfContactSampleQuery {
