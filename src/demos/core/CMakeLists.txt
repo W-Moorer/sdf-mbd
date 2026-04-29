@@ -19,12 +19,13 @@ set(DEMOS
   demo_CH_field_contact_feature_switching
   demo_CH_field_contact_multislip_interlock
   demo_CH_sdf_ncp_regression
+  demo_CH_sdf_ncp_benchmarks
   demo_CH_chrono_native_contact_baseline
   demo_CH_friction_validation
 )
 
 # OpenVDB probe demo is built separately below if OpenVDB is found
-list(APPEND DEMOS_WITH_OPENVDB demo_CH_openvdb_probe demo_CH_sdf_point_contact_openvdb demo_CH_sdf_patch_contact_openvdb demo_CH_sdf_patch_force_openvdb demo_CH_sdf_patch_persistence_openvdb demo_CH_sdf_patch_constitutive_openvdb demo_CH_sdf_patch_constitutive_cases_openvdb demo_CH_sdf_patch_constitutive_tangential_openvdb demo_CH_sdf_patch_constitutive_stickslip_openvdb demo_CH_sdf_patch_constitutive_frame_openvdb demo_CH_sdf_patch_constitutive_transport_limited_openvdb demo_CH_sdf_patch_transport_ablation_openvdb demo_CH_sdf_patch_adaptive_carryover_openvdb demo_CH_sdf_patch_tangential_history_v1_openvdb demo_CH_field_contact_primitives_openvdb demo_CH_field_contact_split_merge_openvdb demo_CH_field_contact_mesh_sdf_nonconvex_openvdb demo_CH_field_contact_matched_mesh_native_openvdb demo_CH_field_contact_free_dynamics_openvdb demo_CH_field_contact_cad_mesh_case_study_openvdb demo_CH_field_contact_chrono_original_mesh_baseline_openvdb demo_CH_simple_gear_openvdb demo_CH_rev_joint_clearance_openvdb)
+list(APPEND DEMOS_WITH_OPENVDB demo_CH_openvdb_probe demo_CH_sdf_point_contact_openvdb demo_CH_sdf_patch_contact_openvdb demo_CH_sdf_patch_force_openvdb demo_CH_sdf_patch_persistence_openvdb demo_CH_sdf_patch_constitutive_openvdb demo_CH_sdf_patch_constitutive_cases_openvdb demo_CH_sdf_patch_constitutive_tangential_openvdb demo_CH_sdf_patch_constitutive_stickslip_openvdb demo_CH_sdf_patch_constitutive_frame_openvdb demo_CH_sdf_patch_constitutive_transport_limited_openvdb demo_CH_sdf_patch_transport_ablation_openvdb demo_CH_sdf_patch_adaptive_carryover_openvdb demo_CH_sdf_patch_tangential_history_v1_openvdb demo_CH_field_contact_primitives_openvdb demo_CH_field_contact_split_merge_openvdb demo_CH_field_contact_mesh_sdf_nonconvex_openvdb demo_CH_field_contact_matched_mesh_native_openvdb demo_CH_field_contact_free_dynamics_openvdb demo_CH_field_contact_cad_mesh_case_study_openvdb demo_CH_field_contact_chrono_original_mesh_baseline_openvdb demo_CH_simple_gear_openvdb demo_CH_rev_joint_clearance_openvdb demo_CH_sdf_ncp_benchmarks_openvdb)
 
 #--------------------------------------------------------------
 
@@ -81,6 +82,11 @@ if(CH_ENABLE_FIELD_CONTACT_REGRESSION_TESTS)
   set_tests_properties(test_sdf_ncp_contact_constraint_eval PROPERTIES
                        LABELS "collision;field_contact;sdf_ncp")
 
+  add_test(NAME test_sdf_ncp_shared_geometry_query
+           COMMAND "$<TARGET_FILE:demo_CH_sdf_ncp_regression>" shared_geometry)
+  set_tests_properties(test_sdf_ncp_shared_geometry_query PROPERTIES
+                       LABELS "collision;field_contact;sdf_ncp")
+
   add_test(NAME test_sdf_ncp_point_mass_plane_step
            COMMAND "$<TARGET_FILE:demo_CH_sdf_ncp_regression>" step)
   set_tests_properties(test_sdf_ncp_point_mass_plane_step PROPERTIES
@@ -101,6 +107,65 @@ if(CH_ENABLE_FIELD_CONTACT_REGRESSION_TESTS)
            COMMAND "$<TARGET_FILE:demo_CH_sdf_ncp_regression>" rollout3d)
   set_tests_properties(test_sdf_ncp_point_mass_3d_plane_rollout PROPERTIES
                        LABELS "collision;field_contact;sdf_ncp"
+                       TIMEOUT 60)
+
+  add_test(NAME test_sdf_ncp_contact_set_eval
+           COMMAND "$<TARGET_FILE:demo_CH_sdf_ncp_regression>" contact_set_eval)
+  set_tests_properties(test_sdf_ncp_contact_set_eval PROPERTIES
+                       LABELS "collision;field_contact;sdf_ncp")
+
+  add_test(NAME test_sdf_ncp_contact_set_force
+           COMMAND "$<TARGET_FILE:demo_CH_sdf_ncp_regression>" contact_set_force)
+  set_tests_properties(test_sdf_ncp_contact_set_force PROPERTIES
+                       LABELS "collision;field_contact;sdf_ncp")
+
+  add_test(NAME test_sdf_ncp_point_mass_contact_set_n1_matches_single
+           COMMAND "$<TARGET_FILE:demo_CH_sdf_ncp_regression>" contact_set_n1)
+  set_tests_properties(test_sdf_ncp_point_mass_contact_set_n1_matches_single PROPERTIES
+                       LABELS "collision;field_contact;sdf_ncp")
+
+  add_test(NAME test_sdf_ncp_point_mass_contact_set_rollout_two_planes
+           COMMAND "$<TARGET_FILE:demo_CH_sdf_ncp_regression>" contact_set_rollout)
+  set_tests_properties(test_sdf_ncp_point_mass_contact_set_rollout_two_planes PROPERTIES
+                       LABELS "collision;field_contact;sdf_ncp"
+                       TIMEOUT 60)
+
+  add_test(NAME test_sdf_ncp_rigidbody2d_kinematics
+           COMMAND "$<TARGET_FILE:demo_CH_sdf_ncp_regression>" rigidbody2d_kinematics)
+  set_tests_properties(test_sdf_ncp_rigidbody2d_kinematics PROPERTIES
+                       LABELS "collision;field_contact;sdf_ncp")
+
+  add_test(NAME test_sdf_ncp_rigidbody2d_jacobian_fd
+           COMMAND "$<TARGET_FILE:demo_CH_sdf_ncp_regression>" rigidbody2d_jacobian)
+  set_tests_properties(test_sdf_ncp_rigidbody2d_jacobian_fd PROPERTIES
+                       LABELS "collision;field_contact;sdf_ncp")
+
+  add_test(NAME test_sdf_ncp_rigidbody2d_contact_force
+           COMMAND "$<TARGET_FILE:demo_CH_sdf_ncp_regression>" rigidbody2d_force)
+  set_tests_properties(test_sdf_ncp_rigidbody2d_contact_force PROPERTIES
+                       LABELS "collision;field_contact;sdf_ncp")
+
+  add_test(NAME test_sdf_ncp_rigidbody2d_step_single_point
+           COMMAND "$<TARGET_FILE:demo_CH_sdf_ncp_regression>" rigidbody2d_step)
+  set_tests_properties(test_sdf_ncp_rigidbody2d_step_single_point PROPERTIES
+                       LABELS "collision;field_contact;sdf_ncp")
+
+  add_test(NAME test_sdf_ncp_rigidbody2d_rollout_two_bottom_points
+           COMMAND "$<TARGET_FILE:demo_CH_sdf_ncp_regression>" rigidbody2d_rollout)
+  set_tests_properties(test_sdf_ncp_rigidbody2d_rollout_two_bottom_points PROPERTIES
+                       LABELS "collision;field_contact;sdf_ncp"
+                       TIMEOUT 60)
+
+  add_test(NAME sdf_ncp_benchmark_headon_spheres
+           COMMAND "$<TARGET_FILE:demo_CH_sdf_ncp_benchmarks>" headon_spheres)
+  set_tests_properties(sdf_ncp_benchmark_headon_spheres PROPERTIES
+                       LABELS "collision;field_contact;sdf_ncp;sdf_ncp_benchmark"
+                       TIMEOUT 60)
+
+  add_test(NAME sdf_ncp_benchmark_headon_spheres_mass_ratio
+           COMMAND "$<TARGET_FILE:demo_CH_sdf_ncp_benchmarks>" headon_spheres_mass_ratio)
+  set_tests_properties(sdf_ncp_benchmark_headon_spheres_mass_ratio PROPERTIES
+                       LABELS "collision;field_contact;sdf_ncp;sdf_ncp_benchmark"
                        TIMEOUT 60)
 
   add_test(NAME demo_CH_friction_validation
@@ -289,6 +354,30 @@ if(OpenVDB_FOUND)
                            FIXTURES_REQUIRED paper_examples_dynamic
                            FIXTURES_SETUP paper_examples_figures
                            TIMEOUT 60)
+
+      add_test(NAME sdf_ncp_benchmark_cam_full_geometry
+               COMMAND "$<TARGET_FILE:demo_CH_sdf_ncp_benchmarks_openvdb>" cam)
+      set_tests_properties(sdf_ncp_benchmark_cam_full_geometry PROPERTIES
+                           LABELS "collision;field_contact;sdf_ncp;sdf_ncp_benchmark"
+                           TIMEOUT 120)
+
+      add_test(NAME sdf_ncp_benchmark_eccentric_roller_full_geometry
+               COMMAND "$<TARGET_FILE:demo_CH_sdf_ncp_benchmarks_openvdb>" eccentric_roller)
+      set_tests_properties(sdf_ncp_benchmark_eccentric_roller_full_geometry PROPERTIES
+                           LABELS "collision;field_contact;sdf_ncp;sdf_ncp_benchmark"
+                           TIMEOUT 120)
+
+      add_test(NAME sdf_ncp_benchmark_onset_stress_full_geometry
+               COMMAND "$<TARGET_FILE:demo_CH_sdf_ncp_benchmarks_openvdb>" onset_stress)
+      set_tests_properties(sdf_ncp_benchmark_onset_stress_full_geometry PROPERTIES
+                           LABELS "collision;field_contact;sdf_ncp;sdf_ncp_benchmark"
+                           TIMEOUT 120)
+
+      add_test(NAME sdf_ncp_benchmark_simple_gear_full_geometry
+               COMMAND "$<TARGET_FILE:demo_CH_sdf_ncp_benchmarks_openvdb>" simple_gear)
+      set_tests_properties(sdf_ncp_benchmark_simple_gear_full_geometry PROPERTIES
+                           LABELS "collision;field_contact;sdf_ncp;sdf_ncp_benchmark"
+                           TIMEOUT 120)
     else()
       message(STATUS "Python3 interpreter not found - skipping OpenVDB field-contact regression tests")
     endif()

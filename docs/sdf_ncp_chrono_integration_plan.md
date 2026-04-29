@@ -330,3 +330,563 @@ compatibility checks.
   contact container, an NSC-like nonlinear constraint path, or a dedicated
   field-contact NCP assembly layer.
 
+## 11. 多点 SDF-NCP contact set assembly
+
+### Why move from one constraint to a contact set
+
+The single-point constraint proves the residual and local Newton solve for one
+gap and one normal multiplier. A useful contact layer must also support several
+simultaneous unilateral constraints before it can become a field-contact NCP
+container. Even a point mass can hit a floor and a side wall at the same time,
+and later patch/field contact will naturally produce multiple candidate contact
+points.
+
+The next abstraction is therefore a small contact set: a list of independent
+frictionless SDF normal constraints that share the same point-mass velocity
+unknowns and are solved in one local NCP system.
+
+### Multi-contact residual
+
+For the current point-mass-only version, all contact points use the same point
+kinematics:
+
+```text
+x_i(q) = q
+```
+
+For contact `i`,
+
+```text
+g_i = surface_i.Phi(q_next)
+n_i = normalize(surface_i.Grad(q_next))
+```
+
+The unknown vector is
+
+```text
+z = [vx_next, vy_next, vz_next, lambda_1, ..., lambda_N]
+```
+
+with
+
+```text
+q_next = q + dt * v_next
+```
+
+The assembled residual is
+
+```text
+R_v = m(v_next - v) - dt(Q + sum_i n_i * lambda_i)
+R_lambda_i = Phi_eps(g_i, lambda_i)
+```
+
+For `N = 0`, the residual degenerates to the free point-mass implicit Euler
+velocity equation:
+
+```text
+R_v = m(v_next - v) - dt Q
+```
+
+### Why this still stays outside Chrono's main solver
+
+The contact set solve is still a local research kernel. It does not yet manage
+Chrono descriptor offsets, active-set persistence, solver warm starting, or
+interaction with `ChContactContainer`. Keeping it independent allows the NCP
+assembly to be tested and compared against the Python prototype without
+destabilizing existing SMC/NSC contact code.
+
+### Role as a future field-contact NCP abstraction
+
+The contact set is a natural precursor to a future field-contact NCP container:
+
+- SDF/field sampling creates candidate points or patch representatives.
+- Each candidate becomes one `ChSdfNcpContactPoint`.
+- The contact set evaluates all gaps, normals, multipliers, and NCP residuals.
+- A later container can map the same residual rows into Chrono's solver
+  descriptor or a dedicated nonlinear complementarity solve.
+
+### Validation case for this phase
+
+The regression checks use two orthogonal planes:
+
+```text
+y = 0, normal [0, 1, 0]
+x = 0, normal [1, 0, 0]
+```
+
+The tests verify direct contact-set evaluation, summed contact force, agreement
+between the `N=1` contact set and the existing single-contact residual, and a
+two-plane rollout with bounded penetration and nonnegative normal multipliers.
+
+### Current limitations
+
+- Friction is still absent.
+- All contacts share point-mass translation kinematics, `x_i(q) = q`.
+- The local Newton solve uses finite-difference Jacobians.
+- The contact set is intended for small `N`; it is not optimized for large
+  contact clouds.
+- There is still no Chrono global descriptor/container integration.
+
+## 12. 2D 刚体局部接触点 SDF-NCP residual
+
+### Why rigid-body local points follow the point-mass contact set
+
+The point-mass contact set verifies multi-contact complementarity assembly, but
+its kinematics are still `x_i(q) = q`. The next minimum mechanics step is a
+rigid body with local contact points. This verifies the contact Jacobian
+definition used in the paper:
+
+```text
+J_phi(q) = grad phi(x_i(q))^T * dx_i(q)/dq
+```
+
+This phase keeps the solve local and small, while adding the rotational
+contribution required before any later Chrono rigid-body descriptor mapping.
+
+### 2D rigid-body state
+
+The local prototype uses planar generalized coordinates and velocities:
+
+```text
+q = [x, y, theta]
+v = [vx, vy, omega]
+```
+
+The mass matrix is
+
+```text
+M = diag(m, m, Iz)
+```
+
+and the external generalized force is
+
+```text
+Q = [0, -m*g0, 0]
+```
+
+### Local point kinematics
+
+For local body point `r_i = [rx, ry]`, the world point is
+
+```text
+x_i(q) = p + R(theta) r_i
+```
+
+or explicitly,
+
+```text
+x_world = x + cos(theta) * rx - sin(theta) * ry
+y_world = y + sin(theta) * rx + cos(theta) * ry
+```
+
+The point Jacobian with respect to `[x, y, theta]` is
+
+```text
+dx_i/dq =
+    [1, 0, -sin(theta)*rx - cos(theta)*ry]
+    [0, 1,  cos(theta)*rx - sin(theta)*ry]
+```
+
+### SDF gap, normal, and contact Jacobian
+
+For contact point `i`,
+
+```text
+g_i(q) = surface_i.Phi(x_i(q))
+n_i = normalize(surface_i.Grad(x_i(q)))
+J_i = n_i^T dx_i/dq
+```
+
+The regression tests compare `J_i` against a finite-difference derivative of
+`surface_i.Phi(x_i(q))`.
+
+### 2D rigid-body residual
+
+The unknown vector for `N` normal contacts is
+
+```text
+z = [vx_next, vy_next, omega_next, lambda_1, ..., lambda_N]
+```
+
+with implicit Euler update
+
+```text
+q_next = q + dt * v_next
+```
+
+The residual is
+
+```text
+R_v = M(v_next - v) - dt(Q + sum_i J_i^T * lambda_i)
+R_lambda_i = Phi_eps(g_i, lambda_i)
+```
+
+This is the rigid-body analogue of the point-mass contact set, with contact
+forces entering through generalized force rows `[Fx, Fy, torque_z]`.
+
+### Current limitations
+
+- The model is planar 2D.
+- Contact is frictionless and normal-only.
+- The nonlinear solve is still a local Newton iteration.
+- The residual Jacobian used by Newton is finite-difference based.
+- The implementation is independent from Chrono's global contact
+  container/descriptor path.
+
+## 13. 第一篇论文数值验证与复现实验计划
+
+### Current SDF-NCP method layers
+
+The repository now contains the independent method layers needed for the first
+traditional SDF-NCP paper:
+
+- Python prototype for SDF gap, normal, point-mass penalty contact, and
+  smooth-Fischer-Burmeister SDF-NCP contact.
+- C++ single-contact residual for a point mass on a plane.
+- C++ multi-contact point-mass contact set assembly.
+- C++ planar rigid-body local-contact residual that verifies
+  `J_phi(q) = grad phi(x_i(q))^T * dx_i(q)/dq`.
+
+These layers remain outside Chrono's production contact containers and global
+solver descriptor. That separation keeps the first-paper experiments
+reproducible and focused on the numerical formulation.
+
+### Questions the first paper should answer
+
+The numerical experiments should answer the following bounded questions without
+overclaiming:
+
+- Are the SDF gap and normal evaluations correct for simple analytical
+  surfaces?
+- Does the SDF contact Jacobian match finite differences of the SDF gap?
+- Does the SDF-NCP formulation reduce penalty-stiffness sensitivity compared
+  with a normal penalty baseline?
+- How does the smooth Fischer-Burmeister parameter `eps` affect penetration,
+  complementarity error, residuals, and solver iterations?
+- Does a small planar rigid body with two local SDF contact points remain
+  stable in a local rollout?
+
+### CSV outputs and figures
+
+The reproducibility suite should generate:
+
+- `results/sdf_ncp/point_mass_plane/point_mass_plane.csv` and time-history
+  figures for height, gap, penetration, contact force, and complementarity
+  error.
+- `results/sdf_ncp/penalty_sensitivity/summary.csv` and
+  `max_penetration_vs_parameter.png`.
+- `results/sdf_ncp/epsilon_sensitivity/summary.csv` plus plots for maximum
+  penetration, complementarity error, and solver iterations versus `eps`.
+- `results/sdf_ncp/geometry/sdf_contours_normals.png` for the method section.
+- `results/sdf_ncp_cpp/rigidbody2d_rollout.csv` from the C++ local rigid-body
+  residual.
+- `results/sdf_ncp_cpp/figures/rigidbody2d_pose_vs_time.png`,
+  `rigidbody2d_gaps_vs_time.png`, `rigidbody2d_lambdas_vs_time.png`, and
+  `rigidbody2d_complementarity_vs_time.png`.
+- `results/sdf_ncp_paper1/tables/method_summary.csv`, a compact table joining
+  the penalty, epsilon, and C++ planar rigid-body statistics.
+
+### Reproduction entry point
+
+The intended paper reproduction command is:
+
+```text
+python scripts/run_sdf_ncp_paper1_experiments.py
+```
+
+It runs the Python point-mass experiments, the SDF geometry visualization, the
+C++ planar rigid-body CSV export, the C++ rollout plotting step, and the summary
+table generation. The script assumes `demo_CH_sdf_ncp_regression` has already
+been built in `build/bin/Release`.
+
+### Still out of scope
+
+This paper-one reproducibility phase still does not include:
+
+- 3D rigid-body contact.
+- Friction cone complementarity.
+- Flexible-body contact.
+- Chrono descriptor or production contact-container integration.
+- AI, neural networks, or machine-learning dependencies.
+
+## 14. SDF 几何前端与接触后端分离
+
+当前仓库中的 SDF 接触需要维护两条后端路线：
+
+1. `field_contact` / pressure-field 后端。
+2. `sdf_ncp` / nonlinear-complementarity 后端。
+
+二者可以复用同一个几何前端，例如 mesh-to-sparse-SDF、surface samples、
+surface graph、SDF query 和法向梯度；但后端的力学装配必须分开。
+
+### 共享几何前端
+
+共享层位于：
+
+```text
+src/chrono/collision/ChSdfContactGeometry.h
+```
+
+该层只包含后端无关数据：
+
+```text
+ChSdfContactSurfaceSample
+ChSdfContactSurfaceGraph
+ChSdfTriangleFace
+ChSdfContactSampleQuery
+MakeTriangleMeshSurfaceGraph
+MakeSphereSurfaceGraph
+```
+
+它只表示：
+
+```text
+sample local position
+sample area
+sample adjacency
+phi(x)
+grad phi(x)
+world sample position
+world sample velocity
+```
+
+它不包含 pressure law、patch force、history transfer、Fischer-Burmeister
+residual、lambda 或 Newton solve。
+
+### pressure-field 后端
+
+pressure-field 后端仍位于：
+
+```text
+src/chrono/collision/ChFieldContactPrimitives.h
+src/chrono/collision/ChFieldContactRuntime.h
+```
+
+`ChFieldContactPrimitives.h` 现在通过别名消费共享几何类型：
+
+```text
+SurfaceGraph      = sdfcontact::ChSdfContactSurfaceGraph
+TriangleFace      = sdfcontact::ChSdfTriangleFace
+FieldSampleQuery  = sdfcontact::ChSdfContactSampleQuery
+```
+
+pressure-field 后端独有内容包括：
+
+```text
+PrimitivePatch
+PatchExtractionSettings
+NormalContactSettings
+ComputeNormalContactIntegral
+TangentialContactSettings
+FieldContactPrimitiveTracker
+history inheritance / split-merge classification
+```
+
+这些内容不应被 SDF-NCP 后端依赖。
+
+### SDF-NCP 后端
+
+SDF-NCP 后端仍位于：
+
+```text
+src/chrono/collision/ChSdfNcpContact.h
+```
+
+该后端独有内容包括：
+
+```text
+SmoothFischerBurmeister
+ComplementarityError
+ChSdfNcpContactConstraint
+ChSdfNcpContactSet
+point-mass residuals
+2D rigid-body residuals
+local Newton solves
+```
+
+SDF-NCP 可以直接消费共享几何 query：
+
+```text
+EvaluateSdfNcpContactQuery(ChSdfContactSampleQuery, lambda, eps)
+```
+
+这条入口只把共享几何中的 `phi` 和 `grad phi` 转换为 NCP gap、normal、
+FB residual 和 complementarity diagnostics；它不调用 pressure-field
+patch extraction 或 pressure force integration。
+
+### 依赖方向
+
+允许的依赖方向是：
+
+```text
+mesh / OpenVDB / sparse SDF frontend
+        -> ChSdfContactGeometry
+        -> ChFieldContactPrimitives / ChFieldContactRuntime
+
+mesh / OpenVDB / sparse SDF frontend
+        -> ChSdfContactGeometry
+        -> ChSdfNcpContact
+```
+
+不允许的依赖方向是：
+
+```text
+ChSdfNcpContact -> ChFieldContactRuntime
+ChSdfNcpContact -> pressure-field force law
+ChFieldContactRuntime -> SDF-NCP lambda / FB residual
+```
+
+这样可以保证两个研究分支共享几何前端，但后端力学装配和验证路径保持独立。
+
+
+## 15. 通用 SDF-NCP 后端与 RecurDyn/资产映射分离
+
+本阶段将 SDF-NCP benchmark 的后端进一步收敛为统一的 generalized residual 层，避免为 `cam`、`eccentric_roller`、`onset_stress`、`simple_gear` 分别维护不同的 NCP 求解器。
+
+### 通用后端输入
+
+通用后端位于：
+
+```text
+src/chrono/collision/ChSdfNcpContact.h
+```
+
+新增核心结构：
+
+```text
+ChSdfNcpGeneralizedContact
+ChSdfNcpGeneralizedProblem
+ChSdfNcpGeneralizedResidual
+ChSdfNcpGeneralizedDiagnostics
+SolveSdfNcpGeneralizedProblem
+```
+
+它只消费：
+
+```text
+current_velocity
+mass_diagonal
+external_force
+dt
+eps
+contact_count
+evaluate_contacts(v_next) -> { gap_i, J_i, weight_i, lambda_i metadata }
+```
+
+其中 `evaluate_contacts` 是前端回调。回调可以来自解析 SDF、OBJ/OpenVDB SDF、RecurDyn marker 映射或未来 SparseSDF 查询，但通用 NCP 后端不读取 OBJ、RMD、OpenVDB 或 field-contact pressure patch 数据结构。
+
+### 通用 residual
+
+```text
+z = [v_next, lambda_1, ..., lambda_n]
+
+R_v[j] =
+    M_j (v_next[j] - v[j])
+    - dt (Q_j + sum_i J_i[j] * lambda_i * weight_i)
+
+R_lambda_i = Phi_eps(g_i, lambda_i)
+
+Phi_eps(g, lambda) = sqrt(g^2 + lambda^2 + eps^2) - g - lambda
+```
+
+`weight_i` 的语义统一为 active contact patch 的 quadrature weight。当前 OpenVDB benchmark 对进入 patch 的 surface samples 使用面积归一化权重，使 `sum_i weight_i = 1`。CSV 中：
+
+```text
+lambda_n       = sample normal NCP multiplier
+contact_weight = active-patch quadrature weight
+lambda_force   = lambda_n * contact_weight
+```
+
+这避免 cam 使用一种力尺度、gear 使用另一种力尺度。后续如果需要真实面积积分压力，应作为统一的后端建模选项引入，而不是按 case 特判。
+
+### 前端映射职责
+
+RecurDyn/资产映射层仍然是 case-specific，但它不是 NCP 后端。它负责：
+
+```text
+OBJ / OpenVDB / SparseSDF loading
+RMD marker, CM, part rotation parsing
+driven coordinate and free coordinate selection
+local/world coordinate transform
+active patch sample selection
+J_i = grad phi(x_i(q))^T dx_i(q)/dq
+```
+
+例如：
+
+- cam-like case 映射为 1 个 follower y-velocity DOF。
+- simple_gear 映射为 GEAR22 RX velocity DOF，当前使用 GEAR21 驱动、GEAR22 自由。
+- gear contact patch 已做双向候选：`GEAR22 -> GEAR21 SDF` 和 `GEAR21 -> GEAR22 SDF`。
+
+### 与 RecurDyn 曲线的一致性状态
+
+当前实现使用完整 OBJ/OpenVDB 几何和自由动力学局部 NCP residual，但还不能声称与 RecurDyn 参考曲线完全对应。主要差异包括：
+
+1. 当前 SDF-NCP 是无摩擦法向 NCP；RecurDyn/field-contact reference 可能包含不同的接触律、阻尼、摩擦、恢复系数或 pressure-field 分布。
+2. 当前 benchmark 只映射了必要的驱动/自由自由度，没有接入 RecurDyn/Chrono 的完整多体约束系统。
+3. 当前 active patch 与 RecurDyn 的接触候选、接触区域和接触力分布并非逐点等价。
+4. 当前局部 Newton 使用有限差分 Jacobian，尚未使用完整解析 Jacobian 或全局 descriptor。
+
+因此，本阶段结果应解释为：通用 SDF-NCP 后端、完整几何 SDF 查询、多点 patch 候选和局部自由动力学已跑通；要达到“与 RecurDyn 参考建模一模一样”，下一步必须逐项对齐 RMD 约束、驱动、初始状态、接触律和输出坐标定义。
+## 2026-04-28 更新：SDF-NCP 进入 Chrono 多体约束求解路径
+
+针对 cam benchmark，当前实现已经从局部 reduced ODE / generalized residual 推进到 Chrono 多体约束描述符路径。新增的独立后端为：
+
+```text
+src/chrono/physics/ChSdfNcpConstraintContact.h
+```
+
+该后端以 `ChPhysicsItem` 形式存在，不修改 `ChSystem`、`ChContactContainerNSC`、`ChContactContainerSMC` 或 Chrono 主 contact container。它通过固定容量的 `ChConstraintTwoBodies` unilateral constraints 将 SDF-NCP 法向接触样本注入 Chrono descriptor，由 Chrono 的多体约束求解器与关节、驱动和刚体变量一起求解。
+
+### 接入方式
+
+SDF / OpenVDB / OBJ 前端仍负责生成接触样本：
+
+```text
+body_a, body_b, point_abs, normal_abs, gap, weight, contact_id
+```
+
+descriptor 后端负责构造无摩擦法向约束 Jacobian：
+
+```text
+g_dot = n^T(v_A + omega_A x r_A - v_B - omega_B x r_B)
+
+Cq_A = [ n^T,  R_A^T (r_A x n)^T ]
+Cq_B = [-n^T, -R_B^T (r_B x n)^T ]
+```
+
+其中角速度行按 Chrono body-local angular velocity 变量写入 `ChConstraintTwoBodies`。求解后的约束乘子通过 `ConstraintsFetch_react` 取回，并用于计算：
+
+```text
+lambda_force = lambda_n * contact_weight
+penetration = max(0, -gap)
+Phi_eps(g, lambda_force)
+complementarity_error(g, lambda_force)
+```
+
+### cam 当前建模状态
+
+`demo_CH_sdf_ncp_benchmarks_openvdb.exe cam` 当前使用：
+
+```text
+ChSystemNSC
+ChBodyAuxRef cam body
+ChBodyAuxRef follower body
+ChLinkMotorRotationSpeed for RevJoint1.RMotion
+ChLinkMateGeneric for TraJoint1 follower translation
+ChSdfNcpConstraintContactSet for SDF-NCP normal contact
+full cam OBJ/OpenVDB SDF geometry
+```
+
+也就是说，cam 已进入 Chrono 多体约束求解路径；旧的局部 generalized/reduced 入口保留为 `cam_reduced`，仅用于对照和回归。
+
+### 仍未完成的对齐项
+
+当前仍不能声称与 RecurDyn 曲线完全对应，原因不是 SDF-NCP 仍停留在局部 reduced 求解，而是以下建模项尚未逐项完全等价：
+
+1. `RevJoint1` 与 `TraJoint1` 的 marker frame / REULER 方向需要继续按 RMD 精确映射到 Chrono joint frames。
+2. RecurDyn `SolidContact1` 中的 penalty/damping/contact-law 参数与当前 frictionless hard NCP 模型不同。
+3. 输出坐标需要确认是否与 reference CSV 的 marker/body 坐标定义完全一致。
+4. 当前 descriptor 接入仍是独立 SDF-NCP physics item，不是 Chrono 主 `ChContactContainerNSC/SMC` 路径。
+
+因此本阶段结论应写为：SDF-NCP 已具备进入 Chrono 多体约束求解路径的独立后端；下一步重点是逐项对齐 RecurDyn 前端建模和接触律，而不是继续扩展 case-specific reduced residual。

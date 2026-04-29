@@ -131,6 +131,7 @@ set(Chrono_physics_HEADERS
     physics/ChSystem.h
     physics/ChSystemNSC.h
     physics/ChSystemSMC.h
+    physics/ChSdfNcpConstraintContact.h
     physics/ChExternalDynamicsODE.h
     physics/ChExternalDynamicsDAE.h
     physics/ChAssembly.h
@@ -697,6 +698,7 @@ set(Chrono_collision_HEADERS
     collision/ChCollisionPair.h
     collision/ChCollisionSystem.h
     collision/ChConvexDecomposition.h
+    collision/ChSdfContactGeometry.h
     collision/ChFieldContactPrimitives.h
     collision/ChFieldContactRuntime.h
     collision/ChSdfNcpContact.h
