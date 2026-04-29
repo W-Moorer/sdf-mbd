@@ -87,6 +87,11 @@ if(CH_ENABLE_FIELD_CONTACT_REGRESSION_TESTS)
   set_tests_properties(test_sdf_ncp_shared_geometry_query PROPERTIES
                        LABELS "collision;field_contact;sdf_ncp")
 
+  add_test(NAME test_sdf_ncp_impulse_mixed_ad_jacobian
+           COMMAND "$<TARGET_FILE:demo_CH_sdf_ncp_regression>" impulse_mixed_ad)
+  set_tests_properties(test_sdf_ncp_impulse_mixed_ad_jacobian PROPERTIES
+                       LABELS "collision;field_contact;sdf_ncp")
+
   add_test(NAME test_sdf_ncp_point_mass_plane_step
            COMMAND "$<TARGET_FILE:demo_CH_sdf_ncp_regression>" step)
   set_tests_properties(test_sdf_ncp_point_mass_plane_step PROPERTIES

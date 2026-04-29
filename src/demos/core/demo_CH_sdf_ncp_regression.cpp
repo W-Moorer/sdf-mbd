@@ -21,6 +21,7 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "chrono/collision/ChSdfNcpContact.h"
 
@@ -134,6 +135,59 @@ void TestSdfNcpSharedGeometryQueryEval() {
                     "Shared SDF geometry query gradient should provide NCP normal");
     CheckNear(contact.lambda_n, 4.0, 1.0e-12, "Shared SDF geometry query should preserve lambda");
     Check(contact.complementarity_error > 0.0, "Penetrating shared query should report complementarity error");
+}
+
+void TestSdfNcpImpulseMixedAutoDiffJacobian() {
+    ChSdfNcpGeneralizedProblem problem;
+    problem.dt = 1.0e-2;
+    problem.eps = 1.0e-6;
+    problem.gap_scale = 1.0e-2;
+    problem.lambda_scale = 1.0e-1;
+    problem.current_velocity = {-0.3};
+    problem.mass_diagonal = {2.0};
+    problem.external_force = {0.5};
+    problem.contact_count = 1;
+    problem.evaluate_contacts = [&](const std::vector<double>& v_next) {
+        ChSdfNcpGeneralizedContact contact;
+        contact.gap = 0.02 + problem.dt * 1.5 * v_next.at(0);
+        contact.jacobian = {1.5};
+        contact.weight = 0.7;
+        contact.contact_id = 7;
+        return std::vector<ChSdfNcpGeneralizedContact>{contact};
+    };
+
+    ChSdfNcpImpulseMixedSettings settings;
+    settings.beta = 0.25;
+    settings.cfm = 0.01;
+    settings.velocity_scale = 1.0;
+    settings.impulse_scale = 0.1;
+
+    const std::vector<double> z = {-0.1, 0.03};
+    const auto ad = ComputeSdfNcpGeneralizedImpulseMixedAd(problem, z, settings);
+
+    const double expected_dynamics = 2.0 * (-0.1 + 0.3) - problem.dt * 0.5 - 1.5 * 0.03 * 0.7;
+    const double gap = 0.02 + problem.dt * 1.5 * z[0];
+    const double mixed_velocity = 1.5 * z[0] + settings.beta * gap / problem.dt + settings.cfm * z[1];
+    const double scaled_impulse = z[1] / settings.impulse_scale;
+    const double expected_ncp = SmoothFischerBurmeister(mixed_velocity / settings.velocity_scale,
+                                                        scaled_impulse,
+                                                        problem.eps);
+    const auto fb_grad =
+        SmoothFischerBurmeisterGrad(mixed_velocity / settings.velocity_scale, scaled_impulse, problem.eps);
+
+    CheckNear(ad.value.at(0), expected_dynamics, 1.0e-14, "Impulse mixed AD dynamics residual");
+    CheckNear(ad.value.at(1), expected_ncp, 1.0e-14, "Impulse mixed AD NCP residual");
+    CheckNear(ad.jacobian.at(0).at(0), 2.0, 1.0e-14, "Impulse mixed AD dRv/dv");
+    CheckNear(ad.jacobian.at(0).at(1), -1.5 * 0.7, 1.0e-14, "Impulse mixed AD dRv/dp");
+    CheckNear(ad.jacobian.at(1).at(0),
+              fb_grad.dPhi_dg * (1.5 * (1.0 + settings.beta)) / settings.velocity_scale,
+              1.0e-13,
+              "Impulse mixed AD dRcp/dv");
+    CheckNear(ad.jacobian.at(1).at(1),
+              fb_grad.dPhi_dg * settings.cfm / settings.velocity_scale +
+                  fb_grad.dPhi_dlambda / settings.impulse_scale,
+              1.0e-13,
+              "Impulse mixed AD dRcp/dp");
 }
 
 void TestPointMassPlaneStep() {
@@ -650,6 +704,9 @@ int main(int argc, char* argv[]) {
     if (mode == "shared_geometry" || mode == "all") {
         TestSdfNcpSharedGeometryQueryEval();
     }
+    if (mode == "impulse_mixed_ad" || mode == "all") {
+        TestSdfNcpImpulseMixedAutoDiffJacobian();
+    }
     if (mode == "step" || mode == "all") {
         TestPointMassPlaneStep();
     }
@@ -691,9 +748,9 @@ int main(int argc, char* argv[]) {
     }
 
     if (mode != "fb" && mode != "surface" && mode != "constraint" && mode != "shared_geometry" &&
-        mode != "step" && mode != "rollout" && mode != "step3d" && mode != "rollout3d" &&
-        mode != "contact_set_eval" && mode != "contact_set_force" && mode != "contact_set_n1" &&
-        mode != "contact_set_rollout" && mode != "rigidbody2d_kinematics" &&
+        mode != "impulse_mixed_ad" && mode != "step" && mode != "rollout" && mode != "step3d" &&
+        mode != "rollout3d" && mode != "contact_set_eval" && mode != "contact_set_force" &&
+        mode != "contact_set_n1" && mode != "contact_set_rollout" && mode != "rigidbody2d_kinematics" &&
         mode != "rigidbody2d_jacobian" && mode != "rigidbody2d_force" &&
         mode != "rigidbody2d_step" && mode != "rigidbody2d_rollout" &&
         mode != "rigidbody2d_export" && mode != "all") {

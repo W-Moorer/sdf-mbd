@@ -1171,6 +1171,211 @@ inline std::vector<std::vector<double>> AnalyticSdfNcpGeneralizedJacobian(
     return jac;
 }
 
+struct ChSdfNcpAdScalar {
+    double value = 0.0;
+    std::vector<double> derivative;
+
+    ChSdfNcpAdScalar() = default;
+
+    ChSdfNcpAdScalar(double v, size_t n = 0) : value(v), derivative(n, 0.0) {}
+
+    static ChSdfNcpAdScalar Variable(double v, size_t index, size_t n) {
+        ChSdfNcpAdScalar out(v, n);
+        out.derivative.at(index) = 1.0;
+        return out;
+    }
+};
+
+inline ChSdfNcpAdScalar operator+(const ChSdfNcpAdScalar& a, const ChSdfNcpAdScalar& b) {
+    ChSdfNcpAdScalar out(a.value + b.value, a.derivative.size());
+    for (size_t i = 0; i < out.derivative.size(); i++) {
+        out.derivative[i] = a.derivative[i] + b.derivative[i];
+    }
+    return out;
+}
+
+inline ChSdfNcpAdScalar operator-(const ChSdfNcpAdScalar& a, const ChSdfNcpAdScalar& b) {
+    ChSdfNcpAdScalar out(a.value - b.value, a.derivative.size());
+    for (size_t i = 0; i < out.derivative.size(); i++) {
+        out.derivative[i] = a.derivative[i] - b.derivative[i];
+    }
+    return out;
+}
+
+inline ChSdfNcpAdScalar operator*(const ChSdfNcpAdScalar& a, const ChSdfNcpAdScalar& b) {
+    ChSdfNcpAdScalar out(a.value * b.value, a.derivative.size());
+    for (size_t i = 0; i < out.derivative.size(); i++) {
+        out.derivative[i] = a.derivative[i] * b.value + b.derivative[i] * a.value;
+    }
+    return out;
+}
+
+inline ChSdfNcpAdScalar operator/(const ChSdfNcpAdScalar& a, const ChSdfNcpAdScalar& b) {
+    ChSdfNcpAdScalar out(a.value / b.value, a.derivative.size());
+    const double denom = b.value * b.value;
+    for (size_t i = 0; i < out.derivative.size(); i++) {
+        out.derivative[i] = (a.derivative[i] * b.value - a.value * b.derivative[i]) / denom;
+    }
+    return out;
+}
+
+inline ChSdfNcpAdScalar operator+(const ChSdfNcpAdScalar& a, double b) {
+    ChSdfNcpAdScalar out = a;
+    out.value += b;
+    return out;
+}
+
+inline ChSdfNcpAdScalar operator+(double a, const ChSdfNcpAdScalar& b) {
+    return b + a;
+}
+
+inline ChSdfNcpAdScalar operator-(const ChSdfNcpAdScalar& a, double b) {
+    ChSdfNcpAdScalar out = a;
+    out.value -= b;
+    return out;
+}
+
+inline ChSdfNcpAdScalar operator-(double a, const ChSdfNcpAdScalar& b) {
+    ChSdfNcpAdScalar out(a - b.value, b.derivative.size());
+    for (size_t i = 0; i < out.derivative.size(); i++) {
+        out.derivative[i] = -b.derivative[i];
+    }
+    return out;
+}
+
+inline ChSdfNcpAdScalar operator*(const ChSdfNcpAdScalar& a, double b) {
+    ChSdfNcpAdScalar out(a.value * b, a.derivative.size());
+    for (size_t i = 0; i < out.derivative.size(); i++) {
+        out.derivative[i] = a.derivative[i] * b;
+    }
+    return out;
+}
+
+inline ChSdfNcpAdScalar operator*(double a, const ChSdfNcpAdScalar& b) {
+    return b * a;
+}
+
+inline ChSdfNcpAdScalar operator/(const ChSdfNcpAdScalar& a, double b) {
+    ChSdfNcpAdScalar out(a.value / b, a.derivative.size());
+    for (size_t i = 0; i < out.derivative.size(); i++) {
+        out.derivative[i] = a.derivative[i] / b;
+    }
+    return out;
+}
+
+inline ChSdfNcpAdScalar Sqrt(const ChSdfNcpAdScalar& a) {
+    const double root = std::sqrt(std::max(a.value, 0.0));
+    ChSdfNcpAdScalar out(root, a.derivative.size());
+    const double denom = std::max(2.0 * root, std::numeric_limits<double>::min());
+    for (size_t i = 0; i < out.derivative.size(); i++) {
+        out.derivative[i] = a.derivative[i] / denom;
+    }
+    return out;
+}
+
+inline ChSdfNcpAdScalar SmoothFischerBurmeisterAd(const ChSdfNcpAdScalar& g,
+                                                  const ChSdfNcpAdScalar& lambda,
+                                                  double eps) {
+    const double e = RegularizedSmoothingEps(eps);
+    return Sqrt(g * g + lambda * lambda + e * e) - g - lambda;
+}
+
+struct ChSdfNcpImpulseMixedSettings {
+    double beta = 0.2;
+    double cfm = 0.0;
+    double velocity_scale = 0.0;
+    double impulse_scale = 0.0;
+};
+
+struct ChSdfNcpAdResidualJacobian {
+    std::vector<double> value;
+    std::vector<std::vector<double>> jacobian;
+    std::vector<ChSdfNcpGeneralizedContact> contacts;
+};
+
+inline ChSdfNcpAdResidualJacobian ComputeSdfNcpGeneralizedImpulseMixedAd(
+    const ChSdfNcpGeneralizedProblem& problem,
+    const std::vector<double>& z,
+    const ChSdfNcpImpulseMixedSettings& settings = ChSdfNcpImpulseMixedSettings()) {
+    ValidateSdfNcpGeneralizedProblem(problem);
+    const size_t n_v = problem.current_velocity.size();
+    const size_t n_c = problem.contact_count;
+    const size_t n = n_v + n_c;
+    if (z.size() != n) {
+        throw std::invalid_argument("Generalized impulse mixed SDF-NCP unknown vector has inconsistent size.");
+    }
+
+    std::vector<double> v_next(z.begin(), z.begin() + static_cast<std::ptrdiff_t>(n_v));
+    std::vector<ChSdfNcpGeneralizedContact> contacts = problem.evaluate_contacts(v_next);
+    if (contacts.size() != n_c) {
+        throw std::invalid_argument("Generalized impulse mixed SDF-NCP contact callback returned inconsistent count.");
+    }
+
+    const double velocity_scale =
+        settings.velocity_scale > 0.0 ? settings.velocity_scale : problem.gap_scale / std::max(problem.dt, 1.0e-12);
+    const double impulse_scale = settings.impulse_scale > 0.0 ? settings.impulse_scale : problem.lambda_scale;
+    if (!(velocity_scale > 0.0) || !std::isfinite(velocity_scale) || !(impulse_scale > 0.0) ||
+        !std::isfinite(impulse_scale)) {
+        throw std::invalid_argument("Generalized impulse mixed SDF-NCP scales must be finite and positive.");
+    }
+
+    std::vector<ChSdfNcpAdScalar> v_ad;
+    std::vector<ChSdfNcpAdScalar> p_ad;
+    v_ad.reserve(n_v);
+    p_ad.reserve(n_c);
+    for (size_t j = 0; j < n_v; j++) {
+        v_ad.push_back(ChSdfNcpAdScalar::Variable(z[j], j, n));
+    }
+    for (size_t i = 0; i < n_c; i++) {
+        p_ad.push_back(ChSdfNcpAdScalar::Variable(z[n_v + i], n_v + i, n));
+    }
+
+    std::vector<ChSdfNcpAdScalar> residual_ad(n, ChSdfNcpAdScalar(0.0, n));
+    for (size_t j = 0; j < n_v; j++) {
+        residual_ad[j] = problem.mass_diagonal[j] * (v_ad[j] - problem.current_velocity[j]) -
+                         problem.dt * problem.external_force[j];
+    }
+
+    for (size_t i = 0; i < n_c; i++) {
+        auto& contact = contacts[i];
+        if (contact.jacobian.size() != n_v) {
+            throw std::invalid_argument("Generalized impulse mixed SDF-NCP contact jacobian has inconsistent size.");
+        }
+
+        contact.lambda_n = z[n_v + i];
+        contact.penetration = std::max(0.0, -contact.gap);
+
+        ChSdfNcpAdScalar normal_velocity(0.0, n);
+        ChSdfNcpAdScalar linearized_gap(contact.gap, n);
+        for (size_t j = 0; j < n_v; j++) {
+            normal_velocity = normal_velocity + contact.jacobian[j] * v_ad[j];
+            linearized_gap = linearized_gap + problem.dt * contact.jacobian[j] * (v_ad[j] - v_next[j]);
+            residual_ad[j] = residual_ad[j] - contact.jacobian[j] * p_ad[i] * contact.weight;
+        }
+
+        const ChSdfNcpAdScalar mixed_velocity =
+            normal_velocity + settings.beta * linearized_gap / std::max(problem.dt, 1.0e-12) + settings.cfm * p_ad[i];
+        const ChSdfNcpAdScalar ncp =
+            SmoothFischerBurmeisterAd(mixed_velocity / velocity_scale, p_ad[i] / impulse_scale, problem.eps);
+        residual_ad[n_v + i] = ncp;
+        contact.ncp_residual = ncp.value;
+        contact.complementarity_error = ComplementarityError(mixed_velocity.value / velocity_scale,
+                                                             contact.lambda_n / impulse_scale);
+    }
+
+    ChSdfNcpAdResidualJacobian out;
+    out.value.assign(n, 0.0);
+    out.jacobian.assign(n, std::vector<double>(n, 0.0));
+    for (size_t row = 0; row < n; row++) {
+        out.value[row] = residual_ad[row].value;
+        for (size_t col = 0; col < n; col++) {
+            out.jacobian[row][col] = residual_ad[row].derivative[col];
+        }
+    }
+    out.contacts = std::move(contacts);
+    return out;
+}
+
 inline ChSdfNcpGeneralizedDiagnostics MakeSdfNcpGeneralizedDiagnostics(
     const ChSdfNcpGeneralizedProblem& problem,
     const std::vector<double>& z,

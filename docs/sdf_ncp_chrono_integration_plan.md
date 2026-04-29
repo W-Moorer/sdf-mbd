@@ -890,3 +890,93 @@ full cam OBJ/OpenVDB SDF geometry
 4. 当前 descriptor 接入仍是独立 SDF-NCP physics item，不是 Chrono 主 `ChContactContainerNSC/SMC` 路径。
 
 因此本阶段结论应写为：SDF-NCP 已具备进入 Chrono 多体约束求解路径的独立后端；下一步重点是逐项对齐 RecurDyn 前端建模和接触律，而不是继续扩展 case-specific reduced residual。
+
+## 2026-04-29 更新：SDF-NCP 后端数值规划，减少有限差分依赖
+
+当前 SDF-NCP 后端已经覆盖 full OBJ/OpenVDB 几何、多点 patch、Chrono 多体约束路径、simple gear 的双向 patch 和基准化输出。下一阶段的核心不应继续堆叠 case-specific 修正，而应把后端数值结构向成熟 NSC/NCP 路径收敛。
+
+### 优先级 1：保留通用后端，不做算例特化
+
+后端统一消费以下数据：
+
+```text
+gap_i
+normal_i
+J_i
+weight_i
+sample_id / patch_id
+body and marker mapping
+```
+
+所有 cam、eccentric_roller、simple_gear、onset_stress 和 sphere benchmark 都应走同一套 residual、scaling、warm start、patch history 和 diagnostics。算例差异只能出现在前端建模映射层，例如 OBJ/OpenVDB 查询、RMD marker/joint/driver 解析、候选 sample 生成和输出坐标定义。
+
+### 优先级 2：从 force-level lambda 过渡到 impulse / velocity-level NCP
+
+成熟 NSC 方法通常在速度层处理不可穿透：
+
+```text
+0 <= w_i + beta * g_i / dt + cfm * p_i  ⟂  p_i >= 0
+```
+
+其中 `p_i` 是接触冲量或局部接触强度，`w_i = J_i v_next` 是法向相对速度。该形式比直接在位置 gap 与 force lambda 上做 smooth-FB 更接近传统 NSC，也能减少小时间步下 `dt` 缩放导致的病态。
+
+本轮已新增一个最小 AD 原型：
+
+```text
+ComputeSdfNcpGeneralizedImpulseMixedAd
+ChSdfNcpImpulseMixedSettings
+ChSdfNcpAdScalar
+```
+
+该原型暂时不替换现有 benchmark 默认求解器，只验证 impulse/mixed complementarity residual 与 Jacobian 可以通过前向自动微分直接得到。
+
+### 优先级 3：优先使用自动微分或解析导数，不再把有限差分作为主路径
+
+有限差分适合早期验证，但不适合作为 full geometry benchmark 的长期 Newton Jacobian：
+
+1. active patch 数量变化时，有限差分会把几何切换误差混入导数；
+2. OpenVDB 查询噪声会被差分步长放大；
+3. 多齿、多 patch 接触时，差分成本随自由度和接触数快速增长；
+4. 小时间步下 residual scaling 更敏感，差分 Jacobian 更容易失真。
+
+规划路径如下：
+
+```text
+阶段 A：后端代数 AD
+    对 mass block、J^T p、scaled Fischer-Burmeister、Baumgarte/CFM、pressure scaling 做 AD。
+
+阶段 B：运动学解析导数
+    对 rigid body marker/local point 到 world point 的映射提供解析 dx/dq 和 dJ/dq。
+
+阶段 C：OpenVDB/SparseSDF 几何导数
+    从插值 SDF 中提供 phi、grad phi、Hessian 或至少一致的 grad/J derivative。
+
+阶段 D：半光滑 active-set Jacobian
+    对 patch 进入/退出使用 hysteresis 和固定 active set Newton；active set 变化只在外层更新。
+```
+
+这意味着未来 benchmark 默认路径应尽量使用 AD/解析 Jacobian；有限差分只保留为 debug checker 或 fallback。
+
+### 优先级 4：scaled FB 与自动尺度
+
+simple gear 当前误差受接触尺度、patch 分区和 NCP 条件数影响。后端应统一提供自动尺度：
+
+```text
+velocity_scale ~= characteristic_gap / dt
+impulse_scale  ~= mass_effective * velocity_scale / contact_weight_scale
+gap_scale      ~= SDF voxel size or active-band scale
+```
+
+smooth-FB 应作用在无量纲变量上，避免不同 benchmark 的 lambda、pressure、impulse 物理量混用。
+
+### 优先级 5：与 RecurDyn 对齐的边界
+
+如果曲线仍有差距，首先检查前端等价性：
+
+1. RMD joint、marker frame、driver 方向和自由度；
+2. 接触律是否为 hard NCP、penalty、damping 或 GGEOMCONTACT；
+3. 输出坐标是否是同一 marker/body/方向；
+4. OBJ/OpenVDB 离散化精度、active band 和 patch 采样；
+5. 时间积分器、步长和求解器容差。
+
+只有在这些项逐项对齐后，剩余误差才应归因于 SDF-NCP 后端理论或数值算法。
