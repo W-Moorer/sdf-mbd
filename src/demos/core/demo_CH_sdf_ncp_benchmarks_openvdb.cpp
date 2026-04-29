@@ -47,9 +47,12 @@
 #include "chrono/physics/ChBodyAuxRef.h"
 #include "chrono/physics/ChLinkMate.h"
 #include "chrono/physics/ChLinkMotorRotationSpeed.h"
+#include "chrono/physics/ChLinkRevolute.h"
 #include "chrono/physics/ChSdfNcpConstraintContact.h"
 #include "chrono/physics/ChSystemNSC.h"
 #include "chrono/solver/ChSolver.h"
+#include "chrono/timestepper/ChTimestepperHHT.h"
+#include "chrono/timestepper/ChTimestepperImplicit.h"
 
 #include <openvdb/openvdb.h>
 
@@ -60,10 +63,13 @@ using chrono::ChFrame;
 using chrono::ChFunctionConst;
 using chrono::ChLinkMateGeneric;
 using chrono::ChLinkMotorRotationSpeed;
+using chrono::ChLinkRevolute;
 using chrono::ChMatrix33d;
 using chrono::ChSolver;
 using chrono::ChSystemNSC;
 using chrono::ChTimestepper;
+using chrono::ChTimestepperHHT;
+using chrono::ChTimestepperImplicit;
 using chrono::ChVectorDynamic;
 using chrono::UpdateFlags;
 using chrono::sdfcontact::BuildOpenVdbLevelSetFromMesh;
@@ -424,6 +430,21 @@ bool HasRmdField(const std::string& line, const std::string& field) {
     return left_ok && right_ok;
 }
 
+double RecurDynStepRamp(double x, double x0, double y0, double x1, double y1) {
+    if (!(x1 > x0)) {
+        return x >= x1 ? y1 : y0;
+    }
+    if (x <= x0) {
+        return y0;
+    }
+    if (x >= x1) {
+        return y1;
+    }
+    const double u = (x - x0) / (x1 - x0);
+    const double s = u * u * (3.0 - 2.0 * u);
+    return y0 + (y1 - y0) * s;
+}
+
 std::string ExtractQuotedName(const std::string& line) {
     const size_t first = line.find('\'');
     if (first == std::string::npos) {
@@ -711,6 +732,10 @@ struct RmdSolidContact {
     double stiffness = 0.0;
     double damping = 0.0;
     double korder = 0.0;
+    double dynamic_friction_coefficient = 0.0;
+    double static_transition_velocity = 0.0;
+    double dynamic_transition_velocity = 0.0;
+    double static_friction_coefficient = 0.0;
 };
 
 struct RmdModel {
@@ -871,13 +896,13 @@ RmdModel LoadRecurDynRmdModel(const std::filesystem::path& path) {
             start_block(Block::Motion, id);
             continue;
         }
-        if (trimmed.rfind("CSURFACE /", 0) == 0) {
+        if (trimmed.rfind("CSURFACE /", 0) == 0 || trimmed.rfind("GGEOM /", 0) == 0) {
             const int id = ParseRmdEntityId(trimmed);
             model.surfaces[id].id = id;
             start_block(Block::Surface, id);
             continue;
         }
-        if (trimmed.rfind("SOLIDCONTACT /", 0) == 0) {
+        if (trimmed.rfind("SOLIDCONTACT /", 0) == 0 || trimmed.rfind("GGEOMCONTACT /", 0) == 0) {
             const int id = ParseRmdEntityId(trimmed);
             model.solid_contacts[id].id = id;
             start_block(Block::SolidContact, id);
@@ -1036,12 +1061,12 @@ RmdModel LoadRecurDynRmdModel(const std::filesystem::path& path) {
                 if (!values.empty()) {
                     contact.j_float_marker_id = static_cast<int>(std::round(values.front()));
                 }
-            } else if (Contains(trimmed, "ICSURFACEID =")) {
+            } else if (Contains(trimmed, "ICSURFACEID =") || Contains(trimmed, "IGGEOMID =")) {
                 const auto values = ParseNumbersAfterEquals(trimmed);
                 if (!values.empty()) {
                     contact.i_surface_id = static_cast<int>(std::round(values.front()));
                 }
-            } else if (Contains(trimmed, "JCSURFACEID =")) {
+            } else if (Contains(trimmed, "JCSURFACEID =") || Contains(trimmed, "JGGEOMID =")) {
                 const auto values = ParseNumbersAfterEquals(trimmed);
                 if (!values.empty()) {
                     contact.j_surface_id = static_cast<int>(std::round(values.front()));
@@ -1070,6 +1095,26 @@ RmdModel LoadRecurDynRmdModel(const std::filesystem::path& path) {
                 const auto values = ParseNumbersAfterEquals(trimmed);
                 if (!values.empty()) {
                     contact.damping = values.front();
+                }
+            } else if (HasRmdField(trimmed, "D_F_C")) {
+                const auto values = ParseNumbersAfterEquals(trimmed);
+                if (!values.empty()) {
+                    contact.dynamic_friction_coefficient = values.front();
+                }
+            } else if (HasRmdField(trimmed, "S_T_V")) {
+                const auto values = ParseNumbersAfterEquals(trimmed);
+                if (!values.empty()) {
+                    contact.static_transition_velocity = values.front();
+                }
+            } else if (HasRmdField(trimmed, "D_T_V")) {
+                const auto values = ParseNumbersAfterEquals(trimmed);
+                if (!values.empty()) {
+                    contact.dynamic_transition_velocity = values.front();
+                }
+            } else if (HasRmdField(trimmed, "S_F_C")) {
+                const auto values = ParseNumbersAfterEquals(trimmed);
+                if (!values.empty()) {
+                    contact.static_friction_coefficient = values.front();
                 }
             }
         }
@@ -1116,7 +1161,9 @@ void WriteRmdMappingAudit(const std::filesystem::path& path, const RmdModel& mod
             << "," << contact.stiffness << "," << contact.damping << "," << contact.bpen
             << ",surfaces " << contact.i_surface_id << "/" << contact.j_surface_id << "; markers "
             << contact.i_float_marker_id << "/" << contact.j_float_marker_id << "; KORDER " << contact.korder
-            << "; RDF " << contact.rdf << "\n";
+            << "; RDF " << contact.rdf << "; D_F_C " << contact.dynamic_friction_coefficient << "; S_T_V "
+            << contact.static_transition_velocity << "; D_T_V " << contact.dynamic_transition_velocity << "; S_F_C "
+            << contact.static_friction_coefficient << "\n";
     }
 }
 
@@ -1165,6 +1212,7 @@ struct MultiStepDiagnostics {
     int patch_count = 0;
     std::vector<MultiContactCandidate> candidates;
     std::vector<double> lambdas;
+    std::vector<double> lambda_forces;
     std::vector<double> ncp_residuals;
     std::vector<double> complementarity_errors;
 };
@@ -1181,6 +1229,7 @@ void ResetMultiStepDiagnostics(MultiStepDiagnostics& diag) {
     diag.patch_count = 0;
     diag.candidates.clear();
     diag.lambdas.clear();
+    diag.lambda_forces.clear();
     diag.ncp_residuals.clear();
     diag.complementarity_errors.clear();
 }
@@ -1208,6 +1257,7 @@ void PopulateMultiStepDiagnostics(const std::vector<ChSdfNcpGeneralizedContact>&
         candidate.jacobian = contact.jacobian.empty() ? 0.0 : contact.jacobian.front();
         diag.candidates.push_back(candidate);
         diag.lambdas.push_back(contact.lambda_n);
+        diag.lambda_forces.push_back(contact.lambda_n * contact.weight);
         diag.ncp_residuals.push_back(std::abs(contact.ncp_residual));
         diag.complementarity_errors.push_back(contact.complementarity_error);
         diag.min_gap = std::min(diag.min_gap, contact.gap);
@@ -1795,13 +1845,16 @@ int RunCamLikeFullGeometryCase(const std::string& case_name) {
             for (size_t c = 0; c < step.diagnostics.candidates.size(); c++) {
                 const auto& candidate = step.diagnostics.candidates[c];
                 const double lambda = c < step.diagnostics.lambdas.size() ? step.diagnostics.lambdas[c] : 0.0;
+                const double lambda_force =
+                    c < step.diagnostics.lambda_forces.size() ? step.diagnostics.lambda_forces[c] :
+                                                                 lambda * candidate.weight;
                 const double ncp = c < step.diagnostics.ncp_residuals.size() ? step.diagnostics.ncp_residuals[c] : 0.0;
                 const double comp = c < step.diagnostics.complementarity_errors.size() ?
                                         step.diagnostics.complementarity_errors[c] :
                                         0.0;
                 trajectory << time << ",follower,0," << state.y << ",0,1,0,0,0,0," << state.vy
                             << ",0,0,0,0," << candidate.sample_id << "," << candidate.gap << "," << lambda
-                            << "," << candidate.weight << "," << lambda * candidate.weight << ","
+                            << "," << candidate.weight << "," << lambda_force << ","
                             << std::max(0.0, -candidate.gap) << "," << ncp << "," << comp << ","
                             << step.diagnostics.residual_norm << "," << step.diagnostics.iterations << ","
                             << (step.diagnostics.success ? 1 : 0) << "\n";
@@ -2490,10 +2543,34 @@ struct GearContactSampleRef {
 struct GearPatchMemory {
     std::set<int> active_sample_ids;
     std::map<int, double> warm_start_intensity;
+    std::map<int, std::set<int>> patch_sample_ids;
+    int next_patch_id = 0;
 };
 
 int GearSamplePersistentId(int direction, int sample_id) {
     return direction == 0 ? sample_id : 1000000 + sample_id;
+}
+
+double PersistentSampleSetOverlap(const std::set<int>& a, const std::set<int>& b) {
+    if (a.empty() || b.empty()) {
+        return 0.0;
+    }
+    size_t intersection = 0;
+    auto ia = a.begin();
+    auto ib = b.begin();
+    while (ia != a.end() && ib != b.end()) {
+        if (*ia == *ib) {
+            intersection++;
+            ++ia;
+            ++ib;
+        } else if (*ia < *ib) {
+            ++ia;
+        } else {
+            ++ib;
+        }
+    }
+    const size_t union_size = a.size() + b.size() - intersection;
+    return union_size > 0 ? static_cast<double>(intersection) / static_cast<double>(union_size) : 0.0;
 }
 
 enum class SimpleGearBackendMode {
@@ -2505,14 +2582,24 @@ struct SimpleGearGGeomContactLawSI {
     double stiffness = 0.0;
     double damping = 0.0;
     double exponent = 1.0;
-    double buffer_penetration = 0.0;
+    double boundary_penetration = 0.0;
+    double rebound_damping_factor = 0.0;
+    double static_transition_velocity = 0.0;
+    double dynamic_transition_velocity = 0.0;
+    double dynamic_friction_coefficient = 0.0;
+    double static_friction_coefficient = 0.0;
 };
 
 SimpleGearGGeomContactLawSI MakeSimpleGearGGeomContactLawSI(const SimpleGearGGeomContactInfo& contact) {
     constexpr double length_scale_m = 1.0e-3;  // simple_gear RMD declares LENGTH = Millimeter.
     SimpleGearGGeomContactLawSI law;
     law.exponent = contact.korder > 0.0 ? contact.korder : 1.0;
-    law.buffer_penetration = contact.bpen * length_scale_m;
+    law.boundary_penetration = contact.bpen * length_scale_m;
+    law.rebound_damping_factor = contact.rdf;
+    law.dynamic_friction_coefficient = contact.dynamic_friction_coefficient;
+    law.static_transition_velocity = contact.static_transition_velocity * length_scale_m;
+    law.dynamic_transition_velocity = contact.dynamic_transition_velocity * length_scale_m;
+    law.static_friction_coefficient = contact.static_friction_coefficient;
     law.stiffness = contact.stiffness * std::pow(1.0 / length_scale_m, law.exponent);
     law.damping = contact.damping * (1.0 / length_scale_m);
     return law;
@@ -2765,6 +2852,9 @@ std::vector<GearContactSampleRef> BuildGearBidirectionalPatchSamples(const ChOpe
         double area = 0.0;
     };
 
+    std::map<int, std::set<int>> next_patch_sample_ids;
+    std::set<int> used_old_patch_ids;
+
     auto build_direction = [&](int direction, const ChSdfContactSurfaceGraph& graph, const ChSdfContactSampleBvh* bvh) {
         auto all_sample_ids = [&]() {
             std::vector<int> ids;
@@ -2896,7 +2986,32 @@ std::vector<GearContactSampleRef> BuildGearBidirectionalPatchSamples(const ChOpe
                     patch_area += std::max(0.0, graph.samples[static_cast<size_t>(sample_id)].area);
                 }
             }
-            const int patch_id = direction == 0 ? min_sample_id : 1000000 + min_sample_id;
+            int patch_id = direction == 0 ? min_sample_id : 1000000 + min_sample_id;
+            std::set<int> persistent_component_ids;
+            for (int sample_id : component) {
+                persistent_component_ids.insert(GearSamplePersistentId(direction, sample_id));
+            }
+            if (memory) {
+                int best_patch_id = -1;
+                double best_overlap = 0.0;
+                for (const auto& old_patch : memory->patch_sample_ids) {
+                    if (used_old_patch_ids.count(old_patch.first) > 0) {
+                        continue;
+                    }
+                    const double overlap = PersistentSampleSetOverlap(persistent_component_ids, old_patch.second);
+                    if (overlap > best_overlap) {
+                        best_overlap = overlap;
+                        best_patch_id = old_patch.first;
+                    }
+                }
+                if (best_patch_id >= 0 && best_overlap >= 0.20) {
+                    patch_id = best_patch_id;
+                    used_old_patch_ids.insert(best_patch_id);
+                } else {
+                    patch_id = memory->next_patch_id++;
+                }
+                next_patch_sample_ids[patch_id] = persistent_component_ids;
+            }
             for (int sample_id : component) {
                 if (sample_id < 0 || sample_id >= static_cast<int>(graph.samples.size())) {
                     continue;
@@ -2935,6 +3050,7 @@ std::vector<GearContactSampleRef> BuildGearBidirectionalPatchSamples(const ChOpe
         for (const auto& ref : refs) {
             memory->active_sample_ids.insert(ref.persistent_id);
         }
+        memory->patch_sample_ids = std::move(next_patch_sample_ids);
     }
     return refs;
 }
@@ -3448,14 +3564,18 @@ double EvaluateSimpleGearGGeomContactLaw(const ChOpenVdbSdfGrid& gear21_sdf,
                                                                   pose22,
                                                                   ref.sample_id,
                                                                   theta21_eval,
-                                                                  theta22_eval);
+                                                                   theta22_eval);
         const double driver_jacobian = SimpleGearDriverGapJacobian(candidate, pose21, ref.direction);
         const double gap_rate = driver_jacobian * config.omega21 + candidate.jacobian * omega22_eval;
-        const double law_penetration = std::max(0.0, law.buffer_penetration - candidate.gap);
-        const double spring_force = law.stiffness > 0.0 && law_penetration > 0.0 ?
-                                        law.stiffness * std::pow(law_penetration, law.exponent) :
+        const double penetration = std::max(0.0, -candidate.gap);
+        const double spring_force = law.stiffness > 0.0 && penetration > 0.0 ?
+                                        law.stiffness * std::pow(penetration, law.exponent) :
                                         0.0;
-        const double damping_force = law_penetration > 0.0 ? law.damping * std::max(0.0, -gap_rate) : 0.0;
+        double damping = std::max(0.0, law.damping);
+        if (law.boundary_penetration > 1.0e-14) {
+            damping = RecurDynStepRamp(penetration, 0.0, 0.0, law.boundary_penetration, damping);
+        }
+        const double damping_force = penetration > 0.0 ? damping * std::max(0.0, -gap_rate) : 0.0;
         const double raw_force = std::max(0.0, spring_force + damping_force);
         const double weight = i < weights.size() ? weights[i] : 0.0;
         const double weighted_force = raw_force * weight;
@@ -3743,7 +3863,7 @@ int RunSimpleGearFullGeometryCase(const std::string& result_case_name = "simple_
         }
     }
     if (backend_mode == SimpleGearBackendMode::SdfNcp) {
-        config.sdf_ncp_contact_offset = config.sdf_ncp_contact_offset_scale * ggeom_law.buffer_penetration;
+        config.sdf_ncp_contact_offset = config.sdf_ncp_contact_offset_scale * ggeom_law.boundary_penetration;
     }
     WriteSimpleGearRmdMappingAudit(out_dir / "rmd_mapping.csv", rmd);
     GearPose pose21{rmd.gear21.cm_marker_mm * kMmToM, rmd.gear21.part_rotation};
@@ -3920,6 +4040,8 @@ int RunSimpleGearFullGeometryCase(const std::string& result_case_name = "simple_
         for (size_t c = 0; c < step.diagnostics.candidates.size(); c++) {
             const auto& candidate = step.diagnostics.candidates[c];
             const double lambda = c < step.diagnostics.lambdas.size() ? step.diagnostics.lambdas[c] : 0.0;
+            const double lambda_force =
+                c < step.diagnostics.lambda_forces.size() ? step.diagnostics.lambda_forces[c] : lambda * candidate.weight;
             const double ncp = c < step.diagnostics.ncp_residuals.size() ? step.diagnostics.ncp_residuals[c] : 0.0;
             const double comp = c < step.diagnostics.complementarity_errors.size() ?
                                     step.diagnostics.complementarity_errors[c] :
@@ -3929,7 +4051,7 @@ int RunSimpleGearFullGeometryCase(const std::string& result_case_name = "simple_
             trajectory << time << ",gear22," << pose22.center.x() << "," << pose22.center.y() << ","
                        << pose22.center.z() << "," << q0 << "," << q1 << ",0,0,0,0,0,"
                        << state.omega22 << ",0,0," << candidate.sample_id << "," << candidate.gap << ","
-                       << lambda << "," << candidate.weight << "," << lambda * candidate.weight << ","
+                       << lambda << "," << candidate.weight << "," << lambda_force << ","
                        << std::max(0.0, -candidate.gap) << "," << ncp << "," << comp << ","
                        << step.diagnostics.residual_norm << "," << step.diagnostics.iterations << ","
                        << (step.diagnostics.success ? 1 : 0) << "\n";
@@ -3982,13 +4104,13 @@ int RunSimpleGearFullGeometryCase(const std::string& result_case_name = "simple_
                << rmd.geo_surface_contact.damping
                << ",0,0,parsed from RecurDyn GGEOMCONTACT; reported for contact-law alignment audit\n";
     comparison << config.case_name << ",ggeomcontact_bpen_m," << rmd.geo_surface_contact.bpen * 1.0e-3 << ","
-               << ggeom_law.buffer_penetration
+               << ggeom_law.boundary_penetration
                << ",0,0,RecurDyn BPEN converted from millimeter RMD length units to meters\n";
     comparison << config.case_name << ",ggeomcontact_K_SI," << ggeom_law.stiffness << "," << ggeom_law.stiffness
                << ",0,0,RecurDyn K converted for meter-based gap with KORDER exponent\n";
     comparison << config.case_name << ",ggeomcontact_C_SI," << ggeom_law.damping << "," << ggeom_law.damping
                << ",0,0,RecurDyn C converted from N/(mm/s) to N/(m/s)\n";
-    comparison << config.case_name << ",sdf_ncp_contact_offset_m," << ggeom_law.buffer_penetration << ","
+    comparison << config.case_name << ",sdf_ncp_contact_offset_m," << ggeom_law.boundary_penetration << ","
                << config.sdf_ncp_contact_offset << ",0,0,"
                << "hard SDF-NCP shell offset used only in SDF-NCP mode; current tuned default keeps it disabled\n";
     comparison << config.case_name << ",sdf_ncp_pressure_scale,0,"
@@ -4241,6 +4363,22 @@ std::vector<ChSdfNcpDescriptorContact> BuildCamDescriptorContacts(
     for (const auto& item : active) {
         total_area += std::max(0.0, item.area);
     }
+    std::vector<int> active_ids;
+    active_ids.reserve(active.size());
+    for (const auto& item : active) {
+        active_ids.push_back(item.sample_id);
+    }
+    const auto components = follower_graph.FindConnectedComponents(active_ids);
+    std::vector<int> patch_ids(follower_graph.samples.size(), -1);
+    std::vector<double> patch_areas(components.size(), 0.0);
+    for (size_t patch = 0; patch < components.size(); patch++) {
+        for (int sample_id : components[patch]) {
+            if (sample_id >= 0 && sample_id < static_cast<int>(follower_graph.samples.size())) {
+                patch_ids[static_cast<size_t>(sample_id)] = static_cast<int>(patch);
+                patch_areas[patch] += std::max(0.0, follower_graph.samples[static_cast<size_t>(sample_id)].area);
+            }
+        }
+    }
     const double uniform_weight = active.empty() ? 0.0 : 1.0 / static_cast<double>(active.size());
 
     std::vector<ChSdfNcpDescriptorContact> contacts;
@@ -4252,7 +4390,15 @@ std::vector<ChSdfNcpDescriptorContact> BuildCamDescriptorContacts(
         contact.point_abs = item.world_pos;
         contact.normal_abs = item.normal_world;
         contact.gap = item.phi;
-        contact.weight = total_area > 1.0e-30 ? std::max(0.0, item.area) / total_area : uniform_weight;
+        contact.weight = item.area > 1.0e-30 ? item.area : uniform_weight;
+        contact.area = std::max(0.0, item.area);
+        const int patch_id = item.sample_id >= 0 && item.sample_id < static_cast<int>(patch_ids.size()) ?
+                                 patch_ids[static_cast<size_t>(item.sample_id)] :
+                                 -1;
+        contact.patch_id = patch_id;
+        contact.patch_area = patch_id >= 0 && patch_id < static_cast<int>(patch_areas.size()) ?
+                                 patch_areas[static_cast<size_t>(patch_id)] :
+                                 total_area;
         contact.contact_id = item.sample_id;
         contacts.push_back(contact);
     }
@@ -4269,14 +4415,15 @@ MultiStepDiagnostics MakeDescriptorContactDiagnostics(const std::vector<ChSdfNcp
     for (const auto& state : states) {
         MultiContactCandidate candidate;
         candidate.sample_id = state.sample.contact_id;
-        candidate.patch_id = 0;
+        candidate.patch_id = state.sample.patch_id;
         candidate.gap = state.sample.gap;
-        candidate.area = state.sample.weight;
+        candidate.area = state.sample.area;
         candidate.weight = state.sample.weight;
         candidate.normal = state.sample.normal_abs;
         candidate.world_pos = state.sample.point_abs;
         diag.candidates.push_back(candidate);
         diag.lambdas.push_back(state.lambda_n);
+        diag.lambda_forces.push_back(state.lambda_force);
         diag.ncp_residuals.push_back(state.ncp_residual);
         diag.complementarity_errors.push_back(state.complementarity_error);
         diag.min_gap = std::min(diag.min_gap, state.sample.gap);
@@ -4285,6 +4432,13 @@ MultiStepDiagnostics MakeDescriptorContactDiagnostics(const std::vector<ChSdfNcp
         diag.ncp_residual_norm += state.ncp_residual * state.ncp_residual;
         diag.max_complementarity_error = std::max(diag.max_complementarity_error, state.complementarity_error);
     }
+    std::set<int> patch_ids;
+    for (const auto& candidate : diag.candidates) {
+        if (candidate.patch_id >= 0) {
+            patch_ids.insert(candidate.patch_id);
+        }
+    }
+    diag.patch_count = static_cast<int>(patch_ids.size());
     diag.ncp_residual_norm = std::sqrt(diag.ncp_residual_norm);
     return diag;
 }
@@ -4293,8 +4447,29 @@ struct RecurDynSolidContactLaw {
     double stiffness = 0.0;
     double damping = 0.0;
     double exponent = 1.0;
-    double buffer_penetration = 0.0;
+    double boundary_penetration = 0.0;
+    double rebound_damping_factor = 0.0;
+    double static_transition_velocity = 0.0;
+    double dynamic_transition_velocity = 0.0;
+    double dynamic_friction_coefficient = 0.0;
+    double static_friction_coefficient = 0.0;
 };
+
+double RecurDynNormalContactForce(const RecurDynSolidContactLaw& law, double gap, double normal_gap_rate) {
+    const double penetration = std::max(0.0, -gap);
+    if (penetration <= 0.0) {
+        return 0.0;
+    }
+    const double exponent = law.exponent > 0.0 ? law.exponent : 1.0;
+    const double spring_force = law.stiffness > 0.0 ? law.stiffness * std::pow(penetration, exponent) : 0.0;
+    const double closing_rate = std::max(0.0, -normal_gap_rate);
+    double damping = std::max(0.0, law.damping);
+    if (law.boundary_penetration > 1.0e-14) {
+        damping = RecurDynStepRamp(penetration, 0.0, 0.0, law.boundary_penetration, damping);
+    }
+    const double damping_force = damping * closing_rate;
+    return std::max(0.0, spring_force + damping_force);
+}
 
 class ChSdfPenaltyContactForceSet : public chrono::ChPhysicsItem {
   public:
@@ -4335,12 +4510,11 @@ class ChSdfPenaltyContactForceSet : public chrono::ChPhysicsItem {
 
   private:
     static void AddBodyForceToResidual(const std::shared_ptr<ChBody>& body,
-                                       const ChVector3d& force_abs,
-                                       const ChVector3d& point_abs,
-                                       ChVectorDynamic<>& residual) {
-        const ChVector3d point_loc = body->TransformPointParentToLocal(point_abs);
-        const ChVector3d force_loc = body->TransformDirectionParentToLocal(force_abs);
-        const ChVector3d torque_loc = point_loc.Cross(force_loc);
+                                        const ChVector3d& force_abs,
+                                        const ChVector3d& point_abs,
+                                        ChVectorDynamic<>& residual) {
+        const ChVector3d torque_abs = (point_abs - body->GetPos()).Cross(force_abs);
+        const ChVector3d torque_loc = body->TransformDirectionParentToLocal(torque_abs);
         residual.segment(body->GetOffset_w() + 0, 3) += force_abs.eigen();
         residual.segment(body->GetOffset_w() + 3, 3) += torque_loc.eigen();
     }
@@ -4370,12 +4544,8 @@ class ChSdfPenaltyContactForceSet : public chrono::ChPhysicsItem {
             const ChVector3d vb =
                 sample.body_b->GetPosDt() + sample.body_b->GetAngVelParent().Cross(sample.point_abs - sample.body_b->GetPos());
             const double gap_rate = normal.Dot(va - vb);
-            const double penetration = std::max(0.0, m_law.buffer_penetration - sample.gap);
-            const double spring_force =
-                m_law.stiffness > 0.0 && penetration > 0.0 ? m_law.stiffness * std::pow(penetration, m_law.exponent)
-                                                            : 0.0;
-            const double damping_force = penetration > 0.0 ? m_law.damping * std::max(0.0, -gap_rate) : 0.0;
-            const double raw_force = std::max(0.0, spring_force + damping_force);
+            const double penetration = std::max(0.0, -sample.gap);
+            const double raw_force = RecurDynNormalContactForce(m_law, sample.gap, gap_rate);
 
             ChSdfNcpDescriptorContactState state;
             state.sample = sample;
@@ -4384,7 +4554,7 @@ class ChSdfPenaltyContactForceSet : public chrono::ChPhysicsItem {
             state.penetration = std::max(0.0, -sample.gap);
             state.ncp_residual = 0.0;
             state.complementarity_error = ComplementarityError(sample.gap, state.lambda_force);
-            state.active = raw_force > 0.0 || sample.gap <= m_law.buffer_penetration;
+            state.active = raw_force > 0.0 || penetration > 0.0;
             m_states.push_back(state);
         }
     }
@@ -4392,6 +4562,888 @@ class ChSdfPenaltyContactForceSet : public chrono::ChPhysicsItem {
     ContactGenerator m_generator;
     RecurDynSolidContactLaw m_law;
     std::vector<ChSdfNcpDescriptorContactState> m_states;
+};
+
+class ChSdfLocalPatchPressureContactForceSet : public chrono::ChPhysicsItem {
+  public:
+    using ContactGenerator = std::function<std::vector<ChSdfNcpDescriptorContact>()>;
+    using PatchWrenchDemandProvider =
+        std::function<bool(double time, const ChVector3d& reference_point, ChVector3d& force, ChVector3d& torque)>;
+
+    void SetContactGenerator(ContactGenerator generator) {
+        m_generator = std::move(generator);
+    }
+
+    void SetSmoothingEps(double eps) {
+        m_eps = std::max(eps, 1.0e-12);
+    }
+
+    void SetTimeStep(double dt) {
+        m_dt = std::max(0.0, dt);
+    }
+
+    void SetActiveSetPolicy(double gap_on, double gap_off) {
+        m_active_gap_on = std::max(0.0, gap_on);
+        m_active_gap_off = std::max(m_active_gap_on, gap_off);
+    }
+
+    void SetPressureSolveParameters(double compliance,
+                                    double laplacian_compliance,
+                                    double gap_scale,
+                                    double pressure_scale) {
+        m_pressure_compliance = std::max(compliance, 1.0e-14);
+        m_laplacian_compliance = std::max(0.0, laplacian_compliance);
+        m_gap_scale = std::max(gap_scale, 1.0e-12);
+        m_pressure_scale = std::max(pressure_scale, 1.0);
+    }
+
+    void SetVelocityLevelDelassusMode(bool enabled, double baumgarte = 0.2, double velocity_scale = 1.0) {
+        m_use_velocity_level_delassus = enabled;
+        m_baumgarte = std::max(0.0, baumgarte);
+        m_velocity_scale = std::max(velocity_scale, 1.0e-9);
+    }
+
+    void SetPatchWrenchClosureMode(bool enabled,
+                                   double force_weight = 1.0,
+                                   double torque_weight = 1.0,
+                                   double regularization = 1.0e-8,
+                                   int max_iterations = 8,
+                                   bool integrated = false) {
+        m_use_patch_wrench_closure = enabled;
+        m_wrench_force_weight = std::max(0.0, force_weight);
+        m_wrench_torque_weight = std::max(0.0, torque_weight);
+        m_wrench_closure_regularization = std::max(0.0, regularization);
+        m_wrench_closure_iterations = std::max(0, max_iterations);
+        m_use_integrated_wrench_closure = integrated;
+    }
+
+    void SetPatchWrenchDemandProvider(PatchWrenchDemandProvider provider) {
+        m_wrench_demand_provider = std::move(provider);
+    }
+
+    const std::vector<ChSdfNcpDescriptorContactState>& GetContactStates() const {
+        return m_states;
+    }
+
+    virtual ChSdfLocalPatchPressureContactForceSet* Clone() const override {
+        return new ChSdfLocalPatchPressureContactForceSet(*this);
+    }
+
+    virtual void Update(double time, UpdateFlags update_flags) override {
+        ChPhysicsItem::Update(time, update_flags);
+        m_current_time = time;
+        RefreshContacts();
+    }
+
+    virtual void IntLoadResidual_F(const unsigned int off, ChVectorDynamic<>& R, const double c) override {
+        RefreshContacts();
+        for (const auto& state : m_states) {
+            if (!state.active || state.lambda_force <= 0.0 || !state.sample.body_a || !state.sample.body_b) {
+                continue;
+            }
+            const ChVector3d force_a = state.sample.normal_abs * (state.lambda_force * c);
+            AddBodyForceToResidual(state.sample.body_a, force_a, state.sample.point_abs, R);
+            AddBodyForceToResidual(state.sample.body_b, -force_a, state.sample.point_abs, R);
+        }
+    }
+
+  private:
+    struct PreparedSample {
+        ChSdfNcpDescriptorContact sample;
+        double gap_rate = 0.0;
+        double predicted_gap = 0.0;
+        double force_scale = 1.0;
+    };
+
+    static void AddBodyForceToResidual(const std::shared_ptr<ChBody>& body,
+                                       const ChVector3d& force_abs,
+                                       const ChVector3d& point_abs,
+                                       ChVectorDynamic<>& residual) {
+        const ChVector3d torque_abs = (point_abs - body->GetPos()).Cross(force_abs);
+        const ChVector3d torque_loc = body->TransformDirectionParentToLocal(torque_abs);
+        residual.segment(body->GetOffset_w() + 0, 3) += force_abs.eigen();
+        residual.segment(body->GetOffset_w() + 3, 3) += torque_loc.eigen();
+    }
+
+    static double ContactForceScale(const ChSdfNcpDescriptorContact& sample) {
+        if (sample.area > 1.0e-30 && std::isfinite(sample.area)) {
+            return sample.area;
+        }
+        if (sample.weight > 1.0e-30 && std::isfinite(sample.weight)) {
+            return sample.weight;
+        }
+        return 1.0;
+    }
+
+    static ChVector3d PointVelocityAbs(const ChBody& body, const ChVector3d& point_abs) {
+        return body.GetPosDt() + body.GetAngVelParent().Cross(point_abs - body.GetPos());
+    }
+
+    static ChVector3d PointVelocityDeltaFromImpulse(ChBody& body,
+                                                    const ChVector3d& impulse_abs,
+                                                    const ChVector3d& impulse_point_abs,
+                                                    const ChVector3d& query_point_abs) {
+        if (body.IsFixed()) {
+            return ChVector3d(0, 0, 0);
+        }
+        const double mass = body.GetMass();
+        ChVector3d delta_v = ChVector3d(0, 0, 0);
+        if (mass > 1.0e-30 && std::isfinite(mass)) {
+            delta_v = impulse_abs / mass;
+        }
+
+        const ChVector3d angular_impulse_abs = (impulse_point_abs - body.GetPos()).Cross(impulse_abs);
+        const ChVector3d angular_impulse_local = body.TransformDirectionParentToLocal(angular_impulse_abs);
+        const ChVector3d delta_w_local = body.GetInvInertia() * angular_impulse_local;
+        const ChVector3d delta_w_abs = body.TransformDirectionLocalToParent(delta_w_local);
+        return delta_v + delta_w_abs.Cross(query_point_abs - body.GetPos());
+    }
+
+    static double VectorNorm(const std::vector<double>& v) {
+        double sum = 0.0;
+        for (double x : v) {
+            sum += x * x;
+        }
+        return std::sqrt(sum);
+    }
+
+    static bool SolveDenseLinearSystem(std::vector<std::vector<double>> A,
+                                       std::vector<double> b,
+                                       std::vector<double>& x) {
+        const int n = static_cast<int>(b.size());
+        x.assign(n, 0.0);
+        for (int k = 0; k < n; k++) {
+            int pivot = k;
+            double pivot_abs = std::abs(A[k][k]);
+            for (int i = k + 1; i < n; i++) {
+                const double value = std::abs(A[i][k]);
+                if (value > pivot_abs) {
+                    pivot = i;
+                    pivot_abs = value;
+                }
+            }
+            if (!(pivot_abs > 1.0e-20) || !std::isfinite(pivot_abs)) {
+                return false;
+            }
+            if (pivot != k) {
+                std::swap(A[pivot], A[k]);
+                std::swap(b[pivot], b[k]);
+            }
+            const double diag = A[k][k];
+            for (int j = k; j < n; j++) {
+                A[k][j] /= diag;
+            }
+            b[k] /= diag;
+            for (int i = k + 1; i < n; i++) {
+                const double factor = A[i][k];
+                if (factor == 0.0) {
+                    continue;
+                }
+                for (int j = k; j < n; j++) {
+                    A[i][j] -= factor * A[k][j];
+                }
+                b[i] -= factor * b[k];
+            }
+        }
+        for (int i = n - 1; i >= 0; i--) {
+            double value = b[i];
+            for (int j = i + 1; j < n; j++) {
+                value -= A[i][j] * x[j];
+            }
+            x[i] = value;
+        }
+        return true;
+    }
+
+    static bool SolveLeastSquaresStep(const std::vector<std::vector<double>>& J,
+                                      const std::vector<double>& residual,
+                                      double regularization,
+                                      std::vector<double>& delta) {
+        const int m = static_cast<int>(residual.size());
+        const int n = J.empty() ? 0 : static_cast<int>(J.front().size());
+        if (m <= 0 || n <= 0) {
+            delta.assign(n, 0.0);
+            return false;
+        }
+        std::vector<std::vector<double>> normal(n, std::vector<double>(n, 0.0));
+        std::vector<double> rhs(n, 0.0);
+        for (int row = 0; row < m; row++) {
+            for (int i = 0; i < n; i++) {
+                rhs[i] -= J[row][i] * residual[row];
+                for (int j = 0; j < n; j++) {
+                    normal[i][j] += J[row][i] * J[row][j];
+                }
+            }
+        }
+        const double reg = std::max(regularization, 1.0e-18);
+        for (int i = 0; i < n; i++) {
+            normal[i][i] += reg;
+        }
+        return SolveDenseLinearSystem(std::move(normal), std::move(rhs), delta);
+    }
+
+    bool PrepareSample(ChSdfNcpDescriptorContact sample, PreparedSample& prepared) const {
+        if (!sample.body_a || !sample.body_b) {
+            return false;
+        }
+        ChVector3d normal = sample.normal_abs;
+        const double length = normal.Length();
+        if (!(length > 1.0e-14) || !std::isfinite(length)) {
+            return false;
+        }
+        normal /= length;
+        sample.normal_abs = normal;
+        sample.weight = std::max(0.0, sample.weight);
+        sample.area = std::max(0.0, sample.area);
+        sample.patch_area = std::max(0.0, sample.patch_area);
+
+        const ChVector3d va = PointVelocityAbs(*sample.body_a, sample.point_abs);
+        const ChVector3d vb = PointVelocityAbs(*sample.body_b, sample.point_abs);
+        prepared.sample = sample;
+        prepared.gap_rate = normal.Dot(va - vb);
+        prepared.predicted_gap = sample.gap + m_dt * prepared.gap_rate;
+        prepared.force_scale = ContactForceScale(sample);
+        return true;
+    }
+
+    bool ShouldActivate(const PreparedSample& prepared) const {
+        const auto& sample = prepared.sample;
+        const bool persistent = sample.contact_id >= 0 && m_persistent_active_ids.count(sample.contact_id) > 0;
+        const bool near_closed = sample.gap <= m_active_gap_on;
+        const bool predicted_closed = prepared.gap_rate < 0.0 && prepared.predicted_gap <= m_active_gap_on;
+        const bool retained = persistent && sample.gap <= m_active_gap_off && prepared.gap_rate < 0.0;
+        return near_closed || predicted_closed || retained;
+    }
+
+    static std::vector<std::vector<double>> BuildNormalizedAreaGraphLaplacian(
+        const std::vector<PreparedSample>& patch) {
+        const int n = static_cast<int>(patch.size());
+        std::vector<std::vector<double>> L(n, std::vector<double>(n, 0.0));
+        if (n <= 1) {
+            return L;
+        }
+
+        double mean_area = 0.0;
+        for (const auto& entry : patch) {
+            mean_area += std::max(entry.force_scale, 1.0e-12);
+        }
+        mean_area /= static_cast<double>(n);
+        double h = std::sqrt(std::max(mean_area, 1.0e-12));
+        if (!(h > 0.0) || !std::isfinite(h)) {
+            h = 1.0e-3;
+        }
+
+        std::vector<std::vector<double>> W(n, std::vector<double>(n, 0.0));
+        std::vector<double> row_sum(n, 0.0);
+        for (int i = 0; i < n; i++) {
+            for (int j = i + 1; j < n; j++) {
+                const double d = (patch[i].sample.point_abs - patch[j].sample.point_abs).Length();
+                if (!(d > 1.0e-14) || d > 3.0 * h) {
+                    continue;
+                }
+                const double area_weight = std::sqrt(std::max(patch[i].force_scale * patch[j].force_scale, 1.0e-24));
+                const double w = area_weight * std::exp(-(d * d) / std::max(4.0 * h * h, 1.0e-24));
+                W[i][j] = w;
+                W[j][i] = w;
+                row_sum[i] += w;
+                row_sum[j] += w;
+            }
+        }
+
+        for (int i = 0; i < n; i++) {
+            if (!(row_sum[i] > 1.0e-30)) {
+                continue;
+            }
+            L[i][i] = 1.0;
+            for (int j = 0; j < n; j++) {
+                if (j != i && W[i][j] > 0.0) {
+                    L[i][j] = -W[i][j] / row_sum[i];
+                }
+            }
+        }
+        return L;
+    }
+
+    std::vector<std::vector<double>> BuildDelassusPressureMatrix(const std::vector<PreparedSample>& patch) const {
+        const int n = static_cast<int>(patch.size());
+        std::vector<std::vector<double>> W(n, std::vector<double>(n, 0.0));
+        if (!m_use_velocity_level_delassus) {
+            return W;
+        }
+        for (int i = 0; i < n; i++) {
+            const auto& ci = patch[i].sample;
+            for (int j = 0; j < n; j++) {
+                const auto& cj = patch[j].sample;
+                const ChVector3d impulse_a = cj.normal_abs * (patch[j].force_scale * m_dt);
+                const ChVector3d impulse_b = -impulse_a;
+                const ChVector3d dvi_a =
+                    PointVelocityDeltaFromImpulse(*ci.body_a, impulse_a, cj.point_abs, ci.point_abs);
+                const ChVector3d dvi_b =
+                    PointVelocityDeltaFromImpulse(*ci.body_b, impulse_b, cj.point_abs, ci.point_abs);
+                W[i][j] = ci.normal_abs.Dot(dvi_a - dvi_b);
+            }
+            W[i][i] = std::max(W[i][i], 0.0);
+        }
+        return W;
+    }
+
+    std::vector<double> EvaluatePatchResidual(const std::vector<PreparedSample>& patch,
+                                              const std::vector<std::vector<double>>& laplacian,
+                                              const std::vector<std::vector<double>>& delassus_pressure,
+                                              const std::vector<double>& pressure,
+                                              std::vector<std::vector<double>>* jacobian) const {
+        const int n = static_cast<int>(patch.size());
+        std::vector<double> residual(n, 0.0);
+        if (jacobian) {
+            jacobian->assign(n, std::vector<double>(n, 0.0));
+        }
+        for (int i = 0; i < n; i++) {
+            double lap = 0.0;
+            for (int j = 0; j < n; j++) {
+                lap += laplacian[i][j] * pressure[j];
+            }
+            double regularized_gap = 0.0;
+            double scale = m_gap_scale;
+            if (m_use_velocity_level_delassus) {
+                regularized_gap =
+                    patch[i].gap_rate + m_baumgarte * std::min(0.0, patch[i].sample.gap) / std::max(m_dt, 1.0e-12);
+                for (int j = 0; j < n; j++) {
+                    regularized_gap += delassus_pressure[i][j] * pressure[j];
+                }
+                regularized_gap += m_pressure_compliance * pressure[i] + m_laplacian_compliance * lap;
+                scale = m_velocity_scale;
+            } else {
+                const double predicted_closing_gap =
+                    patch[i].sample.gap + m_dt * std::min(0.0, patch[i].gap_rate);
+                regularized_gap =
+                    predicted_closing_gap + m_pressure_compliance * pressure[i] + m_laplacian_compliance * lap;
+            }
+            const double scaled_gap = regularized_gap / scale;
+            const double scaled_pressure = pressure[i] / m_pressure_scale;
+            residual[i] = SmoothFischerBurmeister(scaled_gap, scaled_pressure, m_eps);
+            if (!jacobian) {
+                continue;
+            }
+            const auto fb_grad = SmoothFischerBurmeisterGrad(scaled_gap, scaled_pressure, m_eps);
+            for (int j = 0; j < n; j++) {
+                double dgap_dp =
+                    (i == j ? m_pressure_compliance : 0.0) + m_laplacian_compliance * laplacian[i][j];
+                if (m_use_velocity_level_delassus) {
+                    dgap_dp += delassus_pressure[i][j];
+                }
+                (*jacobian)[i][j] = fb_grad.dPhi_dg * dgap_dp / scale;
+                if (i == j) {
+                    (*jacobian)[i][j] += fb_grad.dPhi_dlambda / m_pressure_scale;
+                }
+            }
+        }
+        return residual;
+    }
+
+    static ChVector3d PatchAreaCentroid(const std::vector<PreparedSample>& patch) {
+        ChVector3d center = ChVector3d(0, 0, 0);
+        double weight_sum = 0.0;
+        for (const auto& entry : patch) {
+            const double weight = std::max(entry.force_scale, 0.0);
+            center += entry.sample.point_abs * weight;
+            weight_sum += weight;
+        }
+        return weight_sum > 1.0e-30 ? center / weight_sum : ChVector3d(0, 0, 0);
+    }
+
+    static ChVector3d PatchForce(const std::vector<PreparedSample>& patch, const std::vector<double>& pressure) {
+        ChVector3d force = ChVector3d(0, 0, 0);
+        for (size_t i = 0; i < patch.size() && i < pressure.size(); i++) {
+            force += patch[i].sample.normal_abs * (std::max(0.0, pressure[i]) * patch[i].force_scale);
+        }
+        return force;
+    }
+
+    static ChVector3d PatchTorqueAbout(const std::vector<PreparedSample>& patch,
+                                       const std::vector<double>& pressure,
+                                       const ChVector3d& center) {
+        ChVector3d torque = ChVector3d(0, 0, 0);
+        for (size_t i = 0; i < patch.size() && i < pressure.size(); i++) {
+            const ChVector3d force = patch[i].sample.normal_abs * (std::max(0.0, pressure[i]) * patch[i].force_scale);
+            torque += (patch[i].sample.point_abs - center).Cross(force);
+        }
+        return torque;
+    }
+
+    static double PatchLengthScale(const std::vector<PreparedSample>& patch, const ChVector3d& center) {
+        double max_radius = 0.0;
+        double area_sum = 0.0;
+        for (const auto& entry : patch) {
+            max_radius = std::max(max_radius, (entry.sample.point_abs - center).Length());
+            area_sum += std::max(entry.force_scale, 0.0);
+        }
+        if (max_radius > 1.0e-12 && std::isfinite(max_radius)) {
+            return max_radius;
+        }
+        return std::sqrt(std::max(area_sum, 1.0e-12));
+    }
+
+    static ChVector3d PatchWrenchReferencePoint(const std::vector<PreparedSample>& patch) {
+        if (!patch.empty() && patch.front().sample.body_a) {
+            return patch.front().sample.body_a->GetPos();
+        }
+        return PatchAreaCentroid(patch);
+    }
+
+    void AppendPatchWrenchClosureResidual(const std::vector<PreparedSample>& patch,
+                                          const ChVector3d& center,
+                                          const ChVector3d& target_force,
+                                          const ChVector3d& target_torque,
+                                          const std::vector<double>& pressure,
+                                          std::vector<double>& residual,
+                                          std::vector<std::vector<double>>& jacobian) const {
+        if (!m_use_patch_wrench_closure || patch.empty()) {
+            return;
+        }
+        const int n = static_cast<int>(patch.size());
+        const ChVector3d force = PatchForce(patch, pressure);
+        const ChVector3d torque = PatchTorqueAbout(patch, pressure, center);
+        double area_sum = 0.0;
+        for (const auto& entry : patch) {
+            area_sum += std::max(entry.force_scale, 0.0);
+        }
+        const double force_scale = std::max(target_force.Length(), 1.0);
+        const double length_scale = PatchLengthScale(patch, center);
+        const double torque_scale = std::max(force_scale * length_scale, 1.0e-12);
+        const double wf = std::sqrt(std::max(0.0, m_wrench_force_weight));
+        const double wt = std::sqrt(std::max(0.0, m_wrench_torque_weight));
+
+        if (wf > 0.0) {
+            const ChVector3d force_error = (force - target_force) * (wf / force_scale);
+            const int base = static_cast<int>(residual.size());
+            residual.push_back(force_error.x());
+            residual.push_back(force_error.y());
+            residual.push_back(force_error.z());
+            jacobian.resize(residual.size(), std::vector<double>(n, 0.0));
+            for (int j = 0; j < n; j++) {
+                const ChVector3d df = patch[j].sample.normal_abs * (patch[j].force_scale * wf / force_scale);
+                jacobian[base + 0][j] = df.x();
+                jacobian[base + 1][j] = df.y();
+                jacobian[base + 2][j] = df.z();
+            }
+        }
+
+        if (wt > 0.0) {
+            const ChVector3d torque_error = (torque - target_torque) * (wt / torque_scale);
+            const int base = static_cast<int>(residual.size());
+            residual.push_back(torque_error.x());
+            residual.push_back(torque_error.y());
+            residual.push_back(torque_error.z());
+            jacobian.resize(residual.size(), std::vector<double>(n, 0.0));
+            for (int j = 0; j < n; j++) {
+                const ChVector3d dm =
+                    (patch[j].sample.point_abs - center)
+                        .Cross(patch[j].sample.normal_abs * patch[j].force_scale) *
+                    (wt / torque_scale);
+                jacobian[base + 0][j] = dm.x();
+                jacobian[base + 1][j] = dm.y();
+                jacobian[base + 2][j] = dm.z();
+            }
+        }
+    }
+
+    std::vector<double> EvaluateAugmentedPatchResidual(const std::vector<PreparedSample>& patch,
+                                                       const std::vector<std::vector<double>>& laplacian,
+                                                       const std::vector<std::vector<double>>& delassus_pressure,
+                                                       const ChVector3d& center,
+                                                       const ChVector3d& target_force,
+                                                       const ChVector3d& target_torque,
+                                                       const std::vector<double>& pressure,
+                                                       std::vector<std::vector<double>>* jacobian) const {
+        std::vector<std::vector<double>> fb_jacobian;
+        std::vector<double> residual =
+            EvaluatePatchResidual(patch, laplacian, delassus_pressure, pressure, jacobian ? &fb_jacobian : nullptr);
+        if (jacobian) {
+            *jacobian = std::move(fb_jacobian);
+            AppendPatchWrenchClosureResidual(patch, center, target_force, target_torque, pressure, residual, *jacobian);
+        } else if (m_use_patch_wrench_closure) {
+            std::vector<std::vector<double>> unused;
+            unused.assign(residual.size(), std::vector<double>(patch.size(), 0.0));
+            AppendPatchWrenchClosureResidual(patch, center, target_force, target_torque, pressure, residual, unused);
+        }
+        return residual;
+    }
+
+    void SolvePatchWrenchClosure(const std::vector<PreparedSample>& patch,
+                                 const std::vector<std::vector<double>>& laplacian,
+                                 const std::vector<std::vector<double>>& delassus_pressure,
+                                 std::vector<double>& pressure,
+                                 double& residual_norm) const {
+        if (!m_use_patch_wrench_closure || patch.size() <= 1 || m_wrench_closure_iterations <= 0) {
+            return;
+        }
+        const ChVector3d center = PatchWrenchReferencePoint(patch);
+        ChVector3d target_force = PatchForce(patch, pressure);
+        ChVector3d target_torque = ChVector3d(0, 0, 0);
+        bool has_external_wrench_demand = false;
+        if (m_wrench_demand_provider) {
+            ChVector3d demand_force = ChVector3d(0, 0, 0);
+            ChVector3d demand_torque = ChVector3d(0, 0, 0);
+            if (m_wrench_demand_provider(m_current_time, center, demand_force, demand_torque)) {
+                target_force = demand_force;
+                target_torque = demand_torque;
+                has_external_wrench_demand = true;
+            }
+        }
+        if (!(target_force.Length() > 1.0e-12 || target_torque.Length() > 1.0e-12) ||
+            !std::isfinite(target_force.Length()) || !std::isfinite(target_torque.Length())) {
+            return;
+        }
+
+        for (int iter = 0; !has_external_wrench_demand && iter < m_wrench_closure_iterations; iter++) {
+            std::vector<std::vector<double>> J;
+            const std::vector<double> residual =
+                EvaluateAugmentedPatchResidual(
+                    patch, laplacian, delassus_pressure, center, target_force, target_torque, pressure, &J);
+            const double norm0 = VectorNorm(residual);
+            residual_norm = norm0;
+            if (norm0 < m_newton_tolerance) {
+                break;
+            }
+            std::vector<double> delta;
+            if (!SolveLeastSquaresStep(J, residual, m_wrench_closure_regularization, delta)) {
+                break;
+            }
+
+            bool accepted = false;
+            double alpha = 1.0;
+            for (int ls = 0; ls < 12; ls++) {
+                std::vector<double> trial = pressure;
+                for (size_t i = 0; i < trial.size() && i < delta.size(); i++) {
+                    trial[i] = std::max(0.0, pressure[i] + alpha * delta[i]);
+                    trial[i] = std::min(trial[i], 100.0 * m_pressure_scale);
+                }
+                const double trial_norm =
+                    VectorNorm(EvaluateAugmentedPatchResidual(
+                        patch, laplacian, delassus_pressure, center, target_force, target_torque, trial, nullptr));
+                if (std::isfinite(trial_norm) && trial_norm <= (1.0 - 1.0e-4 * alpha) * norm0) {
+                    pressure = std::move(trial);
+                    residual_norm = trial_norm;
+                    accepted = true;
+                    break;
+                }
+                alpha *= 0.5;
+            }
+            if (!accepted) {
+                break;
+            }
+        }
+
+        // Robust nonnegative projection: preserve the patch resultant force
+        // found by the NCP solve while minimizing the torque it applies about
+        // the rigid-body reference point.  This is not fitted to any reference
+        // trajectory; it is a generic patch pressure redistribution.
+        const int n = static_cast<int>(patch.size());
+        const double force_scale = std::max(target_force.Length(), 1.0);
+        const double length_scale = std::max(PatchLengthScale(patch, center), 1.0e-6);
+        const double torque_scale = std::max(force_scale * length_scale, 1.0e-12);
+        const double wf = std::sqrt(std::max(0.0, m_wrench_force_weight));
+        const double wt = std::sqrt(std::max(0.0, m_wrench_torque_weight));
+        const double reg = std::max(m_wrench_closure_regularization, 1.0e-18);
+
+        std::vector<std::array<double, 6>> columns(static_cast<size_t>(n));
+        std::vector<double> denom(static_cast<size_t>(n), reg);
+        for (int i = 0; i < n; i++) {
+            const ChVector3d df = patch[i].sample.normal_abs * patch[i].force_scale;
+            const ChVector3d dt = (patch[i].sample.point_abs - center).Cross(df);
+            columns[static_cast<size_t>(i)] = {wf * df.x() / force_scale,
+                                               wf * df.y() / force_scale,
+                                               wf * df.z() / force_scale,
+                                               wt * dt.x() / torque_scale,
+                                               wt * dt.y() / torque_scale,
+                                               wt * dt.z() / torque_scale};
+            for (double value : columns[static_cast<size_t>(i)]) {
+                denom[static_cast<size_t>(i)] += value * value;
+            }
+            denom[static_cast<size_t>(i)] = std::max(denom[static_cast<size_t>(i)], 1.0e-30);
+        }
+
+        const std::array<double, 6> target = {wf * target_force.x() / force_scale,
+                                             wf * target_force.y() / force_scale,
+                                             wf * target_force.z() / force_scale,
+                                             wt * target_torque.x() / torque_scale,
+                                             wt * target_torque.y() / torque_scale,
+                                             wt * target_torque.z() / torque_scale};
+        std::array<double, 6> residual = {-target[0], -target[1], -target[2], -target[3], -target[4], -target[5]};
+        for (int i = 0; i < n; i++) {
+            for (int row = 0; row < 6; row++) {
+                residual[static_cast<size_t>(row)] +=
+                    columns[static_cast<size_t>(i)][static_cast<size_t>(row)] * pressure[static_cast<size_t>(i)];
+            }
+        }
+
+        const std::vector<double> p0 = pressure;
+        for (int iter = 0; iter < std::max(20, 4 * n); iter++) {
+            double max_delta = 0.0;
+            for (int i = 0; i < n; i++) {
+                const auto& col = columns[static_cast<size_t>(i)];
+                double gradient = reg * (pressure[static_cast<size_t>(i)] - p0[static_cast<size_t>(i)]);
+                for (int row = 0; row < 6; row++) {
+                    gradient += col[static_cast<size_t>(row)] * residual[static_cast<size_t>(row)];
+                }
+                const double next =
+                    std::max(0.0, pressure[static_cast<size_t>(i)] - gradient / denom[static_cast<size_t>(i)]);
+                const double delta = next - pressure[static_cast<size_t>(i)];
+                if (delta != 0.0) {
+                    pressure[static_cast<size_t>(i)] = std::min(next, 100.0 * m_pressure_scale);
+                    const double applied_delta = pressure[static_cast<size_t>(i)] - (next - delta);
+                    for (int row = 0; row < 6; row++) {
+                        residual[static_cast<size_t>(row)] += col[static_cast<size_t>(row)] * applied_delta;
+                    }
+                    max_delta = std::max(max_delta, std::abs(applied_delta));
+                }
+            }
+            if (max_delta < 1.0e-10) {
+                break;
+            }
+        }
+        residual_norm = VectorNorm(EvaluateAugmentedPatchResidual(
+            patch, laplacian, delassus_pressure, center, target_force, target_torque, pressure, nullptr));
+    }
+
+    void SolveIntegratedPatchWrenchClosure(const std::vector<PreparedSample>& patch,
+                                           const std::vector<std::vector<double>>& laplacian,
+                                           const std::vector<std::vector<double>>& delassus_pressure,
+                                           std::vector<double>& pressure,
+                                           double& residual_norm) const {
+        if (!m_use_patch_wrench_closure || patch.size() <= 1 || m_wrench_closure_iterations <= 0) {
+            return;
+        }
+        const ChVector3d center = PatchWrenchReferencePoint(patch);
+        ChVector3d target_force = PatchForce(patch, pressure);
+        ChVector3d target_torque = ChVector3d(0, 0, 0);
+        if (m_wrench_demand_provider) {
+            ChVector3d demand_force = ChVector3d(0, 0, 0);
+            ChVector3d demand_torque = ChVector3d(0, 0, 0);
+            if (m_wrench_demand_provider(m_current_time, center, demand_force, demand_torque)) {
+                target_force = demand_force;
+                target_torque = demand_torque;
+            }
+        }
+        if (!(target_force.Length() > 1.0e-12 || target_torque.Length() > 1.0e-12) ||
+            !std::isfinite(target_force.Length()) || !std::isfinite(target_torque.Length())) {
+            return;
+        }
+
+        const int max_iterations = std::max(m_max_newton_iterations, m_wrench_closure_iterations);
+        for (int iter = 0; iter < max_iterations; iter++) {
+            std::vector<std::vector<double>> J;
+            const std::vector<double> residual =
+                EvaluateAugmentedPatchResidual(
+                    patch, laplacian, delassus_pressure, center, target_force, target_torque, pressure, &J);
+            const double norm0 = VectorNorm(residual);
+            residual_norm = norm0;
+            if (norm0 < m_newton_tolerance) {
+                break;
+            }
+
+            std::vector<double> delta;
+            if (!SolveLeastSquaresStep(J, residual, m_wrench_closure_regularization, delta)) {
+                break;
+            }
+
+            bool accepted = false;
+            double alpha = 1.0;
+            for (int ls = 0; ls < 12; ls++) {
+                std::vector<double> trial = pressure;
+                for (size_t i = 0; i < trial.size() && i < delta.size(); i++) {
+                    trial[i] = std::max(0.0, pressure[i] + alpha * delta[i]);
+                    trial[i] = std::min(trial[i], 100.0 * m_pressure_scale);
+                }
+                const double trial_norm =
+                    VectorNorm(EvaluateAugmentedPatchResidual(
+                        patch, laplacian, delassus_pressure, center, target_force, target_torque, trial, nullptr));
+                if (std::isfinite(trial_norm) && trial_norm <= (1.0 - 1.0e-4 * alpha) * norm0) {
+                    pressure = std::move(trial);
+                    residual_norm = trial_norm;
+                    accepted = true;
+                    break;
+                }
+                alpha *= 0.5;
+            }
+            if (!accepted) {
+                break;
+            }
+        }
+    }
+
+    std::vector<double> SolvePatchPressure(const std::vector<PreparedSample>& patch, double& residual_norm) {
+        const int n = static_cast<int>(patch.size());
+        std::vector<double> pressure(n, 0.0);
+        for (int i = 0; i < n; i++) {
+            const int id = patch[i].sample.contact_id;
+            const auto found = m_warm_pressure.find(id);
+            if (id >= 0 && found != m_warm_pressure.end()) {
+                pressure[i] = std::max(0.0, found->second);
+            } else if (m_use_velocity_level_delassus) {
+                const double velocity_residual =
+                    patch[i].gap_rate + m_baumgarte * std::min(0.0, patch[i].sample.gap) / std::max(m_dt, 1.0e-12);
+                pressure[i] = std::max(0.0, -velocity_residual / std::max(m_pressure_compliance, 1.0e-14));
+            } else {
+                const double predicted_closing_gap = patch[i].sample.gap + m_dt * std::min(0.0, patch[i].gap_rate);
+                pressure[i] = std::max(0.0, -predicted_closing_gap / m_pressure_compliance);
+            }
+            pressure[i] = std::min(pressure[i], 100.0 * m_pressure_scale);
+        }
+
+        const auto laplacian = BuildNormalizedAreaGraphLaplacian(patch);
+        const auto delassus_pressure = BuildDelassusPressureMatrix(patch);
+        if (m_use_velocity_level_delassus) {
+            for (int i = 0; i < n; i++) {
+                const double velocity_residual =
+                    patch[i].gap_rate + m_baumgarte * std::min(0.0, patch[i].sample.gap) / std::max(m_dt, 1.0e-12);
+                const double denom = std::max(delassus_pressure[i][i] + m_pressure_compliance, 1.0e-14);
+                if (pressure[i] <= 0.0) {
+                    pressure[i] = std::max(0.0, -velocity_residual / denom);
+                    pressure[i] = std::min(pressure[i], 100.0 * m_pressure_scale);
+                }
+            }
+        }
+        residual_norm = std::numeric_limits<double>::infinity();
+        for (int iter = 0; iter < m_max_newton_iterations; iter++) {
+            std::vector<std::vector<double>> J;
+            const std::vector<double> residual =
+                EvaluatePatchResidual(patch, laplacian, delassus_pressure, pressure, &J);
+            const double norm0 = VectorNorm(residual);
+            residual_norm = norm0;
+            if (norm0 < m_newton_tolerance) {
+                break;
+            }
+            std::vector<double> rhs(n, 0.0);
+            for (int i = 0; i < n; i++) {
+                rhs[i] = -residual[i];
+                J[i][i] += 1.0e-12;
+            }
+            std::vector<double> delta;
+            if (!SolveDenseLinearSystem(J, rhs, delta)) {
+                break;
+            }
+
+            bool accepted = false;
+            double alpha = 1.0;
+            for (int ls = 0; ls < 12; ls++) {
+                std::vector<double> trial = pressure;
+                for (int i = 0; i < n; i++) {
+                    trial[i] = std::max(0.0, pressure[i] + alpha * delta[i]);
+                    trial[i] = std::min(trial[i], 100.0 * m_pressure_scale);
+                }
+                const double trial_norm =
+                    VectorNorm(EvaluatePatchResidual(patch, laplacian, delassus_pressure, trial, nullptr));
+                if (std::isfinite(trial_norm) && trial_norm <= (1.0 - 1.0e-4 * alpha) * norm0) {
+                    pressure = std::move(trial);
+                    residual_norm = trial_norm;
+                    accepted = true;
+                    break;
+                }
+                alpha *= 0.5;
+            }
+            if (!accepted) {
+                break;
+            }
+        }
+        if (m_use_integrated_wrench_closure) {
+            SolveIntegratedPatchWrenchClosure(patch, laplacian, delassus_pressure, pressure, residual_norm);
+        } else {
+            SolvePatchWrenchClosure(patch, laplacian, delassus_pressure, pressure, residual_norm);
+        }
+        return pressure;
+    }
+
+    void RefreshContacts() {
+        m_states.clear();
+        if (!m_generator) {
+            return;
+        }
+        std::vector<PreparedSample> active;
+        std::set<int> next_active_ids;
+        for (auto& sample : m_generator()) {
+            PreparedSample prepared;
+            if (!PrepareSample(sample, prepared) || !ShouldActivate(prepared)) {
+                continue;
+            }
+            if (prepared.sample.contact_id >= 0) {
+                next_active_ids.insert(prepared.sample.contact_id);
+            }
+            active.push_back(std::move(prepared));
+        }
+
+        std::map<int, std::vector<PreparedSample>> patches;
+        int fallback_patch_id = 0;
+        for (auto& prepared : active) {
+            const int patch_id = prepared.sample.patch_id >= 0 ? prepared.sample.patch_id : 100000000 + fallback_patch_id++;
+            patches[patch_id].push_back(std::move(prepared));
+        }
+
+        std::map<int, double> next_warm_pressure;
+        for (const auto& item : patches) {
+            const auto& patch = item.second;
+            if (patch.empty()) {
+                continue;
+            }
+            double residual_norm = 0.0;
+            const std::vector<double> pressure = SolvePatchPressure(patch, residual_norm);
+            for (size_t i = 0; i < patch.size(); i++) {
+                const double p = std::max(0.0, pressure[i]);
+                const double lambda_force = p * patch[i].force_scale;
+                ChSdfNcpDescriptorContactState state;
+                state.sample = patch[i].sample;
+                state.lambda_n = p;
+                state.lambda_force = lambda_force;
+                state.penetration = std::max(0.0, -patch[i].sample.gap);
+                double scaled_gap = 0.0;
+                if (m_use_velocity_level_delassus) {
+                    scaled_gap =
+                        (patch[i].gap_rate +
+                         m_baumgarte * std::min(0.0, patch[i].sample.gap) / std::max(m_dt, 1.0e-12)) /
+                        m_velocity_scale;
+                } else {
+                    scaled_gap =
+                        (patch[i].sample.gap + m_dt * std::min(0.0, patch[i].gap_rate)) / m_gap_scale;
+                }
+                const double scaled_pressure = p / m_pressure_scale;
+                state.ncp_residual = std::abs(SmoothFischerBurmeister(scaled_gap, scaled_pressure, m_eps));
+                state.complementarity_error = ComplementarityError(scaled_gap, scaled_pressure);
+                state.active = lambda_force > 0.0 || state.penetration > 0.0;
+                m_states.push_back(state);
+                if (patch[i].sample.contact_id >= 0) {
+                    next_warm_pressure[patch[i].sample.contact_id] = p;
+                }
+            }
+        }
+        m_persistent_active_ids = std::move(next_active_ids);
+        m_warm_pressure = std::move(next_warm_pressure);
+    }
+
+    ContactGenerator m_generator;
+    PatchWrenchDemandProvider m_wrench_demand_provider;
+    std::vector<ChSdfNcpDescriptorContactState> m_states;
+    std::map<int, double> m_warm_pressure;
+    std::set<int> m_persistent_active_ids;
+    double m_current_time = 0.0;
+    double m_eps = 1.0e-7;
+    double m_dt = 0.001;
+    double m_active_gap_on = 1.0e-5;
+    double m_active_gap_off = 2.0e-3;
+    double m_pressure_compliance = 1.0e-10;
+    double m_laplacian_compliance = 2.5e-11;
+    double m_gap_scale = 1.0e-5;
+    double m_pressure_scale = 1.0e6;
+    bool m_use_velocity_level_delassus = false;
+    bool m_use_patch_wrench_closure = false;
+    bool m_use_integrated_wrench_closure = false;
+    double m_baumgarte = 0.2;
+    double m_velocity_scale = 1.0;
+    double m_wrench_force_weight = 1.0;
+    double m_wrench_torque_weight = 1.0;
+    double m_wrench_closure_regularization = 1.0e-8;
+    int m_max_newton_iterations = 25;
+    int m_wrench_closure_iterations = 8;
+    double m_newton_tolerance = 1.0e-8;
 };
 
 int RunCamChronoMbdCase(const std::string& output_case_name = "cam",
@@ -4499,18 +5551,42 @@ int RunCamChronoMbdCase(const std::string& output_case_name = "cam",
     follower_joint->Initialize(follower, ground, RmdMarkerFrameAbs(rmd, RequireMarkerById(rmd, tra_joint.i_marker_id)));
     sys.AddLink(follower_joint);
 
+    auto manifold_manager = chrono_types::make_shared<ChSdfContactManifoldManager>();
+    ChSdfContactManifoldManager::Settings manifold_settings;
+    manifold_settings.dt = dt;
+    manifold_settings.gap_on = ncp_config.activation_band;
+    manifold_settings.gap_off = ncp_config.max_activation_band;
+    manifold_settings.lambda_hold_force = 1.0e-8;
+    manifold_settings.patch_overlap_threshold = 0.20;
+    manifold_settings.release_steps = 1;
+    manifold_manager->SetSettings(manifold_settings);
+
     std::shared_ptr<ChSdfNcpConstraintContactSet> contact_item;
     std::shared_ptr<ChSdfPenaltyContactForceSet> penalty_item;
-    auto generator = [cam, follower, &cam_sdf, &follower_graph, &follower_bvh, broad_phase_padding, ncp_config]() {
-        return BuildCamDescriptorContacts(
+    auto generator = [cam,
+                      follower,
+                      &cam_sdf,
+                      &follower_graph,
+                      &follower_bvh,
+                      broad_phase_padding,
+                      ncp_config,
+                      manifold_manager,
+                      use_manifold = !use_recurdyn_solid_contact_law]() {
+        auto contacts = BuildCamDescriptorContacts(
             cam, follower, cam_sdf, follower_graph, ncp_config, &follower_bvh, &cam_sdf.local_bounds, broad_phase_padding);
+        return use_manifold ? manifold_manager->Update(contacts) : contacts;
     };
     if (use_recurdyn_solid_contact_law) {
         RecurDynSolidContactLaw law;
         law.stiffness = solid_contact.stiffness;
         law.damping = solid_contact.damping;
         law.exponent = solid_contact.korder > 0.0 ? solid_contact.korder : 1.0;
-        law.buffer_penetration = solid_contact.bpen;
+        law.boundary_penetration = solid_contact.bpen;
+        law.rebound_damping_factor = solid_contact.rdf;
+        law.dynamic_friction_coefficient = solid_contact.dynamic_friction_coefficient;
+        law.static_transition_velocity = solid_contact.static_transition_velocity;
+        law.dynamic_transition_velocity = solid_contact.dynamic_transition_velocity;
+        law.static_friction_coefficient = solid_contact.static_friction_coefficient;
         penalty_item = chrono_types::make_shared<ChSdfPenaltyContactForceSet>();
         penalty_item->SetContactLaw(law);
         penalty_item->SetContactGenerator(generator);
@@ -4555,6 +5631,9 @@ int RunCamChronoMbdCase(const std::string& output_case_name = "cam",
         }
         const bool finite_state = std::isfinite(follower->GetPos().y()) && std::isfinite(follower->GetPosDt().y());
         const auto& contact_states = contact_item ? contact_item->GetContactStates() : penalty_item->GetContactStates();
+        if (contact_item) {
+            manifold_manager->ObserveSolvedStates(contact_states);
+        }
         MultiStepDiagnostics diag = MakeDescriptorContactDiagnostics(contact_states, finite_state);
         Accumulate(stats, diag);
 
@@ -4573,6 +5652,8 @@ int RunCamChronoMbdCase(const std::string& output_case_name = "cam",
             for (size_t c = 0; c < diag.candidates.size(); c++) {
                 const auto& candidate = diag.candidates[c];
                 const double lambda = c < diag.lambdas.size() ? diag.lambdas[c] : 0.0;
+                const double lambda_force =
+                    c < diag.lambda_forces.size() ? diag.lambda_forces[c] : lambda * candidate.weight;
                 const double ncp = c < diag.ncp_residuals.size() ? diag.ncp_residuals[c] : 0.0;
                 const double comp = c < diag.complementarity_errors.size() ? diag.complementarity_errors[c] : 0.0;
                 trajectory << time << ",follower," << follower->GetPos().x() << "," << follower->GetPos().y() << ","
@@ -4580,7 +5661,7 @@ int RunCamChronoMbdCase(const std::string& output_case_name = "cam",
                            << fq.e3() << "," << follower->GetPosDt().x() << "," << follower->GetPosDt().y() << ","
                            << follower->GetPosDt().z() << "," << follower_w.x() << "," << follower_w.y() << ","
                            << follower_w.z() << "," << candidate.sample_id << "," << candidate.gap << ","
-                           << lambda << "," << candidate.weight << "," << lambda * candidate.weight << ","
+                           << lambda << "," << candidate.weight << "," << lambda_force << ","
                            << std::max(0.0, -candidate.gap) << "," << ncp << "," << comp << ",0,0,"
                            << (diag.success ? 1 : 0) << "\n";
             }
@@ -4745,12 +5826,13 @@ int RunCamFullGeometryCase() {
         for (size_t c = 0; c < diag.candidates.size(); c++) {
             const auto& candidate = diag.candidates[c];
             const double lambda = c < diag.lambdas.size() ? diag.lambdas[c] : 0.0;
+            const double lambda_force = c < diag.lambda_forces.size() ? diag.lambda_forces[c] : lambda * candidate.weight;
             const double ncp = c < diag.ncp_residuals.size() ? diag.ncp_residuals[c] : 0.0;
             const double comp = c < diag.complementarity_errors.size() ? diag.complementarity_errors[c] : 0.0;
             trajectory << time << ",follower," << follower_cm.x() << "," << follower_cm.y() << ","
                        << follower_cm.z() << ",1,0,0,0,0," << state.vy << ",0,0,0,0,"
                        << candidate.sample_id << "," << candidate.gap << "," << lambda << ","
-                       << candidate.weight << "," << lambda * candidate.weight << ","
+                       << candidate.weight << "," << lambda_force << ","
                        << std::max(0.0, -candidate.gap) << "," << ncp << "," << comp << ","
                        << diag.residual_norm << "," << diag.iterations << "," << (diag.success ? 1 : 0) << "\n";
         }
@@ -4780,6 +5862,2447 @@ int RunCamFullGeometryCase() {
 
     const double success_rate = stats.sum_success / static_cast<double>(std::max(1, stats.samples));
     return stats.max_penetration < 5.0e-3 && stats.max_complementarity_error < 10.0 && success_rate > 0.95 ? 0 : 1;
+}
+
+struct RevClearanceConfig {
+    std::string case_name = "rev_joint_clearance";
+    std::string asset = "assets/rev_joint_clearance";
+    double dt = 0.001;
+    double t_end = 3.0;
+    double eps = 1.0e-7;
+    double voxel_size = 0.002;
+    float half_width_voxels = 32.0f;
+    double activation_band = 1.0e-5;
+    double max_activation_band = 0.002;
+    double pressure_compliance = 1.0e-9;
+    int min_patch_samples = 16;
+    int max_contacts = 512;
+    bool use_absolute_active_band = true;
+};
+
+struct RevClearanceRunOptions {
+    std::string case_name = "rev_joint_clearance";
+    double t_end_override = -1.0;
+    double dt_override = -1.0;
+    bool use_recurdyn_ggeomcontact_law = false;
+    ChTimestepper::Type timestepper_type = ChTimestepper::Type::EULER_IMPLICIT_LINEARIZED;
+    std::string timestepper_label = "euler_implicit_linearized";
+    bool use_step_control = false;
+    bool contact_substepping = false;
+    bool startup_substepping = false;
+    bool patch_pressure_aggregation = false;
+    bool descriptor_patch_projection = false;
+    bool descriptor_patch_delassus_solve = false;
+    bool descriptor_velocity_level_ncp = false;
+    double descriptor_patch_projection_strength = 0.15;
+    double descriptor_patch_laplacian_compliance_scale = 0.0;
+    double descriptor_patch_wrench_closure_strength = 0.0;
+    double descriptor_velocity_baumgarte = 0.2;
+    double descriptor_velocity_rhs_scale = 1.0;
+    bool manifold_use_prediction = true;
+    bool bidirectional_contact = false;
+    bool local_patch_pressure_solve = false;
+    bool local_patch_delassus = false;
+    bool local_patch_wrench_closure = false;
+    bool local_patch_integrated_wrench_closure = false;
+    bool local_patch_global_wrench_demand = false;
+    double local_patch_pressure_compliance_scale = 0.1;
+    double local_patch_wrench_force_weight = 1.0;
+    double local_patch_wrench_torque_weight = 1.0;
+    double local_patch_wrench_regularization = 1.0e-8;
+    int contact_substeps = 5;
+    int startup_substeps = 20;
+    double startup_time = 0.01;
+};
+
+void ConfigureRevClearanceTimestepper(ChSystemNSC& sys, const RevClearanceRunOptions& options) {
+    sys.SetTimestepperType(options.timestepper_type);
+    auto implicit = std::dynamic_pointer_cast<ChTimestepperImplicit>(sys.GetTimestepper());
+    if (implicit) {
+        implicit->SetMaxIters(50);
+        implicit->SetRelTolerance(1.0e-6);
+        implicit->SetAbsTolerances(1.0e-8, 1.0e-8);
+        implicit->SetStepControl(options.use_step_control);
+        implicit->SetMinStepSize(1.0e-8);
+        implicit->SetJacobianUpdateMethod(ChTimestepperImplicit::JacobianUpdate::EVERY_ITERATION);
+        implicit->AcceptTerminatedStep(true);
+    }
+    auto hht = std::dynamic_pointer_cast<ChTimestepperHHT>(sys.GetTimestepper());
+    if (hht) {
+        hht->SetAlpha(-0.2);
+    }
+}
+
+struct RevClearanceReferenceRow {
+    double time = 0.0;
+    ChVector3d pos = ChVector3d(0, 0, 0);
+    ChVector3d vel = ChVector3d(0, 0, 0);
+    ChVector3d acc = ChVector3d(0, 0, 0);
+};
+
+struct RevClearanceIdealWrenchRow {
+    double time = 0.0;
+    ChVector3d force = ChVector3d(0, 0, 0);
+    ChVector3d torque_about_body_ref = ChVector3d(0, 0, 0);
+};
+
+std::vector<RevClearanceReferenceRow> LoadRevClearanceReference(const std::filesystem::path& path) {
+    std::ifstream in(path);
+    if (!in) {
+        throw std::runtime_error("Cannot open reference CSV: " + path.string());
+    }
+
+    std::string line;
+    std::getline(in, line);
+    std::vector<RevClearanceReferenceRow> rows;
+    while (std::getline(in, line)) {
+        if (line.empty()) {
+            continue;
+        }
+        const auto cols = SplitCsvLine(line);
+        if (cols.size() < 18) {
+            continue;
+        }
+        RevClearanceReferenceRow row;
+        row.time = std::stod(cols[0]);
+        row.pos = ChVector3d(std::stod(cols[9]), std::stod(cols[10]), std::stod(cols[11]));
+        row.vel = ChVector3d(std::stod(cols[12]), std::stod(cols[13]), std::stod(cols[14]));
+        row.acc = ChVector3d(std::stod(cols[15]), std::stod(cols[16]), std::stod(cols[17]));
+        rows.push_back(row);
+    }
+    return rows;
+}
+
+RevClearanceReferenceRow InterpolateRevClearanceReference(const std::vector<RevClearanceReferenceRow>& rows,
+                                                          double time) {
+    if (rows.empty()) {
+        return {};
+    }
+    if (time <= rows.front().time) {
+        return rows.front();
+    }
+    if (time >= rows.back().time) {
+        return rows.back();
+    }
+
+    auto upper = std::lower_bound(rows.begin(), rows.end(), time, [](const RevClearanceReferenceRow& row, double t) {
+        return row.time < t;
+    });
+    if (upper == rows.begin()) {
+        return *upper;
+    }
+    const auto lower = upper - 1;
+    const double denom = upper->time - lower->time;
+    const double alpha = std::abs(denom) > 1.0e-14 ? (time - lower->time) / denom : 0.0;
+    RevClearanceReferenceRow out;
+    out.time = time;
+    out.pos = lower->pos + (upper->pos - lower->pos) * alpha;
+    out.vel = lower->vel + (upper->vel - lower->vel) * alpha;
+    out.acc = lower->acc + (upper->acc - lower->acc) * alpha;
+    return out;
+}
+
+std::vector<RevClearanceIdealWrenchRow> LoadRevClearanceIdealWrench(const std::filesystem::path& path) {
+    std::vector<RevClearanceIdealWrenchRow> rows;
+    std::ifstream in(path);
+    if (!in) {
+        return rows;
+    }
+    std::string header;
+    if (!std::getline(in, header)) {
+        return rows;
+    }
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty()) {
+            continue;
+        }
+        const auto cols = SplitCsvLine(line);
+        if (cols.size() < 22 || cols[1] != "body3") {
+            continue;
+        }
+        RevClearanceIdealWrenchRow row;
+        row.time = std::stod(cols[0]);
+        row.force = ChVector3d(std::stod(cols[3]), std::stod(cols[4]), std::stod(cols[5]));
+        row.torque_about_body_ref = ChVector3d(std::stod(cols[11]), std::stod(cols[12]), std::stod(cols[13]));
+        rows.push_back(row);
+    }
+    return rows;
+}
+
+RevClearanceIdealWrenchRow InterpolateRevClearanceIdealWrench(const std::vector<RevClearanceIdealWrenchRow>& rows,
+                                                              double time) {
+    if (rows.empty()) {
+        return {};
+    }
+    if (time <= rows.front().time) {
+        return rows.front();
+    }
+    if (time >= rows.back().time) {
+        return rows.back();
+    }
+    auto upper = std::lower_bound(rows.begin(), rows.end(), time, [](const RevClearanceIdealWrenchRow& row, double t) {
+        return row.time < t;
+    });
+    if (upper == rows.begin()) {
+        return *upper;
+    }
+    const auto lower = upper - 1;
+    const double denom = upper->time - lower->time;
+    const double alpha = std::abs(denom) > 1.0e-14 ? (time - lower->time) / denom : 0.0;
+    RevClearanceIdealWrenchRow out;
+    out.time = time;
+    out.force = lower->force + (upper->force - lower->force) * alpha;
+    out.torque_about_body_ref =
+        lower->torque_about_body_ref + (upper->torque_about_body_ref - lower->torque_about_body_ref) * alpha;
+    return out;
+}
+
+double RmsError(const std::vector<double>& values) {
+    if (values.empty()) {
+        return 0.0;
+    }
+    double sum = 0.0;
+    for (double value : values) {
+        sum += value * value;
+    }
+    return std::sqrt(sum / static_cast<double>(values.size()));
+}
+
+double MaxAbsError(const std::vector<double>& values) {
+    double out = 0.0;
+    for (double value : values) {
+        out = std::max(out, std::abs(value));
+    }
+    return out;
+}
+
+double MeanValue(const std::vector<double>& values) {
+    if (values.empty()) {
+        return 0.0;
+    }
+    double sum = 0.0;
+    for (double value : values) {
+        sum += value;
+    }
+    return sum / static_cast<double>(values.size());
+}
+
+ChVector3d NormalizeOrZero(const ChVector3d& v) {
+    const double length = v.Length();
+    if (!(length > 1.0e-14) || !std::isfinite(length)) {
+        return ChVector3d(0, 0, 0);
+    }
+    return v / length;
+}
+
+double SafeVectorAngle(const ChVector3d& a, const ChVector3d& b) {
+    const double la = a.Length();
+    const double lb = b.Length();
+    if (!(la > 1.0e-14) || !(lb > 1.0e-14) || !std::isfinite(la) || !std::isfinite(lb)) {
+        return 0.0;
+    }
+    const double c = std::clamp(a.Dot(b) / (la * lb), -1.0, 1.0);
+    return std::acos(c);
+}
+
+ChVector3d RotateBySwing(const ChVector3d& from, const ChVector3d& to, const ChVector3d& value) {
+    const ChVector3d a = NormalizeOrZero(from);
+    const ChVector3d b = NormalizeOrZero(to);
+    if (a.Length() <= 0.0 || b.Length() <= 0.0) {
+        return value;
+    }
+    const double c = std::clamp(a.Dot(b), -1.0, 1.0);
+    if (c > 1.0 - 1.0e-12) {
+        return value;
+    }
+    if (c < -1.0 + 1.0e-12) {
+        ChVector3d axis = std::abs(a.x()) < 0.8 ? ChVector3d(1, 0, 0) : ChVector3d(0, 1, 0);
+        axis = NormalizeOrZero(axis - a * a.Dot(axis));
+        return value * -1.0 + axis * (2.0 * axis.Dot(value));
+    }
+    const ChVector3d v = a.Cross(b);
+    const double s2 = v.Dot(v);
+    return value * c + v.Cross(value) + v * (v.Dot(value) * (1.0 - c) / s2);
+}
+
+struct RevClearanceContactWrench {
+    ChVector3d force_world = ChVector3d(0, 0, 0);
+    ChVector3d torque_world = ChVector3d(0, 0, 0);
+    ChVector3d center_of_pressure = ChVector3d(0, 0, 0);
+    double force_norm = 0.0;
+    double torque_norm = 0.0;
+    int active_contacts = 0;
+};
+
+RevClearanceContactWrench ComputeRevClearanceContactWrench(
+    const std::vector<ChSdfNcpDescriptorContactState>& states,
+    const std::shared_ptr<ChBodyAuxRef>& body3,
+    bool use_raw_multiplier_as_effective_force = false) {
+    RevClearanceContactWrench out;
+    double weighted_point_sum = 0.0;
+    for (const auto& state : states) {
+        const double magnitude = use_raw_multiplier_as_effective_force ? state.lambda_n : state.lambda_force;
+        if (!state.active || !(magnitude > 0.0) || !state.sample.body_a || !state.sample.body_b) {
+            continue;
+        }
+        ChVector3d force_on_body3 = ChVector3d(0, 0, 0);
+        ChVector3d torque_on_body3 = ChVector3d(0, 0, 0);
+        if (state.sample.use_custom_wrench && state.sample.body_a == body3) {
+            force_on_body3 = state.sample.force_on_body_a_per_lambda_abs * state.lambda_n;
+            torque_on_body3 = state.sample.torque_on_body_a_per_lambda_abs * state.lambda_n;
+        } else if (state.sample.use_custom_wrench && state.sample.body_b == body3) {
+            force_on_body3 = state.sample.force_on_body_b_per_lambda_abs * state.lambda_n;
+            torque_on_body3 = state.sample.torque_on_body_b_per_lambda_abs * state.lambda_n;
+        } else if (state.sample.body_a == body3) {
+            force_on_body3 = state.sample.normal_abs * magnitude;
+            torque_on_body3 = (state.sample.point_abs - body3->GetPos()).Cross(force_on_body3);
+        } else if (state.sample.body_b == body3) {
+            force_on_body3 = state.sample.normal_abs * (-magnitude);
+            torque_on_body3 = (state.sample.point_abs - body3->GetPos()).Cross(force_on_body3);
+        } else {
+            continue;
+        }
+        out.force_world += force_on_body3;
+        out.torque_world += torque_on_body3;
+        const double weight = std::abs(magnitude);
+        out.center_of_pressure += state.sample.point_abs * weight;
+        weighted_point_sum += weight;
+        out.active_contacts++;
+    }
+    if (weighted_point_sum > 1.0e-30) {
+        out.center_of_pressure /= weighted_point_sum;
+    }
+    out.force_norm = out.force_world.Length();
+    out.torque_norm = out.torque_world.Length();
+    return out;
+}
+
+struct RevClearancePatchMomentRow {
+    int patch_id = -1;
+    int active_samples = 0;
+    double area_sum = 0.0;
+    double weight_sum = 0.0;
+    double min_gap = std::numeric_limits<double>::max();
+    double max_penetration = 0.0;
+    double lambda_n_sum = 0.0;
+    double lambda_force_sum = 0.0;
+    ChVector3d raw_force = ChVector3d(0, 0, 0);
+    ChVector3d weighted_force = ChVector3d(0, 0, 0);
+    ChVector3d effective_force = ChVector3d(0, 0, 0);
+    ChVector3d raw_torque = ChVector3d(0, 0, 0);
+    ChVector3d weighted_torque = ChVector3d(0, 0, 0);
+    ChVector3d effective_torque = ChVector3d(0, 0, 0);
+    ChVector3d effective_center = ChVector3d(0, 0, 0);
+    double effective_center_weight = 0.0;
+    double max_moment_arm = 0.0;
+};
+
+void AccumulateRevClearancePatchMomentRow(RevClearancePatchMomentRow& row,
+                                          const ChSdfNcpDescriptorContactState& state,
+                                          const std::shared_ptr<ChBodyAuxRef>& body3,
+                                          bool use_raw_multiplier_as_effective_force) {
+    if (!state.active || !state.sample.body_a || !state.sample.body_b) {
+        return;
+    }
+    double sign = 0.0;
+    if (state.sample.body_a == body3) {
+        sign = 1.0;
+    } else if (state.sample.body_b == body3) {
+        sign = -1.0;
+    } else {
+        return;
+    }
+
+    const ChVector3d moment_arm = state.sample.point_abs - body3->GetPos();
+    ChVector3d raw_force = ChVector3d(0, 0, 0);
+    ChVector3d weighted_force = ChVector3d(0, 0, 0);
+    ChVector3d effective_force = ChVector3d(0, 0, 0);
+    ChVector3d raw_torque = ChVector3d(0, 0, 0);
+    ChVector3d weighted_torque = ChVector3d(0, 0, 0);
+    ChVector3d effective_torque = ChVector3d(0, 0, 0);
+
+    if (state.sample.use_custom_wrench && state.sample.body_a == body3) {
+        weighted_force = state.sample.force_on_body_a_per_lambda_abs * state.lambda_n;
+        weighted_torque = state.sample.torque_on_body_a_per_lambda_abs * state.lambda_n;
+        raw_force = weighted_force;
+        raw_torque = weighted_torque;
+    } else if (state.sample.use_custom_wrench && state.sample.body_b == body3) {
+        weighted_force = state.sample.force_on_body_b_per_lambda_abs * state.lambda_n;
+        weighted_torque = state.sample.torque_on_body_b_per_lambda_abs * state.lambda_n;
+        raw_force = weighted_force;
+        raw_torque = weighted_torque;
+    } else {
+        raw_force = state.sample.normal_abs * (sign * state.lambda_n);
+        weighted_force = state.sample.normal_abs * (sign * state.lambda_force);
+        raw_torque = moment_arm.Cross(raw_force);
+        weighted_torque = moment_arm.Cross(weighted_force);
+    }
+    effective_force = use_raw_multiplier_as_effective_force ? raw_force : weighted_force;
+    effective_torque = use_raw_multiplier_as_effective_force ? raw_torque : weighted_torque;
+
+    row.active_samples++;
+    row.area_sum += std::max(0.0, state.sample.area);
+    row.weight_sum += std::max(0.0, state.sample.weight);
+    row.min_gap = std::min(row.min_gap, state.sample.gap);
+    row.max_penetration = std::max(row.max_penetration, std::max(0.0, -state.sample.gap));
+    row.lambda_n_sum += std::max(0.0, state.lambda_n);
+    row.lambda_force_sum += std::max(0.0, state.lambda_force);
+    row.raw_force += raw_force;
+    row.weighted_force += weighted_force;
+    row.effective_force += effective_force;
+    row.raw_torque += raw_torque;
+    row.weighted_torque += weighted_torque;
+    row.effective_torque += effective_torque;
+    const double effective_weight = effective_force.Length();
+    row.effective_center += state.sample.point_abs * effective_weight;
+    row.effective_center_weight += effective_weight;
+    row.max_moment_arm = std::max(row.max_moment_arm, moment_arm.Length());
+}
+
+std::vector<RevClearancePatchMomentRow> ComputeRevClearancePatchMomentRows(
+    const std::vector<ChSdfNcpDescriptorContactState>& states,
+    const std::shared_ptr<ChBodyAuxRef>& body3,
+    bool use_raw_multiplier_as_effective_force) {
+    std::map<int, RevClearancePatchMomentRow> rows;
+    RevClearancePatchMomentRow global;
+    global.patch_id = -1;
+    for (const auto& state : states) {
+        if (!state.active) {
+            continue;
+        }
+        AccumulateRevClearancePatchMomentRow(global, state, body3, use_raw_multiplier_as_effective_force);
+        const int patch_id = state.sample.patch_id;
+        auto& row = rows[patch_id];
+        row.patch_id = patch_id;
+        AccumulateRevClearancePatchMomentRow(row, state, body3, use_raw_multiplier_as_effective_force);
+    }
+
+    std::vector<RevClearancePatchMomentRow> out;
+    if (global.active_samples > 0) {
+        if (global.effective_center_weight > 1.0e-30) {
+            global.effective_center /= global.effective_center_weight;
+        }
+        out.push_back(global);
+    }
+    for (auto& item : rows) {
+        auto& row = item.second;
+        if (row.active_samples <= 0) {
+            continue;
+        }
+        if (row.effective_center_weight > 1.0e-30) {
+            row.effective_center /= row.effective_center_weight;
+        }
+        out.push_back(row);
+    }
+    return out;
+}
+
+void WriteRevClearancePatchMomentHeader(std::ofstream& out) {
+    out << "time,backend,patch_id,active_samples,area_sum,weight_sum,min_gap,max_penetration,lambda_n_sum,"
+           "lambda_force_sum,raw_force_x,raw_force_y,raw_force_z,raw_force_norm,weighted_force_x,weighted_force_y,"
+           "weighted_force_z,weighted_force_norm,effective_force_x,effective_force_y,effective_force_z,"
+           "effective_force_norm,raw_torque_x,raw_torque_y,raw_torque_z,raw_torque_norm,weighted_torque_x,"
+           "weighted_torque_y,weighted_torque_z,weighted_torque_norm,effective_torque_x,effective_torque_y,"
+           "effective_torque_z,effective_torque_norm,resultant_line_offset_m,closure_ratio_max_arm,"
+           "effective_center_x,effective_center_y,effective_center_z,max_moment_arm_m,notes\n";
+}
+
+void WriteRevClearancePatchMomentRows(std::ofstream& out,
+                                      double time,
+                                      const std::string& backend,
+                                      const std::vector<RevClearancePatchMomentRow>& rows) {
+    for (const auto& row : rows) {
+        const double effective_force_norm = row.effective_force.Length();
+        const double effective_torque_norm = row.effective_torque.Length();
+        const double resultant_line_offset =
+            effective_force_norm > 1.0e-30 ? effective_torque_norm / effective_force_norm : 0.0;
+        const double closure_ratio =
+            effective_force_norm * row.max_moment_arm > 1.0e-30 ?
+                effective_torque_norm / (effective_force_norm * row.max_moment_arm) :
+                0.0;
+        out << time << "," << backend << "," << row.patch_id << "," << row.active_samples << ","
+            << row.area_sum << "," << row.weight_sum << "," << row.min_gap << "," << row.max_penetration << ","
+            << row.lambda_n_sum << "," << row.lambda_force_sum << "," << row.raw_force.x() << ","
+            << row.raw_force.y() << "," << row.raw_force.z() << "," << row.raw_force.Length() << ","
+            << row.weighted_force.x() << "," << row.weighted_force.y() << "," << row.weighted_force.z() << ","
+            << row.weighted_force.Length() << "," << row.effective_force.x() << "," << row.effective_force.y()
+            << "," << row.effective_force.z() << "," << effective_force_norm << "," << row.raw_torque.x() << ","
+            << row.raw_torque.y() << "," << row.raw_torque.z() << "," << row.raw_torque.Length() << ","
+            << row.weighted_torque.x() << "," << row.weighted_torque.y() << "," << row.weighted_torque.z() << ","
+            << row.weighted_torque.Length() << "," << row.effective_torque.x() << "," << row.effective_torque.y()
+            << "," << row.effective_torque.z() << "," << effective_torque_norm << "," << resultant_line_offset
+            << "," << closure_ratio << "," << row.effective_center.x() << "," << row.effective_center.y() << ","
+            << row.effective_center.z() << "," << row.max_moment_arm
+            << ",patch_id=-1 is the global sum; raw uses descriptor multiplier/intensity; weighted uses lambda_force "
+               "from the backend sample force scale; effective follows the force actually applied to the Chrono "
+               "residual\n";
+    }
+}
+
+double SampleRevClearancePhi(const ChOpenVdbSdfGrid& bore_sdf,
+                             const ChSdfContactSurfaceGraph& pin_graph,
+                             const std::shared_ptr<ChBodyAuxRef>& body1,
+                             const std::shared_ptr<ChBodyAuxRef>& body3,
+                             int sample_id) {
+    const auto& sample = pin_graph.samples.at(static_cast<size_t>(sample_id));
+    const auto& body1_ref = body1->GetFrameRefToAbs();
+    const auto& body3_ref = body3->GetFrameRefToAbs();
+    const ChVector3d world_pos = body3_ref.TransformPointLocalToParent(sample.local_pos);
+    const ChVector3d body1_local = body1_ref.TransformPointParentToLocal(world_pos);
+    return bore_sdf.SamplePhi(body1_local);
+}
+
+double MinRevClearanceGap(const ChOpenVdbSdfGrid& bore_sdf,
+                          const ChSdfContactSurfaceGraph& pin_graph,
+                          const std::shared_ptr<ChBodyAuxRef>& body1,
+                          const std::shared_ptr<ChBodyAuxRef>& body3) {
+    double min_gap = std::numeric_limits<double>::max();
+    for (const auto& sample : pin_graph.samples) {
+        if (sample.area <= 0.0) {
+            continue;
+        }
+        min_gap = std::min(min_gap, SampleRevClearancePhi(bore_sdf, pin_graph, body1, body3, sample.id));
+    }
+    return min_gap;
+}
+
+std::vector<ChSdfNcpDescriptorContact> BuildRevClearanceDescriptorContacts(
+    const std::shared_ptr<ChBodyAuxRef>& body1,
+    const std::shared_ptr<ChBodyAuxRef>& body3,
+    const ChOpenVdbSdfGrid& bore_sdf,
+    const ChSdfContactSurfaceGraph& pin_graph,
+    const ChSdfContactSampleBvh& pin_bvh,
+    const RevClearanceConfig& config) {
+    struct SamplePhi {
+        int sample_id = -1;
+        double phi = 0.0;
+        double area = 0.0;
+    };
+
+    const auto& body1_ref = body1->GetFrameRefToAbs();
+    const auto& body3_ref = body3->GetFrameRefToAbs();
+
+    auto all_sample_ids = [&]() {
+        std::vector<int> ids;
+        ids.reserve(pin_graph.samples.size());
+        for (const auto& sample : pin_graph.samples) {
+            if (sample.area > 0.0) {
+                ids.push_back(sample.id);
+            }
+        }
+        return ids;
+    };
+
+    std::vector<int> candidate_ids;
+    if (!pin_bvh.Empty() && bore_sdf.local_bounds.IsValid()) {
+        const double padding = std::max(config.max_activation_band, config.activation_band) +
+                               8.0 * std::max(config.voxel_size, 1.0e-12);
+        const ChSdfAabb padded = ExpandedAabb(bore_sdf.local_bounds, padding);
+        ChSdfAabb query_bounds;
+        for (const auto& corner : AabbCorners(padded)) {
+            const ChVector3d world = body1_ref.TransformPointLocalToParent(corner);
+            query_bounds.Include(body3_ref.TransformPointParentToLocal(world));
+        }
+        candidate_ids = pin_bvh.Query(query_bounds);
+        std::sort(candidate_ids.begin(), candidate_ids.end());
+        candidate_ids.erase(std::unique(candidate_ids.begin(), candidate_ids.end()), candidate_ids.end());
+    } else {
+        candidate_ids = all_sample_ids();
+    }
+
+    if (candidate_ids.empty()) {
+        return {};
+    }
+
+    std::vector<SamplePhi> sampled;
+    sampled.reserve(candidate_ids.size());
+    auto collect_sampled = [&](const std::vector<int>& ids, double& min_phi) {
+        sampled.clear();
+        min_phi = std::numeric_limits<double>::max();
+        for (int sample_id : ids) {
+            if (sample_id < 0 || sample_id >= static_cast<int>(pin_graph.samples.size())) {
+                continue;
+            }
+            const auto& sample = pin_graph.samples[static_cast<size_t>(sample_id)];
+            if (sample.area <= 0.0) {
+                continue;
+            }
+            const double phi = SampleRevClearancePhi(bore_sdf, pin_graph, body1, body3, sample.id);
+            sampled.push_back(SamplePhi{sample.id, phi, sample.area});
+            min_phi = std::min(min_phi, phi);
+        }
+    };
+
+    double min_phi = std::numeric_limits<double>::max();
+    collect_sampled(candidate_ids, min_phi);
+    if (sampled.empty() || min_phi > std::max(config.activation_band, config.max_activation_band)) {
+        return {};
+    }
+
+    std::vector<int> active;
+    auto build_active = [&]() {
+        active.clear();
+        double band = std::max(config.activation_band, 0.0);
+        const double band_limit = std::max(band, config.max_activation_band);
+        for (;;) {
+            active.clear();
+            const double threshold = config.use_absolute_active_band ? std::max(band_limit, min_phi + band) :
+                                                                       min_phi + band;
+            for (const auto& item : sampled) {
+                if (item.phi <= threshold) {
+                    active.push_back(item.sample_id);
+                }
+            }
+            if (static_cast<int>(active.size()) >= std::max(1, config.min_patch_samples) || band >= band_limit) {
+                break;
+            }
+            band = std::min(band_limit, std::max(2.0 * band, band + 1.0e-12));
+        }
+    };
+    build_active();
+
+    if (active.size() < static_cast<size_t>(std::max(1, config.min_patch_samples)) &&
+        candidate_ids.size() < pin_graph.samples.size()) {
+        candidate_ids = all_sample_ids();
+        collect_sampled(candidate_ids, min_phi);
+        build_active();
+    }
+
+    const auto components = pin_graph.FindConnectedComponents(active);
+    std::vector<int> patch_ids(pin_graph.samples.size(), -1);
+    std::vector<double> patch_areas(components.size(), 0.0);
+    std::vector<int> flattened;
+    flattened.reserve(active.size());
+    for (size_t patch = 0; patch < components.size(); patch++) {
+        for (int sample_id : components[patch]) {
+            if (sample_id >= 0 && sample_id < static_cast<int>(pin_graph.samples.size())) {
+                patch_ids[static_cast<size_t>(sample_id)] = static_cast<int>(patch);
+                patch_areas[patch] += std::max(0.0, pin_graph.samples[static_cast<size_t>(sample_id)].area);
+            }
+        }
+        flattened.insert(flattened.end(), components[patch].begin(), components[patch].end());
+    }
+
+    double total_area = 0.0;
+    for (int sample_id : flattened) {
+        if (sample_id >= 0 && sample_id < static_cast<int>(pin_graph.samples.size())) {
+            total_area += std::max(0.0, pin_graph.samples[static_cast<size_t>(sample_id)].area);
+        }
+    }
+    const double uniform_weight = flattened.empty() ? 0.0 : 1.0 / static_cast<double>(flattened.size());
+
+    std::vector<ChSdfNcpDescriptorContact> contacts;
+    contacts.reserve(flattened.size());
+    for (int sample_id : flattened) {
+        if (sample_id < 0 || sample_id >= static_cast<int>(pin_graph.samples.size())) {
+            continue;
+        }
+        const auto& sample = pin_graph.samples[static_cast<size_t>(sample_id)];
+        const ChVector3d world_pos = body3_ref.TransformPointLocalToParent(sample.local_pos);
+        const ChVector3d body1_local = body1_ref.TransformPointParentToLocal(world_pos);
+        const auto query = bore_sdf.QueryLocal(body1_local);
+        ChSdfNcpDescriptorContact contact;
+        contact.body_a = body3;
+        contact.body_b = body1;
+        contact.point_abs = world_pos;
+        contact.normal_abs = body1_ref.TransformDirectionLocalToParent(query.grad).GetNormalized();
+        contact.gap = query.phi;
+        contact.weight = total_area > 1.0e-30 ? std::max(0.0, sample.area) / total_area : uniform_weight;
+        contact.area = std::max(0.0, sample.area);
+        const int patch_id = sample_id >= 0 && sample_id < static_cast<int>(patch_ids.size()) ?
+                                 patch_ids[static_cast<size_t>(sample_id)] :
+                                 -1;
+        contact.patch_id = patch_id;
+        contact.patch_area = patch_id >= 0 && patch_id < static_cast<int>(patch_areas.size()) ?
+                                 patch_areas[static_cast<size_t>(patch_id)] :
+                                 0.0;
+        contact.contact_id = sample_id;
+        contacts.push_back(contact);
+    }
+    return contacts;
+}
+
+std::vector<ChSdfNcpDescriptorContact> BuildRevClearanceDirectionalContacts(
+    const std::shared_ptr<ChBodyAuxRef>& source_body,
+    const std::shared_ptr<ChBodyAuxRef>& target_body,
+    const ChOpenVdbSdfGrid& target_sdf,
+    const ChSdfContactSurfaceGraph& source_graph,
+    const ChSdfContactSampleBvh& source_bvh,
+    const RevClearanceConfig& config,
+    int contact_id_offset,
+    int patch_id_offset) {
+    struct SamplePhi {
+        int sample_id = -1;
+        double phi = 0.0;
+        double area = 0.0;
+        ChVector3d world_pos = ChVector3d(0, 0, 0);
+        ChVector3d normal_world = ChVector3d(0, 1, 0);
+    };
+
+    const auto& source_ref = source_body->GetFrameRefToAbs();
+    const auto& target_ref = target_body->GetFrameRefToAbs();
+
+    auto all_sample_ids = [&]() {
+        std::vector<int> ids;
+        ids.reserve(source_graph.samples.size());
+        for (const auto& sample : source_graph.samples) {
+            if (sample.area > 0.0) {
+                ids.push_back(sample.id);
+            }
+        }
+        return ids;
+    };
+
+    std::vector<int> candidate_ids;
+    if (!source_bvh.Empty() && target_sdf.local_bounds.IsValid()) {
+        const double padding = std::max(config.max_activation_band, config.activation_band) +
+                               8.0 * std::max(config.voxel_size, 1.0e-12);
+        const ChSdfAabb padded = ExpandedAabb(target_sdf.local_bounds, padding);
+        ChSdfAabb query_bounds;
+        for (const auto& corner : AabbCorners(padded)) {
+            const ChVector3d world = target_ref.TransformPointLocalToParent(corner);
+            query_bounds.Include(source_ref.TransformPointParentToLocal(world));
+        }
+        candidate_ids = source_bvh.Query(query_bounds);
+        std::sort(candidate_ids.begin(), candidate_ids.end());
+        candidate_ids.erase(std::unique(candidate_ids.begin(), candidate_ids.end()), candidate_ids.end());
+    } else {
+        candidate_ids = all_sample_ids();
+    }
+    if (candidate_ids.empty()) {
+        return {};
+    }
+
+    std::vector<SamplePhi> sampled;
+    sampled.reserve(candidate_ids.size());
+    auto collect_sampled = [&](const std::vector<int>& ids, double& min_phi) {
+        sampled.clear();
+        min_phi = std::numeric_limits<double>::max();
+        for (int sample_id : ids) {
+            if (sample_id < 0 || sample_id >= static_cast<int>(source_graph.samples.size())) {
+                continue;
+            }
+            const auto& sample = source_graph.samples[static_cast<size_t>(sample_id)];
+            if (sample.area <= 0.0) {
+                continue;
+            }
+            const ChVector3d world_pos = source_ref.TransformPointLocalToParent(sample.local_pos);
+            const ChVector3d target_local = target_ref.TransformPointParentToLocal(world_pos);
+            const auto query = target_sdf.QueryLocal(target_local);
+            sampled.push_back(SamplePhi{
+                sample.id,
+                query.phi,
+                sample.area,
+                world_pos,
+                target_ref.TransformDirectionLocalToParent(query.grad).GetNormalized()});
+            min_phi = std::min(min_phi, query.phi);
+        }
+    };
+
+    double min_phi = std::numeric_limits<double>::max();
+    collect_sampled(candidate_ids, min_phi);
+    if (sampled.empty() || min_phi > std::max(config.activation_band, config.max_activation_band)) {
+        return {};
+    }
+
+    std::vector<int> active;
+    auto build_active = [&]() {
+        active.clear();
+        double band = std::max(config.activation_band, 0.0);
+        const double band_limit = std::max(band, config.max_activation_band);
+        for (;;) {
+            active.clear();
+            const double threshold = config.use_absolute_active_band ? std::max(band_limit, min_phi + band) :
+                                                                       min_phi + band;
+            for (const auto& item : sampled) {
+                if (item.phi <= threshold) {
+                    active.push_back(item.sample_id);
+                }
+            }
+            if (static_cast<int>(active.size()) >= std::max(1, config.min_patch_samples) || band >= band_limit) {
+                break;
+            }
+            band = std::min(band_limit, std::max(2.0 * band, band + 1.0e-12));
+        }
+    };
+    build_active();
+    if (active.size() < static_cast<size_t>(std::max(1, config.min_patch_samples)) &&
+        candidate_ids.size() < source_graph.samples.size()) {
+        candidate_ids = all_sample_ids();
+        collect_sampled(candidate_ids, min_phi);
+        build_active();
+    }
+
+    const auto components = source_graph.FindConnectedComponents(active);
+    std::vector<int> patch_ids(source_graph.samples.size(), -1);
+    std::vector<double> patch_areas(components.size(), 0.0);
+    std::vector<int> flattened;
+    flattened.reserve(active.size());
+    for (size_t patch = 0; patch < components.size(); patch++) {
+        for (int sample_id : components[patch]) {
+            if (sample_id >= 0 && sample_id < static_cast<int>(source_graph.samples.size())) {
+                patch_ids[static_cast<size_t>(sample_id)] = patch_id_offset + static_cast<int>(patch);
+                patch_areas[patch] += std::max(0.0, source_graph.samples[static_cast<size_t>(sample_id)].area);
+            }
+        }
+        flattened.insert(flattened.end(), components[patch].begin(), components[patch].end());
+    }
+
+    std::map<int, SamplePhi> by_id;
+    for (const auto& item : sampled) {
+        by_id[item.sample_id] = item;
+    }
+
+    std::vector<ChSdfNcpDescriptorContact> contacts;
+    contacts.reserve(flattened.size());
+    for (int sample_id : flattened) {
+        if (sample_id < 0 || sample_id >= static_cast<int>(source_graph.samples.size())) {
+            continue;
+        }
+        const auto found = by_id.find(sample_id);
+        if (found == by_id.end()) {
+            continue;
+        }
+        const auto& sample = source_graph.samples[static_cast<size_t>(sample_id)];
+        const auto& item = found->second;
+        const int patch_id = patch_ids[static_cast<size_t>(sample_id)];
+        const int patch_index = patch_id - patch_id_offset;
+        ChSdfNcpDescriptorContact contact;
+        contact.body_a = source_body;
+        contact.body_b = target_body;
+        contact.point_abs = item.world_pos;
+        contact.normal_abs = item.normal_world;
+        contact.gap = item.phi;
+        contact.weight = std::max(0.0, sample.area);
+        contact.area = std::max(0.0, sample.area);
+        contact.patch_id = patch_id;
+        contact.patch_area =
+            patch_index >= 0 && patch_index < static_cast<int>(patch_areas.size()) ? patch_areas[patch_index] : 0.0;
+        contact.contact_id = contact_id_offset + sample_id;
+        contacts.push_back(contact);
+    }
+    return contacts;
+}
+
+std::vector<ChSdfNcpDescriptorContact> BuildRevClearanceBidirectionalDescriptorContacts(
+    const std::shared_ptr<ChBodyAuxRef>& body1,
+    const std::shared_ptr<ChBodyAuxRef>& body3,
+    const ChOpenVdbSdfGrid& bore_sdf,
+    const ChOpenVdbSdfGrid& pin_sdf,
+    const ChSdfContactSurfaceGraph& bore_graph,
+    const ChSdfContactSurfaceGraph& pin_graph,
+    const ChSdfContactSampleBvh& bore_bvh,
+    const ChSdfContactSampleBvh& pin_bvh,
+    const RevClearanceConfig& config) {
+    auto contacts =
+        BuildRevClearanceDirectionalContacts(body3, body1, bore_sdf, pin_graph, pin_bvh, config, 0, 0);
+    auto reverse =
+        BuildRevClearanceDirectionalContacts(body1, body3, pin_sdf, bore_graph, bore_bvh, config, 1000000, 1000000);
+    contacts.insert(contacts.end(), reverse.begin(), reverse.end());
+    return contacts;
+}
+
+int RunRevJointClearanceCase(const RevClearanceRunOptions& options) {
+    const auto start = std::chrono::steady_clock::now();
+    const auto root = GetProjectRoot();
+    const auto asset_dir = root / "assets" / "rev_joint_clearance";
+    const auto out_dir = root / "results" / "sdf_ncp_benchmarks" / options.case_name;
+    std::filesystem::create_directories(out_dir);
+
+    RevClearanceConfig config;
+    config.case_name = options.case_name;
+    const std::string model_json = ReadTextFile(asset_dir / "rev_joint_clearance_model.json");
+    config.dt = ExtractJsonDouble(model_json, "step_size", config.dt);
+    config.t_end = ExtractJsonDouble(model_json, "total_time", config.t_end);
+    config.max_activation_band = ExtractJsonDouble(model_json, "collision_envelope", config.max_activation_band);
+    config.pressure_compliance = ExtractJsonDouble(model_json, "contact_compliance", config.pressure_compliance);
+    if (options.t_end_override > 0.0) {
+        config.t_end = options.t_end_override;
+    }
+    if (options.dt_override > 0.0) {
+        config.dt = options.dt_override;
+    }
+
+    openvdb::initialize();
+    const RmdModel rmd = LoadRecurDynRmdModel(asset_dir / "rev_clearance_joint.rmd");
+    WriteRmdMappingAudit(out_dir / "rmd_mapping.csv", rmd);
+
+    const RmdPart& body1_part = RequirePartByName(rmd, "Body1");
+    const RmdPart& body2_part = RequirePartByName(rmd, "Body2");
+    const RmdPart& body3_part = RequirePartByName(rmd, "Body3");
+    const RmdMarker& body1_cm = RequireMarkerById(rmd, body1_part.cm_marker_id);
+    const RmdMarker& body2_cm = RequireMarkerById(rmd, body2_part.cm_marker_id);
+    const RmdMarker& body3_cm = RequireMarkerById(rmd, body3_part.cm_marker_id);
+    const RmdJoint& fixed1 = RequireJointByName(rmd, "Fixed1");
+    const RmdJoint& fixed2 = RequireJointByName(rmd, "Fixed2");
+    const RmdSolidContact& contact_law = RequireSolidContactByName(rmd, "GeoSurContact1");
+    const RmdMarker& body3_fixed_marker = RequireMarkerById(rmd, fixed2.i_marker_id);
+    const RmdMarker& body2_fixed_marker = RequireMarkerById(rmd, fixed2.j_marker_id);
+    const RmdMarker& action_marker = RequireMarkerById(rmd, contact_law.i_float_marker_id);
+    const ChVector3d body2_cm_local_in_body3 =
+        body3_fixed_marker.qp +
+        body3_fixed_marker.rotation * (Transpose(body2_fixed_marker.rotation) * (body2_cm.qp - body2_fixed_marker.qp));
+
+    ChSdfTriangleMeshData bore_mesh =
+        LoadWavefrontMeshForSdf(asset_dir / "models" / "body1_subtract1_centered.obj");
+    ChSdfTriangleMeshData pin_mesh =
+        LoadWavefrontMeshForSdf(asset_dir / "models" / "body3_cylinder1_centered.obj");
+    ChOpenVdbSdfGrid bore_sdf = BuildOpenVdbLevelSetFromMesh(
+        bore_mesh, config.voxel_size, config.half_width_voxels);
+    ChOpenVdbSdfGrid pin_sdf = BuildOpenVdbLevelSetFromMesh(
+        pin_mesh, config.voxel_size, config.half_width_voxels);
+    ChSdfContactSurfaceGraph bore_graph = MakeSurfaceGraphFromMeshForSdf(bore_mesh);
+    ChSdfContactSurfaceGraph pin_graph = MakeSurfaceGraphFromMeshForSdf(pin_mesh);
+    ChSdfContactSampleBvh bore_bvh(bore_graph);
+    ChSdfContactSampleBvh pin_bvh(pin_graph);
+
+    const auto body2_reference = LoadRevClearanceReference(asset_dir / "data" / "body2.csv");
+    const auto body3_reference = LoadRevClearanceReference(asset_dir / "data" / "body3.csv");
+    if (body2_reference.empty() || body3_reference.empty()) {
+        throw std::runtime_error("rev_joint_clearance reference CSV files are empty.");
+    }
+    const auto ideal_wrench_reference = LoadRevClearanceIdealWrench(
+        root / "results" / "sdf_ncp_benchmarks" / "rev_joint_clearance_ideal_revolute" / "joint_reaction_wrench.csv");
+
+    ChSystemNSC sys;
+    sys.SetGravitationalAcceleration(rmd.gravity);
+    sys.SetSolverType(ChSolver::Type::PSOR);
+    sys.GetSolver()->AsIterative()->SetMaxIterations(300);
+    sys.GetSolver()->AsIterative()->SetTolerance(1.0e-8);
+    sys.SetMaxPenetrationRecoverySpeed(0.5);
+    ConfigureRevClearanceTimestepper(sys, options);
+
+    auto ground = chrono_types::make_shared<ChBody>();
+    ground->SetFixed(true);
+    sys.AddBody(ground);
+
+    auto body1 = chrono_types::make_shared<ChBodyAuxRef>();
+    ConfigureAuxRefBodyFromRmdPart(rmd, body1_part, body1_cm, body1);
+    sys.AddBody(body1);
+
+    auto body2 = chrono_types::make_shared<ChBodyAuxRef>();
+    ConfigureAuxRefBodyFromRmdPart(rmd, body2_part, body2_cm, body2);
+    sys.AddBody(body2);
+
+    auto body3 = chrono_types::make_shared<ChBodyAuxRef>();
+    ConfigureAuxRefBodyFromRmdPart(rmd, body3_part, body3_cm, body3);
+    sys.AddBody(body3);
+
+    auto fixed1_link = chrono_types::make_shared<ChLinkMateGeneric>(true, true, true, true, true, true);
+    fixed1_link->SetName("Fixed1");
+    fixed1_link->Initialize(body1, ground, RmdMarkerFrameAbs(rmd, RequireMarkerById(rmd, fixed1.i_marker_id)));
+    sys.AddLink(fixed1_link);
+
+    auto fixed2_link = chrono_types::make_shared<ChLinkMateGeneric>(true, true, true, true, true, true);
+    fixed2_link->SetName("Fixed2");
+    fixed2_link->Initialize(body3, body2, RmdMarkerFrameAbs(rmd, RequireMarkerById(rmd, fixed2.i_marker_id)));
+    sys.AddLink(fixed2_link);
+
+    auto manifold_manager = chrono_types::make_shared<ChSdfContactManifoldManager>();
+    ChSdfContactManifoldManager::Settings manifold_settings;
+    manifold_settings.dt = config.dt;
+    manifold_settings.gap_on = contact_law.bpen;
+    manifold_settings.gap_off = config.max_activation_band;
+    manifold_settings.lambda_hold_force = 1.0e-8;
+    manifold_settings.patch_overlap_threshold = 0.20;
+    manifold_settings.release_steps = 1;
+    manifold_settings.use_prediction = options.manifold_use_prediction;
+    manifold_settings.cleanup_opening_gap = true;
+    manifold_manager->SetSettings(manifold_settings);
+
+    auto generator = [body1,
+                      body3,
+                      &bore_sdf,
+                      &pin_sdf,
+                      &bore_graph,
+                      &pin_graph,
+                      &bore_bvh,
+                      &pin_bvh,
+                      config,
+                      manifold_manager,
+                      bidirectional_contact = options.bidirectional_contact,
+                      use_manifold = !(options.use_recurdyn_ggeomcontact_law ||
+                                       options.local_patch_pressure_solve)]() {
+        auto contacts = bidirectional_contact ?
+                            BuildRevClearanceBidirectionalDescriptorContacts(body1,
+                                                                            body3,
+                                                                            bore_sdf,
+                                                                            pin_sdf,
+                                                                            bore_graph,
+                                                                            pin_graph,
+                                                                            bore_bvh,
+                                                                            pin_bvh,
+                                                                            config) :
+                            BuildRevClearanceDescriptorContacts(body1, body3, bore_sdf, pin_graph, pin_bvh, config);
+        return use_manifold ? manifold_manager->Update(contacts) : contacts;
+    };
+
+    std::shared_ptr<ChSdfNcpConstraintContactSet> contact_item;
+    std::shared_ptr<ChSdfPenaltyContactForceSet> penalty_item;
+    std::shared_ptr<ChSdfLocalPatchPressureContactForceSet> local_patch_item;
+    if (options.use_recurdyn_ggeomcontact_law) {
+        RecurDynSolidContactLaw law;
+        law.stiffness = contact_law.stiffness;
+        law.damping = contact_law.damping;
+        law.exponent = contact_law.korder > 0.0 ? contact_law.korder : 1.0;
+        law.boundary_penetration = contact_law.bpen;
+        law.rebound_damping_factor = contact_law.rdf;
+        law.dynamic_friction_coefficient = contact_law.dynamic_friction_coefficient;
+        law.static_transition_velocity = contact_law.static_transition_velocity;
+        law.dynamic_transition_velocity = contact_law.dynamic_transition_velocity;
+        law.static_friction_coefficient = contact_law.static_friction_coefficient;
+        penalty_item = chrono_types::make_shared<ChSdfPenaltyContactForceSet>();
+        penalty_item->SetContactLaw(law);
+        penalty_item->SetContactGenerator(generator);
+        sys.Add(penalty_item);
+    } else if (options.local_patch_pressure_solve) {
+        local_patch_item = chrono_types::make_shared<ChSdfLocalPatchPressureContactForceSet>();
+        local_patch_item->SetSmoothingEps(config.eps);
+        local_patch_item->SetTimeStep(config.dt);
+        local_patch_item->SetActiveSetPolicy(contact_law.bpen, config.max_activation_band);
+        const double local_pressure_compliance =
+            std::max(1.0e-12, options.local_patch_pressure_compliance_scale * config.pressure_compliance);
+        local_patch_item->SetPressureSolveParameters(local_pressure_compliance,
+                                                     0.25 * local_pressure_compliance,
+                                                     std::max(contact_law.bpen, 1.0e-6),
+                                                     std::max(1.0e5, std::max(contact_law.bpen, 1.0e-6) /
+                                                                               local_pressure_compliance));
+        local_patch_item->SetVelocityLevelDelassusMode(options.local_patch_delassus, 0.2, 1.0);
+        local_patch_item->SetPatchWrenchClosureMode(options.local_patch_wrench_closure,
+                                                    options.local_patch_wrench_force_weight,
+                                                    options.local_patch_wrench_torque_weight,
+                                                    options.local_patch_wrench_regularization,
+                                                    8,
+                                                    options.local_patch_integrated_wrench_closure);
+        if (options.local_patch_global_wrench_demand) {
+            local_patch_item->SetPatchWrenchDemandProvider(
+                [ideal_wrench_reference](double time,
+                                          const ChVector3d&,
+                                          ChVector3d& target_force,
+                                          ChVector3d& target_torque) {
+                    if (ideal_wrench_reference.empty()) {
+                        return false;
+                    }
+                    const auto demand = InterpolateRevClearanceIdealWrench(ideal_wrench_reference, time);
+                    target_force = demand.force;
+                    target_torque = demand.torque_about_body_ref;
+                    return true;
+                });
+        }
+        local_patch_item->SetContactGenerator(generator);
+        sys.Add(local_patch_item);
+    } else {
+        contact_item = chrono_types::make_shared<ChSdfNcpConstraintContactSet>(
+            static_cast<size_t>(std::max(1, config.max_contacts)));
+        contact_item->SetSmoothingEps(config.eps);
+        contact_item->SetRecoveryClamp(config.max_activation_band);
+        contact_item->SetPressureCompliance(config.pressure_compliance);
+        contact_item->SetDescriptorVelocityLevelNcp(options.descriptor_velocity_level_ncp,
+                                                    config.dt,
+                                                    options.descriptor_velocity_baumgarte,
+                                                    options.descriptor_velocity_rhs_scale);
+        contact_item->SetActiveSetPolicy(false, config.dt, contact_law.bpen, config.max_activation_band, true);
+        contact_item->SetPatchPressureAggregation(options.patch_pressure_aggregation);
+        const bool descriptor_block_solve =
+            options.descriptor_patch_projection || options.descriptor_patch_delassus_solve;
+        const double descriptor_block_strength =
+            options.descriptor_patch_delassus_solve ? 1.0 : options.descriptor_patch_projection_strength;
+        contact_item->SetPatchPressureProjection(descriptor_block_solve, descriptor_block_strength, 0.0, true);
+        contact_item->SetPatchBlockLaplacianCompliance(
+            options.descriptor_patch_delassus_solve ?
+                options.descriptor_patch_laplacian_compliance_scale * config.pressure_compliance :
+                0.0);
+        contact_item->SetPatchBlockWrenchClosureStrength(options.descriptor_patch_wrench_closure_strength);
+        contact_item->SetContactGenerator(generator);
+        sys.Add(contact_item);
+    }
+
+    std::ofstream trajectory(out_dir / "trajectory.csv");
+    std::ofstream comparison(out_dir / "comparison.csv");
+    std::ofstream reference_timeseries(out_dir / "recurdyn_reference_comparison_timeseries.csv");
+    std::ofstream kinematic_diagnostics(out_dir / "recurdyn_chrono_kinematic_diagnostics.csv");
+    std::ofstream patch_moment_diagnostics(out_dir / "contact_patch_moment_diagnostics.csv");
+    std::ofstream manifold_diagnostics(out_dir / "contact_manifold_diagnostics.csv");
+    std::ofstream wrench_alignment(out_dir / "wrench_alignment.csv");
+    trajectory << std::setprecision(17);
+    comparison << std::setprecision(17);
+    reference_timeseries << std::setprecision(17);
+    kinematic_diagnostics << std::setprecision(17);
+    patch_moment_diagnostics << std::setprecision(17);
+    manifold_diagnostics << std::setprecision(17);
+    wrench_alignment << std::setprecision(17);
+    WriteTrajectoryHeader(trajectory);
+    comparison << "case_name,metric,field_contact_value,sdf_ncp_value,absolute_difference,relative_difference,notes\n";
+    WriteRevClearancePatchMomentHeader(patch_moment_diagnostics);
+    manifold_diagnostics
+        << "time,candidate_count,active_count,patch_count,reused_patch_count,new_patch_count,"
+           "released_sample_count,active_area,open_positive_lambda_rows,open_positive_lambda_force_sum,"
+           "open_positive_lambda_force_max\n";
+    wrench_alignment
+        << "time,has_ideal_reference,sdf_force_x,sdf_force_y,sdf_force_z,sdf_force_norm,"
+           "sdf_torque_x,sdf_torque_y,sdf_torque_z,sdf_torque_norm,"
+           "ideal_force_x,ideal_force_y,ideal_force_z,ideal_force_norm,"
+           "ideal_torque_x,ideal_torque_y,ideal_torque_z,ideal_torque_norm,"
+           "force_error_x,force_error_y,force_error_z,force_error_norm,"
+           "torque_error_x,torque_error_y,torque_error_z,torque_error_norm,"
+           "force_cosine,torque_cosine,active_contacts,notes\n";
+    reference_timeseries
+        << "time,body2_x_ref,body2_y_ref,body2_z_ref,body2_x_sdf_ncp,body2_y_sdf_ncp,body2_z_sdf_ncp,"
+           "body2_y_error,body2_z_error,body3_x_ref,body3_y_ref,body3_z_ref,body3_x_sdf_ncp,body3_y_sdf_ncp,"
+           "body3_z_sdf_ncp,body3_y_error,body3_z_error,min_gap,max_penetration,success\n";
+    kinematic_diagnostics
+        << "time,body3_ref_x,body3_ref_y,body3_ref_z,body3_sim_x,body3_sim_y,body3_sim_z,"
+           "body3_q0_sim,body3_q1_sim,body3_q2_sim,body3_q3_sim,body3_wx_sim,body3_wy_sim,body3_wz_sim,"
+           "rel_ref_x,rel_ref_y,rel_ref_z,rel_sim_x,rel_sim_y,rel_sim_z,rel_ref_norm,rel_sim_norm,"
+           "rel_vector_angle_error_rad,rel_vector_angle_error_deg,"
+           "body3_axis_ref_proxy_x,body3_axis_ref_proxy_y,body3_axis_ref_proxy_z,"
+           "body3_axis_sim_x,body3_axis_sim_y,body3_axis_sim_z,"
+           "action_marker_sim_x,action_marker_sim_y,action_marker_sim_z,"
+           "action_marker_ref_proxy_x,action_marker_ref_proxy_y,action_marker_ref_proxy_z,"
+           "contact_center_x,contact_center_y,contact_center_z,"
+           "contact_force_x,contact_force_y,contact_force_z,contact_force_norm,"
+           "contact_torque_world_x,contact_torque_world_y,contact_torque_world_z,contact_torque_norm,"
+           "active_contact_count,min_gap,max_penetration,success,notes\n";
+
+    const int steps = static_cast<int>(std::round(config.t_end / config.dt));
+    BenchmarkStats stats;
+    stats.case_name = config.case_name;
+    stats.method = options.use_recurdyn_ggeomcontact_law ?
+                       "recurdyn_ggeomcontact_sdf" :
+                       (options.local_patch_pressure_solve ?
+                            (options.local_patch_wrench_closure ?
+                                 (options.local_patch_global_wrench_demand ?
+                                      (options.local_patch_delassus ?
+                                           "sdf_ncp_local_patch_delassus_global_wrench_demand" :
+                                           "sdf_ncp_local_patch_pressure_global_wrench_demand") :
+                                  options.local_patch_integrated_wrench_closure ?
+                                      (options.local_patch_delassus ?
+                                           "sdf_ncp_local_patch_delassus_augmented_wrench_closure" :
+                                           "sdf_ncp_local_patch_pressure_augmented_wrench_closure") :
+                                      (options.local_patch_delassus ? "sdf_ncp_local_patch_delassus_wrench_closure" :
+                                                                      "sdf_ncp_local_patch_pressure_wrench_closure")) :
+                                 (options.local_patch_delassus ? "sdf_ncp_local_patch_delassus_solve" :
+                                                                 "sdf_ncp_local_patch_pressure_solve")) :
+                            (options.descriptor_patch_delassus_solve ? "sdf_ncp_descriptor_patch_delassus_block" :
+                                                                       "sdf_ncp"));
+    stats.asset = config.asset;
+    stats.dt = config.dt;
+    stats.t_end = config.t_end;
+    stats.num_steps = steps;
+    if (!options.use_recurdyn_ggeomcontact_law && !options.local_patch_pressure_solve &&
+        options.descriptor_velocity_level_ncp) {
+        stats.method = options.descriptor_patch_delassus_solve ?
+                           "sdf_ncp_descriptor_velocity_patch_delassus_block" :
+                           "sdf_ncp_descriptor_velocity_level";
+    }
+    if (options.use_recurdyn_ggeomcontact_law) {
+        stats.notes =
+            "full rev_joint_clearance RMD/OBJ/OpenVDB frontend; Body1 fixed; Body2-Body3 fixed joint; "
+            "Body3.Cylinder1 surface samples query Body1.Subtract1 SDF; AABB BVH broad phase; "
+            "RecurDyn GGEOMCONTACT K/C/KORDER/BPEN penalty-damping calibration path with penetration-only force "
+            "and BPEN damping ramp";
+    } else if (options.local_patch_pressure_solve) {
+        stats.notes =
+            "full rev_joint_clearance RMD/OBJ/OpenVDB frontend; Body1 fixed; Body2-Body3 fixed joint; "
+            "Body3.Cylinder1 surface samples query Body1.Subtract1 SDF; AABB BVH broad phase; "
+            "experimental local patch pressure solve force path; sample pressure unknowns are coupled by "
+            "an area-weighted normalized graph Laplacian";
+        if (options.local_patch_delassus) {
+            stats.notes += "; velocity-level effective-mass Delassus matrix W=J M^-1 J^T enters the local FB Jacobian";
+        } else {
+            stats.notes += "; geometric pressure compliance enters the local FB Jacobian";
+        }
+        if (options.local_patch_wrench_closure) {
+            if (options.local_patch_global_wrench_demand) {
+                stats.notes +=
+                    "; diagnostic global wrench demand mode redistributes nonnegative sample pressures to match the "
+                    "Chrono ideal revolute Body3 reaction wrench; the demand is diagnostic and is not a production "
+                    "SDF-NCP closure";
+            } else {
+                stats.notes +=
+                    "; patch wrench closure preserves the FB-computed patch resultant force while minimizing free torque "
+                    "about the patch area centroid with nonnegative sample pressure";
+            }
+        }
+    } else {
+        stats.notes =
+            "full rev_joint_clearance RMD/OBJ/OpenVDB frontend; Body1 fixed; Body2-Body3 fixed joint; "
+            "Body3.Cylinder1 surface samples query Body1.Subtract1 SDF; AABB BVH broad phase; "
+            "frictionless SDF-NCP descriptor contact path; descriptor active-set policy filters broad-band candidates by "
+            "gap/gap-rate prediction and persistent contact_id hysteresis; lambda_n is local sample pressure/intensity";
+    }
+    if (!options.use_recurdyn_ggeomcontact_law && options.patch_pressure_aggregation) {
+        stats.notes +=
+            "; experimental patch pressure aggregation uses one coupled pressure unknown per connected active patch";
+    }
+    if (!options.use_recurdyn_ggeomcontact_law && options.descriptor_patch_projection) {
+        stats.notes += "; descriptor patch pressure projection strength=" +
+                       std::to_string(options.descriptor_patch_projection_strength);
+    }
+    if (!options.use_recurdyn_ggeomcontact_law && options.descriptor_patch_delassus_solve) {
+        stats.notes +=
+            "; descriptor-level patch Delassus block solve keeps sample pressure rows in Chrono's global velocity "
+            "descriptor so body velocity, joint constraints, drivers, and patch pressure are iterated together";
+        if (options.descriptor_patch_laplacian_compliance_scale > 0.0) {
+            stats.notes += "; descriptor_patch_laplacian_compliance_scale=" +
+                           std::to_string(options.descriptor_patch_laplacian_compliance_scale);
+        }
+        if (options.descriptor_patch_wrench_closure_strength > 0.0) {
+            stats.notes += "; descriptor_patch_wrench_closure_strength=" +
+                           std::to_string(options.descriptor_patch_wrench_closure_strength);
+        }
+    }
+    if (!options.use_recurdyn_ggeomcontact_law && options.descriptor_velocity_level_ncp) {
+        stats.notes += "; descriptor velocity-level NCP RHS uses v_n + beta min(g,0)/dt with beta=" +
+                       std::to_string(options.descriptor_velocity_baumgarte) +
+                       " and rhs_scale=" + std::to_string(options.descriptor_velocity_rhs_scale);
+    }
+    if (options.bidirectional_contact) {
+        stats.notes += "; bidirectional full-mesh manifold: pin samples query bore SDF and bore samples query pin SDF";
+    }
+    stats.notes += "; timestepper=" + options.timestepper_label;
+    if (options.contact_substepping) {
+        stats.notes += "; contact_substeps=" + std::to_string(options.contact_substeps);
+    }
+    if (options.startup_substepping) {
+        stats.notes += "; startup_substeps=" + std::to_string(options.startup_substeps);
+    }
+    if (options.local_patch_pressure_solve) {
+        stats.notes += "; local_patch_pressure_compliance_scale=" +
+                       std::to_string(options.local_patch_pressure_compliance_scale);
+        if (options.local_patch_wrench_closure) {
+            stats.notes += options.local_patch_integrated_wrench_closure ?
+                               "; local_patch_integrated_wrench_closure=1" :
+                               "; local_patch_wrench_closure=1";
+        }
+    }
+
+    std::vector<double> body2_y_errors;
+    std::vector<double> body2_z_errors;
+    std::vector<double> body3_y_errors;
+    std::vector<double> body3_z_errors;
+    std::vector<double> relative_vector_angle_errors;
+    std::vector<double> wrench_force_error_norms;
+    std::vector<double> wrench_torque_error_norms;
+    std::vector<double> wrench_force_cosines;
+    std::vector<double> wrench_torque_cosines;
+    double max_patch_effective_force_norm = 0.0;
+    double max_patch_effective_torque_norm = 0.0;
+    double max_patch_resultant_line_offset = 0.0;
+    double max_patch_closure_ratio = 0.0;
+    int max_patch_active_samples = 0;
+    auto implicit_stepper = std::dynamic_pointer_cast<ChTimestepperImplicit>(sys.GetTimestepper());
+
+    auto advance_dynamics = [&](double dt) {
+        int substeps = 1;
+        if (options.startup_substepping && sys.GetChTime() < options.startup_time) {
+            substeps = std::max(substeps, std::max(1, options.startup_substeps));
+        }
+        if (options.contact_substepping) {
+            const double min_gap = MinRevClearanceGap(bore_sdf, pin_graph, body1, body3);
+            const double trigger_band = 5.0 * std::max(config.max_activation_band, config.activation_band);
+            if (min_gap < trigger_band) {
+                substeps = std::max(substeps, std::max(1, options.contact_substeps));
+            }
+        }
+        const double h = dt / static_cast<double>(std::max(1, substeps));
+        for (int substep = 0; substep < substeps; substep++) {
+            sys.DoStepDynamics(h);
+        }
+    };
+
+    for (int i = 0; i <= steps; i++) {
+        if (i > 0) {
+            advance_dynamics(config.dt);
+        } else {
+            sys.Setup();
+            sys.Update(UpdateFlags::UPDATE_ALL & ~UpdateFlags::VISUAL_ASSETS);
+        }
+
+        if (contact_item) {
+            contact_item->Update(sys.GetChTime(), UpdateFlags::UPDATE_ALL & ~UpdateFlags::VISUAL_ASSETS);
+        }
+        if (penalty_item) {
+            penalty_item->Update(sys.GetChTime(), UpdateFlags::UPDATE_ALL & ~UpdateFlags::VISUAL_ASSETS);
+        }
+        if (local_patch_item) {
+            local_patch_item->Update(sys.GetChTime(), UpdateFlags::UPDATE_ALL & ~UpdateFlags::VISUAL_ASSETS);
+        }
+        const bool finite_state =
+            std::isfinite(body2->GetPos().y()) && std::isfinite(body3->GetPos().y()) &&
+            std::isfinite(body2->GetPosDt().y()) && std::isfinite(body3->GetPosDt().y());
+        const auto& contact_states = contact_item ? contact_item->GetContactStates() :
+                                      penalty_item ? penalty_item->GetContactStates() :
+                                                     local_patch_item->GetContactStates();
+        if (contact_item) {
+            manifold_manager->ObserveSolvedStates(contact_states);
+        }
+        MultiStepDiagnostics diag = MakeDescriptorContactDiagnostics(contact_states, finite_state);
+        if (implicit_stepper) {
+            diag.iterations = static_cast<int>(implicit_stepper->GetNumStepIterations());
+        }
+        diag.min_gap = MinRevClearanceGap(bore_sdf, pin_graph, body1, body3);
+        diag.max_penetration = std::max(diag.max_penetration, std::max(0.0, -diag.min_gap));
+        Accumulate(stats, diag);
+
+        const double time = sys.GetChTime();
+        const auto ref2 = InterpolateRevClearanceReference(body2_reference, time);
+        const auto ref3 = InterpolateRevClearanceReference(body3_reference, time);
+        body2_y_errors.push_back(body2->GetPos().y() - ref2.pos.y());
+        body2_z_errors.push_back(body2->GetPos().z() - ref2.pos.z());
+        body3_y_errors.push_back(body3->GetPos().y() - ref3.pos.y());
+        body3_z_errors.push_back(body3->GetPos().z() - ref3.pos.z());
+        const ChVector3d rel_ref = ref2.pos - ref3.pos;
+        const ChVector3d rel_sim = body2->GetPos() - body3->GetPos();
+        const double rel_angle_error = SafeVectorAngle(rel_ref, rel_sim);
+        relative_vector_angle_errors.push_back(rel_angle_error);
+        const ChVector3d rel_axis_ref = NormalizeOrZero(rel_ref);
+        const ChVector3d rel_axis_sim = NormalizeOrZero(rel_sim);
+        const ChVector3d action_marker_sim =
+            body3->GetFrameRefToAbs().TransformPointLocalToParent(action_marker.qp);
+        const ChVector3d action_marker_ref_proxy =
+            ref3.pos + RotateBySwing(body2_cm_local_in_body3, rel_ref, action_marker.qp);
+        const bool use_raw_multiplier_as_effective_force = false;
+        const std::string backend_label =
+            options.use_recurdyn_ggeomcontact_law ?
+                "ggeomcontact_weighted_penalty" :
+                 (options.local_patch_pressure_solve ?
+                      "sdf_ncp_local_patch_pressure_solve" :
+                      (options.descriptor_velocity_level_ncp ?
+                           (options.descriptor_patch_delassus_solve ?
+                                "sdf_ncp_descriptor_velocity_patch_delassus_block" :
+                                "sdf_ncp_descriptor_velocity_level") :
+                           (options.descriptor_patch_delassus_solve ? "sdf_ncp_descriptor_patch_delassus_block" :
+                                                                      "sdf_ncp_descriptor_area_intensity")));
+        const RevClearanceContactWrench wrench =
+            ComputeRevClearanceContactWrench(contact_states, body3, use_raw_multiplier_as_effective_force);
+        const auto ideal_wrench = InterpolateRevClearanceIdealWrench(ideal_wrench_reference, time);
+        const bool has_ideal_wrench = !ideal_wrench_reference.empty();
+        const ChVector3d force_error = has_ideal_wrench ? (wrench.force_world - ideal_wrench.force) : ChVector3d(0, 0, 0);
+        const ChVector3d torque_error =
+            has_ideal_wrench ? (wrench.torque_world - ideal_wrench.torque_about_body_ref) : ChVector3d(0, 0, 0);
+        const double force_cosine =
+            has_ideal_wrench && wrench.force_norm > 1.0e-30 && ideal_wrench.force.Length() > 1.0e-30 ?
+                wrench.force_world.Dot(ideal_wrench.force) / (wrench.force_norm * ideal_wrench.force.Length()) :
+                0.0;
+        const double torque_cosine =
+            has_ideal_wrench && wrench.torque_norm > 1.0e-30 && ideal_wrench.torque_about_body_ref.Length() > 1.0e-30 ?
+                wrench.torque_world.Dot(ideal_wrench.torque_about_body_ref) /
+                    (wrench.torque_norm * ideal_wrench.torque_about_body_ref.Length()) :
+                0.0;
+        if (has_ideal_wrench) {
+            wrench_force_error_norms.push_back(force_error.Length());
+            wrench_torque_error_norms.push_back(torque_error.Length());
+            wrench_force_cosines.push_back(force_cosine);
+            wrench_torque_cosines.push_back(torque_cosine);
+        }
+        wrench_alignment << time << "," << (has_ideal_wrench ? 1 : 0) << "," << wrench.force_world.x() << ","
+                         << wrench.force_world.y() << "," << wrench.force_world.z() << "," << wrench.force_norm
+                         << "," << wrench.torque_world.x() << "," << wrench.torque_world.y() << ","
+                         << wrench.torque_world.z() << "," << wrench.torque_norm << "," << ideal_wrench.force.x()
+                         << "," << ideal_wrench.force.y() << "," << ideal_wrench.force.z() << ","
+                         << ideal_wrench.force.Length() << "," << ideal_wrench.torque_about_body_ref.x() << ","
+                         << ideal_wrench.torque_about_body_ref.y() << ","
+                         << ideal_wrench.torque_about_body_ref.z() << ","
+                         << ideal_wrench.torque_about_body_ref.Length() << "," << force_error.x() << ","
+                         << force_error.y() << "," << force_error.z() << "," << force_error.Length() << ","
+                         << torque_error.x() << "," << torque_error.y() << "," << torque_error.z() << ","
+                         << torque_error.Length() << "," << force_cosine << "," << torque_cosine << ","
+                         << wrench.active_contacts
+                         << ",ideal reference loaded from rev_joint_clearance_ideal_revolute/joint_reaction_wrench.csv "
+                            "when available\n";
+        int open_positive_rows = 0;
+        double open_positive_force_sum = 0.0;
+        double open_positive_force_max = 0.0;
+        for (const auto& state : contact_states) {
+            if (state.sample.contact_id >= 0 && state.sample.gap > contact_law.bpen && state.lambda_force > 0.0) {
+                open_positive_rows++;
+                open_positive_force_sum += state.lambda_force;
+                open_positive_force_max = std::max(open_positive_force_max, state.lambda_force);
+            }
+        }
+        const auto manifold_diag = manifold_manager->GetDiagnostics();
+        manifold_diagnostics << time << "," << manifold_diag.candidate_count << "," << manifold_diag.active_count
+                             << "," << manifold_diag.patch_count << "," << manifold_diag.reused_patch_count << ","
+                             << manifold_diag.new_patch_count << "," << manifold_diag.released_sample_count << ","
+                             << manifold_diag.active_area << "," << open_positive_rows << ","
+                             << open_positive_force_sum << "," << open_positive_force_max << "\n";
+        const auto patch_moment_rows =
+            ComputeRevClearancePatchMomentRows(contact_states, body3, use_raw_multiplier_as_effective_force);
+        for (const auto& row : patch_moment_rows) {
+            if (row.patch_id != -1) {
+                continue;
+            }
+            const double effective_force_norm = row.effective_force.Length();
+            const double effective_torque_norm = row.effective_torque.Length();
+            const double resultant_line_offset =
+                effective_force_norm > 1.0e-30 ? effective_torque_norm / effective_force_norm : 0.0;
+            const double closure_ratio =
+                effective_force_norm * row.max_moment_arm > 1.0e-30 ?
+                    effective_torque_norm / (effective_force_norm * row.max_moment_arm) :
+                    0.0;
+            max_patch_effective_force_norm = std::max(max_patch_effective_force_norm, effective_force_norm);
+            max_patch_effective_torque_norm = std::max(max_patch_effective_torque_norm, effective_torque_norm);
+            max_patch_resultant_line_offset = std::max(max_patch_resultant_line_offset, resultant_line_offset);
+            max_patch_closure_ratio = std::max(max_patch_closure_ratio, closure_ratio);
+            max_patch_active_samples = std::max(max_patch_active_samples, row.active_samples);
+        }
+        WriteRevClearancePatchMomentRows(patch_moment_diagnostics, time, backend_label, patch_moment_rows);
+        const auto body3_q = body3->GetRot();
+        const ChVector3d body3_w = body3->GetAngVelParent();
+
+        reference_timeseries << time << "," << ref2.pos.x() << "," << ref2.pos.y() << "," << ref2.pos.z() << ","
+                             << body2->GetPos().x() << "," << body2->GetPos().y() << "," << body2->GetPos().z()
+                             << "," << body2_y_errors.back() << "," << body2_z_errors.back() << ","
+                             << ref3.pos.x() << "," << ref3.pos.y() << "," << ref3.pos.z() << ","
+                             << body3->GetPos().x() << "," << body3->GetPos().y() << "," << body3->GetPos().z()
+                             << "," << body3_y_errors.back() << "," << body3_z_errors.back() << ","
+                             << diag.min_gap << "," << diag.max_penetration << "," << (diag.success ? 1 : 0)
+                             << "\n";
+        kinematic_diagnostics
+            << time << "," << ref3.pos.x() << "," << ref3.pos.y() << "," << ref3.pos.z() << ","
+            << body3->GetPos().x() << "," << body3->GetPos().y() << "," << body3->GetPos().z() << ","
+            << body3_q.e0() << "," << body3_q.e1() << "," << body3_q.e2() << "," << body3_q.e3() << ","
+            << body3_w.x() << "," << body3_w.y() << "," << body3_w.z() << ","
+            << rel_ref.x() << "," << rel_ref.y() << "," << rel_ref.z() << ","
+            << rel_sim.x() << "," << rel_sim.y() << "," << rel_sim.z() << ","
+            << rel_ref.Length() << "," << rel_sim.Length() << "," << rel_angle_error << ","
+            << rel_angle_error * 180.0 / kPi << "," << rel_axis_ref.x() << "," << rel_axis_ref.y() << ","
+            << rel_axis_ref.z() << "," << rel_axis_sim.x() << "," << rel_axis_sim.y() << "," << rel_axis_sim.z()
+            << "," << action_marker_sim.x() << "," << action_marker_sim.y() << "," << action_marker_sim.z() << ","
+            << action_marker_ref_proxy.x() << "," << action_marker_ref_proxy.y() << "," << action_marker_ref_proxy.z()
+            << "," << wrench.center_of_pressure.x() << "," << wrench.center_of_pressure.y() << ","
+            << wrench.center_of_pressure.z() << "," << wrench.force_world.x() << "," << wrench.force_world.y()
+            << "," << wrench.force_world.z() << "," << wrench.force_norm << "," << wrench.torque_world.x() << ","
+            << wrench.torque_world.y() << "," << wrench.torque_world.z() << "," << wrench.torque_norm << ","
+            << wrench.active_contacts << "," << diag.min_gap << "," << diag.max_penetration << ","
+            << (diag.success ? 1 : 0)
+            << ",RecurDyn attitude and action-marker columns are swing proxies inferred from Body2-Body3 relative "
+               "position because the provided reference CSV has no orientation or force-moment output\n";
+
+        const auto write_body_row = [&](const std::shared_ptr<ChBodyAuxRef>& body,
+                                        const std::string& name,
+                                        int contact_id,
+                                        double gap,
+                                        double lambda,
+                                        double weight,
+                                        double lambda_force,
+                                        double ncp,
+                                        double comp) {
+            const auto q = body->GetRot();
+            const ChVector3d w = body->GetAngVelParent();
+            trajectory << time << "," << name << "," << body->GetPos().x() << "," << body->GetPos().y() << ","
+                       << body->GetPos().z() << "," << q.e0() << "," << q.e1() << "," << q.e2() << "," << q.e3()
+                       << "," << body->GetPosDt().x() << "," << body->GetPosDt().y() << "," << body->GetPosDt().z()
+                       << "," << w.x() << "," << w.y() << "," << w.z() << "," << contact_id << "," << gap << ","
+                       << lambda << "," << weight << "," << lambda_force << "," << std::max(0.0, -gap) << ","
+                       << ncp << "," << comp << ",0,0," << (diag.success ? 1 : 0) << "\n";
+        };
+
+        write_body_row(body2, "body2", -1, diag.min_gap, 0.0, 0.0, 0.0, 0.0, 0.0);
+        if (diag.candidates.empty()) {
+            write_body_row(body3, "body3", -1, diag.min_gap, 0.0, 0.0, 0.0, 0.0, 0.0);
+        }
+        for (size_t c = 0; c < diag.candidates.size(); c++) {
+            const auto& candidate = diag.candidates[c];
+            const double lambda = c < diag.lambdas.size() ? diag.lambdas[c] : 0.0;
+            const double lambda_force = c < diag.lambda_forces.size() ? diag.lambda_forces[c] : lambda * candidate.weight;
+            const double ncp = c < diag.ncp_residuals.size() ? diag.ncp_residuals[c] : 0.0;
+            const double comp = c < diag.complementarity_errors.size() ? diag.complementarity_errors[c] : 0.0;
+            write_body_row(
+                body3, "body3", candidate.sample_id, candidate.gap, lambda, candidate.weight, lambda_force, ncp, comp);
+        }
+    }
+
+    const double body2_y_rmse = RmsError(body2_y_errors);
+    const double body2_z_rmse = RmsError(body2_z_errors);
+    const double body3_y_rmse = RmsError(body3_y_errors);
+    const double body3_z_rmse = RmsError(body3_z_errors);
+    const double rel_angle_rmse = RmsError(relative_vector_angle_errors);
+    const double rel_angle_max = MaxAbsError(relative_vector_angle_errors);
+    const double wrench_force_error_rmse = RmsError(wrench_force_error_norms);
+    const double wrench_force_error_max = MaxAbsError(wrench_force_error_norms);
+    const double wrench_torque_error_rmse = RmsError(wrench_torque_error_norms);
+    const double wrench_torque_error_max = MaxAbsError(wrench_torque_error_norms);
+    const double wrench_force_cosine_mean = MeanValue(wrench_force_cosines);
+    const double wrench_torque_cosine_mean = MeanValue(wrench_torque_cosines);
+    comparison << config.case_name << ",body2_y_rmse_vs_recurdyn,0," << body2_y_rmse << "," << body2_y_rmse
+               << ",0,reference assets/rev_joint_clearance/data/body2.csv Y:Pos_TY\n";
+    comparison << config.case_name << ",body2_z_rmse_vs_recurdyn,0," << body2_z_rmse << "," << body2_z_rmse
+               << ",0,reference assets/rev_joint_clearance/data/body2.csv Y:Pos_TZ\n";
+    comparison << config.case_name << ",body3_y_rmse_vs_recurdyn,0," << body3_y_rmse << "," << body3_y_rmse
+               << ",0,reference assets/rev_joint_clearance/data/body3.csv Y:Pos_TY\n";
+    comparison << config.case_name << ",body3_z_rmse_vs_recurdyn,0," << body3_z_rmse << "," << body3_z_rmse
+               << ",0,reference assets/rev_joint_clearance/data/body3.csv Y:Pos_TZ\n";
+    comparison << config.case_name << ",ggeomcontact_K," << contact_law.stiffness << "," << contact_law.stiffness
+               << ",0,0,parsed from RecurDyn GGEOMCONTACT"
+               << (options.use_recurdyn_ggeomcontact_law ? "; applied by calibration backend\n" :
+                                                   "; hard SDF-NCP does not apply penalty K\n");
+    comparison << config.case_name << ",ggeomcontact_C," << contact_law.damping << "," << contact_law.damping
+               << ",0,0,parsed from RecurDyn GGEOMCONTACT"
+               << (options.use_recurdyn_ggeomcontact_law ? "; applied by calibration backend\n" :
+                                                   "; hard SDF-NCP does not apply damping C\n");
+    comparison << config.case_name << ",ggeomcontact_bpen," << contact_law.bpen << "," << contact_law.bpen
+               << ",0,0,parsed from RecurDyn GGEOMCONTACT"
+               << (options.use_recurdyn_ggeomcontact_law ? "; applied by calibration backend\n" :
+                                                   "; reported for contact-law audit\n");
+    comparison << config.case_name << ",ggeomcontact_nomaxcp_reference,10," << config.max_contacts << ","
+               << std::abs(10.0 - static_cast<double>(config.max_contacts)) << ",0,"
+               << "SDF-NCP keeps full active patch capacity instead of compressing to NOMAXCP\n";
+    comparison << config.case_name << ",sdf_ncp_active_gap_on,0," << contact_law.bpen << "," << contact_law.bpen
+               << ",0,descriptor active-set starts constraints at RecurDyn BPEN-scale geometric gap\n";
+    comparison << config.case_name << ",sdf_ncp_active_gap_off,0," << config.max_activation_band << ","
+               << config.max_activation_band
+               << ",0,persistent contact_id hysteresis band; retained only while normal gap rate remains closing\n";
+    comparison << config.case_name << ",sdf_ncp_pressure_compliance,0," << config.pressure_compliance << ","
+               << config.pressure_compliance
+               << ",0,diagonal local pressure/intensity compliance applied as force_scale*compliance CFM\n";
+    comparison << config.case_name << ",wrench_force_error_rmse_vs_ideal_revolute,0," << wrench_force_error_rmse
+               << "," << wrench_force_error_rmse
+               << ",0,contact wrench force error against Chrono ideal revolute joint reaction wrench\n";
+    comparison << config.case_name << ",wrench_torque_error_rmse_vs_ideal_revolute,0," << wrench_torque_error_rmse
+               << "," << wrench_torque_error_rmse
+               << ",0,contact wrench torque error against Chrono ideal revolute joint reaction wrench\n";
+    comparison << config.case_name << ",wrench_force_cosine_mean_vs_ideal_revolute,1," << wrench_force_cosine_mean
+               << "," << std::abs(1.0 - wrench_force_cosine_mean)
+               << ",0,mean cosine between SDF contact force and ideal revolute reaction force\n";
+    comparison << config.case_name << ",wrench_torque_cosine_mean_vs_ideal_revolute,1," << wrench_torque_cosine_mean
+               << "," << std::abs(1.0 - wrench_torque_cosine_mean)
+               << ",0,mean cosine between SDF contact torque and ideal revolute reaction torque\n";
+    comparison << config.case_name << ",sdf_ncp_patch_pressure_aggregation,0,"
+               << (!options.use_recurdyn_ggeomcontact_law && options.patch_pressure_aggregation ? 1 : 0) << ","
+               << (!options.use_recurdyn_ggeomcontact_law && options.patch_pressure_aggregation ? 1 : 0)
+               << ",0,hard SDF-NCP path aggregates connected active samples into one pressure unknown per patch; "
+                  "GGEOMCONTACT calibration keeps per-sample penalty forces\n";
+    comparison << config.case_name << ",sdf_ncp_descriptor_patch_projection,0,"
+               << (!options.use_recurdyn_ggeomcontact_law && options.descriptor_patch_projection ? 1 : 0) << ","
+               << (!options.use_recurdyn_ggeomcontact_law && options.descriptor_patch_projection ? 1 : 0)
+               << ",0,descriptor-level unilateral rows remain in Chrono global solver; the PSOR projection hook "
+                  "solves a small nonnegative patch Delassus block and increments descriptor states consistently\n";
+    comparison << config.case_name << ",sdf_ncp_descriptor_patch_delassus_block,0,"
+               << (!options.use_recurdyn_ggeomcontact_law && options.descriptor_patch_delassus_solve ? 1 : 0)
+               << ","
+               << (!options.use_recurdyn_ggeomcontact_law && options.descriptor_patch_delassus_solve ? 1 : 0)
+               << ",0,descriptor-level patch block solve uses W=J M^-1 J^T + CFM inside PSOR group projection; "
+                  "sample pressure rows, joint constraints, drivers, and body velocities are iterated in one "
+                  "Chrono descriptor solve\n";
+    comparison << config.case_name << ",sdf_ncp_descriptor_patch_laplacian_compliance_scale,0,"
+               << (!options.use_recurdyn_ggeomcontact_law && options.descriptor_patch_delassus_solve ?
+                       options.descriptor_patch_laplacian_compliance_scale :
+                       0.0)
+               << ","
+               << (!options.use_recurdyn_ggeomcontact_law && options.descriptor_patch_delassus_solve ?
+                       options.descriptor_patch_laplacian_compliance_scale :
+                       0.0)
+               << ",0,optional patch graph Laplacian pressure regularization added to the descriptor block matrix\n";
+    comparison << config.case_name << ",sdf_ncp_descriptor_velocity_level_ncp,0,"
+               << (!options.use_recurdyn_ggeomcontact_law && options.descriptor_velocity_level_ncp ? 1 : 0) << ","
+               << (!options.use_recurdyn_ggeomcontact_law && options.descriptor_velocity_level_ncp ? 1 : 0)
+               << ",0,descriptor RHS uses velocity-level normal approach residual v_n + beta min(g,0)/dt instead of "
+                  "raw geometric gap stabilization\n";
+    comparison << config.case_name << ",sdf_ncp_descriptor_velocity_baumgarte,0,"
+               << (!options.use_recurdyn_ggeomcontact_law && options.descriptor_velocity_level_ncp ?
+                       options.descriptor_velocity_baumgarte :
+                       0.0)
+               << ","
+               << (!options.use_recurdyn_ggeomcontact_law && options.descriptor_velocity_level_ncp ?
+                       options.descriptor_velocity_baumgarte :
+                       0.0)
+               << ",0,dimensionless beta in beta min(g,0)/dt velocity-level stabilization\n";
+    comparison << config.case_name << ",sdf_ncp_descriptor_patch_wrench_closure_strength,0,"
+               << (!options.use_recurdyn_ggeomcontact_law && options.descriptor_patch_delassus_solve ?
+                       options.descriptor_patch_wrench_closure_strength :
+                       0.0)
+               << ","
+               << (!options.use_recurdyn_ggeomcontact_law && options.descriptor_patch_delassus_solve ?
+                       options.descriptor_patch_wrench_closure_strength :
+                       0.0)
+               << ",0,optional torque Gram regularization inside the descriptor patch block; it keeps sample pressure "
+                  "nonnegative while discouraging large free contact torque on the contacted body\n";
+    comparison << config.case_name << ",sdf_ncp_local_patch_pressure_solve,0,"
+               << (!options.use_recurdyn_ggeomcontact_law && options.local_patch_pressure_solve ? 1 : 0) << ","
+               << (!options.use_recurdyn_ggeomcontact_law && options.local_patch_pressure_solve ? 1 : 0)
+               << ",0,experimental force backend keeps sample pressure unknowns inside each patch and couples them "
+                  "with an area-weighted graph Laplacian local FB solve\n";
+    comparison << config.case_name << ",sdf_ncp_local_patch_delassus,0,"
+               << (!options.use_recurdyn_ggeomcontact_law && options.local_patch_delassus ? 1 : 0) << ","
+               << (!options.use_recurdyn_ggeomcontact_law && options.local_patch_delassus ? 1 : 0)
+               << ",0,velocity-level local patch solve uses W=J M^-1 J^T effective-mass coupling before applying "
+                  "area-integrated sample forces\n";
+    comparison << config.case_name << ",sdf_ncp_local_patch_wrench_closure,0,"
+               << (!options.use_recurdyn_ggeomcontact_law && options.local_patch_wrench_closure ? 1 : 0) << ","
+               << (!options.use_recurdyn_ggeomcontact_law && options.local_patch_wrench_closure ? 1 : 0)
+               << ",0,local patch pressure solve preserves the FB-computed resultant force and redistributes "
+                  "nonnegative sample pressures to reduce free torque about the contact body reference point\n";
+    comparison << config.case_name << ",sdf_ncp_local_patch_global_wrench_demand,0,"
+               << (!options.use_recurdyn_ggeomcontact_law && options.local_patch_global_wrench_demand ? 1 : 0)
+               << ","
+               << (!options.use_recurdyn_ggeomcontact_law && options.local_patch_global_wrench_demand ? 1 : 0)
+               << ",0,diagnostic mode uses Chrono ideal revolute reaction wrench as the patch pressure demand; "
+                  "it is not a production SDF-NCP closure\n";
+    comparison << config.case_name << ",sdf_ncp_local_patch_integrated_wrench_closure,0,"
+               << (!options.use_recurdyn_ggeomcontact_law && options.local_patch_integrated_wrench_closure ? 1 : 0)
+               << ","
+               << (!options.use_recurdyn_ggeomcontact_law && options.local_patch_integrated_wrench_closure ? 1 : 0)
+               << ",0,augmented local patch block includes FB complementarity plus force preservation and body-reference torque residuals\n";
+    comparison << config.case_name << ",patch_effective_force_norm_max,0," << max_patch_effective_force_norm << ","
+               << max_patch_effective_force_norm
+               << ",0,global active patch resultant force norm from contact_patch_moment_diagnostics.csv\n";
+    comparison << config.case_name << ",patch_effective_torque_norm_max,0," << max_patch_effective_torque_norm << ","
+               << max_patch_effective_torque_norm
+               << ",0,global active patch torque norm about Body3 reference from "
+                  "contact_patch_moment_diagnostics.csv\n";
+    comparison << config.case_name << ",patch_resultant_line_offset_m_max,0," << max_patch_resultant_line_offset
+               << "," << max_patch_resultant_line_offset
+               << ",0,|sum r cross f| / |sum f|; fixed regression metric for patch torque closure\n";
+    comparison << config.case_name << ",patch_closure_ratio_max,0," << max_patch_closure_ratio << ","
+               << max_patch_closure_ratio
+               << ",0,|sum r cross f| / (|sum f| max|r|); fixed regression metric for patch torque closure\n";
+
+    std::ofstream patch_moment_summary(out_dir / "contact_patch_moment_summary.csv");
+    patch_moment_summary << std::setprecision(17);
+    patch_moment_summary
+        << "case_name,method,max_effective_force_norm,max_effective_torque_norm,max_resultant_line_offset_m,"
+           "max_closure_ratio,max_active_samples,notes\n";
+    patch_moment_summary
+        << config.case_name << "," << stats.method << "," << max_patch_effective_force_norm << ","
+        << max_patch_effective_torque_norm << "," << max_patch_resultant_line_offset << ","
+        << max_patch_closure_ratio << "," << max_patch_active_samples
+        << ",Regression summary for global patch_id=-1 rows in contact_patch_moment_diagnostics.csv; "
+           "SDF-NCP descriptor lambda_n is local intensity and lambda_force is area/scale-integrated sample force\n";
+
+    std::ofstream wrench_summary(out_dir / "wrench_alignment_summary.csv");
+    wrench_summary << std::setprecision(17);
+    wrench_summary
+        << "case_name,method,num_samples,force_error_rmse,force_error_max,torque_error_rmse,torque_error_max,"
+           "force_cosine_mean,torque_cosine_mean,notes\n";
+    wrench_summary
+        << config.case_name << "," << stats.method << "," << wrench_force_error_norms.size() << ","
+        << wrench_force_error_rmse << "," << wrench_force_error_max << "," << wrench_torque_error_rmse << ","
+        << wrench_torque_error_max << "," << wrench_force_cosine_mean << "," << wrench_torque_cosine_mean
+        << ",Fixed regression metrics comparing the integrated SDF contact wrench on Body3 against "
+           "rev_joint_clearance_ideal_revolute/joint_reaction_wrench.csv; the reference is diagnostic only and is "
+           "not used by the SDF-NCP solver\n";
+
+    std::ofstream reference_summary(out_dir / "recurdyn_reference_comparison_summary.csv");
+    reference_summary << std::setprecision(17);
+    reference_summary << "case_name,quantity,time_start,time_end,num_samples,rmse,max_abs_error,final_reference,"
+                         "final_sdf_ncp,final_abs_error,notes\n";
+    const auto final_ref2 = InterpolateRevClearanceReference(body2_reference, config.t_end);
+    const auto final_ref3 = InterpolateRevClearanceReference(body3_reference, config.t_end);
+    reference_summary << config.case_name << ",body2_y,0," << config.t_end << "," << body2_y_errors.size() << ","
+                      << body2_y_rmse << "," << MaxAbsError(body2_y_errors) << "," << final_ref2.pos.y() << ","
+                      << body2->GetPos().y() << "," << std::abs(body2->GetPos().y() - final_ref2.pos.y())
+                      << ",Y:Pos_TY-Body2 compared to Chrono Body2 position y\n";
+    reference_summary << config.case_name << ",body2_z,0," << config.t_end << "," << body2_z_errors.size() << ","
+                      << body2_z_rmse << "," << MaxAbsError(body2_z_errors) << "," << final_ref2.pos.z() << ","
+                      << body2->GetPos().z() << "," << std::abs(body2->GetPos().z() - final_ref2.pos.z())
+                      << ",Y:Pos_TZ-Body2 compared to Chrono Body2 position z\n";
+    reference_summary << config.case_name << ",body3_y,0," << config.t_end << "," << body3_y_errors.size() << ","
+                      << body3_y_rmse << "," << MaxAbsError(body3_y_errors) << "," << final_ref3.pos.y() << ","
+                      << body3->GetPos().y() << "," << std::abs(body3->GetPos().y() - final_ref3.pos.y())
+                      << ",Y:Pos_TY-Body3 compared to Chrono Body3 position y\n";
+    reference_summary << config.case_name << ",body3_z,0," << config.t_end << "," << body3_z_errors.size() << ","
+                      << body3_z_rmse << "," << MaxAbsError(body3_z_errors) << "," << final_ref3.pos.z() << ","
+                      << body3->GetPos().z() << "," << std::abs(body3->GetPos().z() - final_ref3.pos.z())
+                      << ",Y:Pos_TZ-Body3 compared to Chrono Body3 position z\n";
+    const double final_rel_angle =
+        SafeVectorAngle(final_ref2.pos - final_ref3.pos, body2->GetPos() - body3->GetPos());
+    reference_summary << config.case_name << ",body2_body3_relative_vector_angle_rad,0," << config.t_end << ","
+                      << relative_vector_angle_errors.size() << "," << rel_angle_rmse << "," << rel_angle_max
+                      << ",0," << final_rel_angle << "," << final_rel_angle
+                      << ",orientation phase proxy from Body2-Body3 relative vector; RecurDyn reference has no direct "
+                         "Body3 quaternion output\n";
+
+    stats.runtime_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    WriteSummary(out_dir / "summary.csv", stats);
+    std::cout << "Wrote " << (out_dir / "trajectory.csv").string() << std::endl;
+    std::cout << "Wrote " << (out_dir / "recurdyn_reference_comparison_timeseries.csv").string() << std::endl;
+    std::cout << "Wrote " << (out_dir / "recurdyn_chrono_kinematic_diagnostics.csv").string() << std::endl;
+    std::cout << "Wrote " << (out_dir / "contact_patch_moment_diagnostics.csv").string() << std::endl;
+    std::cout << "Wrote " << (out_dir / "contact_patch_moment_summary.csv").string() << std::endl;
+    std::cout << "Wrote " << (out_dir / "contact_manifold_diagnostics.csv").string() << std::endl;
+    std::cout << "Wrote " << (out_dir / "wrench_alignment.csv").string() << std::endl;
+    std::cout << "Wrote " << (out_dir / "wrench_alignment_summary.csv").string() << std::endl;
+
+    const double success_rate = stats.sum_success / static_cast<double>(std::max(1, stats.samples));
+    const bool patch_closure_bounded =
+        options.use_recurdyn_ggeomcontact_law ||
+        (std::isfinite(max_patch_resultant_line_offset) && std::isfinite(max_patch_closure_ratio) &&
+         max_patch_resultant_line_offset < 1.2 && max_patch_closure_ratio < 1.05);
+    const bool wrench_alignment_bounded =
+        wrench_force_error_norms.empty() ||
+        (std::isfinite(wrench_force_error_rmse) && std::isfinite(wrench_torque_error_rmse) &&
+         wrench_force_error_rmse < 5.0e5 && wrench_torque_error_rmse < 2.0e5);
+    return std::isfinite(body3_y_rmse) && stats.max_penetration < 5.0e-2 && success_rate > 0.90 &&
+                   patch_closure_bounded && wrench_alignment_bounded ?
+               0 :
+               1;
+}
+
+int RunRevJointClearanceCase(const std::string& output_case_name = "rev_joint_clearance",
+                             double t_end_override = -1.0,
+                             double dt_override = -1.0,
+                             bool use_recurdyn_ggeomcontact_law = false) {
+    RevClearanceRunOptions options;
+    options.case_name = output_case_name;
+    options.t_end_override = t_end_override;
+    options.dt_override = dt_override;
+    options.use_recurdyn_ggeomcontact_law = use_recurdyn_ggeomcontact_law;
+    return RunRevJointClearanceCase(options);
+}
+
+int RunRevJointClearanceIdealRevoluteCase(const std::string& output_case_name = "rev_joint_clearance_ideal_revolute",
+                                          double t_end_override = 3.0,
+                                          double dt_override = 0.001) {
+    const auto start = std::chrono::steady_clock::now();
+    const auto root = GetProjectRoot();
+    const auto asset_dir = root / "assets" / "rev_joint_clearance";
+    const auto out_dir = root / "results" / "sdf_ncp_benchmarks" / output_case_name;
+    std::filesystem::create_directories(out_dir);
+
+    RevClearanceConfig config;
+    const std::string model_json = ReadTextFile(asset_dir / "rev_joint_clearance_model.json");
+    config.dt = ExtractJsonDouble(model_json, "step_size", config.dt);
+    config.t_end = ExtractJsonDouble(model_json, "total_time", config.t_end);
+    if (t_end_override > 0.0) {
+        config.t_end = t_end_override;
+    }
+    if (dt_override > 0.0) {
+        config.dt = dt_override;
+    }
+
+    const RmdModel rmd = LoadRecurDynRmdModel(asset_dir / "rev_clearance_joint.rmd");
+    WriteRmdMappingAudit(out_dir / "rmd_mapping.csv", rmd);
+    const RmdPart& body1_part = RequirePartByName(rmd, "Body1");
+    const RmdPart& body2_part = RequirePartByName(rmd, "Body2");
+    const RmdPart& body3_part = RequirePartByName(rmd, "Body3");
+    const RmdMarker& body1_cm = RequireMarkerById(rmd, body1_part.cm_marker_id);
+    const RmdMarker& body2_cm = RequireMarkerById(rmd, body2_part.cm_marker_id);
+    const RmdMarker& body3_cm = RequireMarkerById(rmd, body3_part.cm_marker_id);
+    const RmdJoint& fixed1 = RequireJointByName(rmd, "Fixed1");
+    const RmdJoint& fixed2 = RequireJointByName(rmd, "Fixed2");
+
+    const auto body2_ideal_reference = LoadRevClearanceReference(asset_dir / "data" / "body2_ideal.csv");
+    if (body2_ideal_reference.empty()) {
+        throw std::runtime_error("rev_joint_clearance ideal Body2 reference CSV is empty.");
+    }
+
+    RevClearanceRunOptions options;
+    options.timestepper_type = ChTimestepper::Type::HHT;
+    options.timestepper_label = "hht_alpha_minus_0p2_fixed_step";
+    options.use_step_control = false;
+
+    ChSystemNSC sys;
+    sys.SetGravitationalAcceleration(rmd.gravity);
+    sys.SetSolverType(ChSolver::Type::PSOR);
+    sys.GetSolver()->AsIterative()->SetMaxIterations(300);
+    sys.GetSolver()->AsIterative()->SetTolerance(1.0e-8);
+    sys.SetMaxPenetrationRecoverySpeed(0.5);
+    ConfigureRevClearanceTimestepper(sys, options);
+
+    auto ground = chrono_types::make_shared<ChBody>();
+    ground->SetFixed(true);
+    sys.AddBody(ground);
+
+    auto body1 = chrono_types::make_shared<ChBodyAuxRef>();
+    ConfigureAuxRefBodyFromRmdPart(rmd, body1_part, body1_cm, body1);
+    sys.AddBody(body1);
+
+    auto body2 = chrono_types::make_shared<ChBodyAuxRef>();
+    ConfigureAuxRefBodyFromRmdPart(rmd, body2_part, body2_cm, body2);
+    sys.AddBody(body2);
+
+    auto body3 = chrono_types::make_shared<ChBodyAuxRef>();
+    ConfigureAuxRefBodyFromRmdPart(rmd, body3_part, body3_cm, body3);
+    sys.AddBody(body3);
+
+    auto fixed1_link = chrono_types::make_shared<ChLinkMateGeneric>(true, true, true, true, true, true);
+    fixed1_link->SetName("Fixed1");
+    fixed1_link->Initialize(body1, ground, RmdMarkerFrameAbs(rmd, RequireMarkerById(rmd, fixed1.i_marker_id)));
+    sys.AddLink(fixed1_link);
+
+    auto fixed2_link = chrono_types::make_shared<ChLinkMateGeneric>(true, true, true, true, true, true);
+    fixed2_link->SetName("Fixed2");
+    fixed2_link->Initialize(body3, body2, RmdMarkerFrameAbs(rmd, RequireMarkerById(rmd, fixed2.i_marker_id)));
+    sys.AddLink(fixed2_link);
+
+    auto revolute = chrono_types::make_shared<ChLinkRevolute>();
+    revolute->SetName("ChronoIdealRevJoint_Body3_to_Body1_global_X");
+    const ChFrame<> rev_frame(ChVector3d(0, 0, 0), ToChronoMatrix(RotYMatrix(kPi / 2.0)));
+    revolute->Initialize(body3, body1, rev_frame);
+    sys.AddLink(revolute);
+
+    std::ofstream trajectory(out_dir / "trajectory.csv");
+    std::ofstream comparison(out_dir / "comparison.csv");
+    std::ofstream timeseries(out_dir / "ideal_revolute_comparison_timeseries.csv");
+    std::ofstream joint_wrench(out_dir / "joint_reaction_wrench.csv");
+    trajectory << std::setprecision(17);
+    comparison << std::setprecision(17);
+    timeseries << std::setprecision(17);
+    joint_wrench << std::setprecision(17);
+    WriteTrajectoryHeader(trajectory);
+    comparison << "case_name,metric,field_contact_value,sdf_ncp_value,absolute_difference,relative_difference,notes\n";
+    timeseries << "time,body2_x_ideal,body2_y_ideal,body2_z_ideal,body2_x_chrono,body2_y_chrono,"
+                  "body2_z_chrono,body2_y_error,body2_z_error,body3_x_chrono,body3_y_chrono,body3_z_chrono,"
+                  "body3_q0_chrono,body3_q1_chrono,body3_q2_chrono,body3_q3_chrono,body3_wx_chrono,"
+                  "joint_force_x,joint_force_y,joint_force_z,joint_force_norm,joint_torque_about_body3_x,"
+                  "joint_torque_about_body3_y,joint_torque_about_body3_z,joint_torque_about_body3_norm,success\n";
+    joint_wrench
+        << "time,body,frame,force_x,force_y,force_z,force_norm,torque_at_joint_x,torque_at_joint_y,"
+           "torque_at_joint_z,torque_at_joint_norm,torque_about_body_ref_x,torque_about_body_ref_y,"
+           "torque_about_body_ref_z,torque_about_body_ref_norm,joint_x,joint_y,joint_z,body_ref_x,body_ref_y,"
+           "body_ref_z,success\n";
+
+    const int steps = static_cast<int>(std::round(config.t_end / config.dt));
+    BenchmarkStats stats;
+    stats.case_name = output_case_name;
+    stats.method = "chrono_ideal_revolute";
+    stats.asset = "assets/rev_joint_clearance";
+    stats.dt = config.dt;
+    stats.t_end = config.t_end;
+    stats.num_steps = steps;
+    stats.notes =
+        "Chrono diagnostic ideal revolute joint: same RMD Body1/Body2/Body3 mass-marker-inertia mapping and Body2-Body3 "
+        "fixed joint, no contact, Body3 revolute to Body1 about global X axis; compared to body2_ideal.csv";
+
+    std::vector<double> body2_y_errors;
+    std::vector<double> body2_z_errors;
+    bool finite_all = true;
+    for (int i = 0; i <= steps; i++) {
+        if (i > 0) {
+            sys.DoStepDynamics(config.dt);
+        } else {
+            sys.Setup();
+            sys.Update(UpdateFlags::UPDATE_ALL & ~UpdateFlags::VISUAL_ASSETS);
+        }
+
+        const double time = sys.GetChTime();
+        const auto ref = InterpolateRevClearanceReference(body2_ideal_reference, time);
+        body2_y_errors.push_back(body2->GetPos().y() - ref.pos.y());
+        body2_z_errors.push_back(body2->GetPos().z() - ref.pos.z());
+        finite_all = finite_all && std::isfinite(body2->GetPos().y()) && std::isfinite(body3->GetPos().y());
+        const auto q2 = body2->GetRot();
+        const auto q3 = body3->GetRot();
+        const ChVector3d w2 = body2->GetAngVelParent();
+        const ChVector3d w3 = body3->GetAngVelParent();
+        const auto reaction1 = revolute->GetReaction1();
+        const auto reaction2 = revolute->GetReaction2();
+        const ChVector3d joint_pos_body3 = revolute->GetFrame1Abs().GetPos();
+        const ChVector3d joint_pos_body1 = revolute->GetFrame2Abs().GetPos();
+        const ChVector3d reaction1_force_world =
+            revolute->GetFrame1Abs().TransformDirectionLocalToParent(reaction1.force);
+        const ChVector3d reaction1_torque_at_joint_world =
+            revolute->GetFrame1Abs().TransformDirectionLocalToParent(reaction1.torque);
+        const ChVector3d reaction1_torque_about_body3_world =
+            reaction1_torque_at_joint_world + (joint_pos_body3 - body3->GetPos()).Cross(reaction1_force_world);
+        const ChVector3d reaction2_force_world =
+            revolute->GetFrame2Abs().TransformDirectionLocalToParent(reaction2.force);
+        const ChVector3d reaction2_torque_at_joint_world =
+            revolute->GetFrame2Abs().TransformDirectionLocalToParent(reaction2.torque);
+        const ChVector3d reaction2_torque_about_body1_world =
+            reaction2_torque_at_joint_world + (joint_pos_body1 - body1->GetPos()).Cross(reaction2_force_world);
+        trajectory << time << ",body2," << body2->GetPos().x() << "," << body2->GetPos().y() << ","
+                   << body2->GetPos().z() << "," << q2.e0() << "," << q2.e1() << "," << q2.e2() << "," << q2.e3()
+                   << "," << body2->GetPosDt().x() << "," << body2->GetPosDt().y() << "," << body2->GetPosDt().z()
+                   << "," << w2.x() << "," << w2.y() << "," << w2.z()
+                   << ",-1,0,0,0,0,0,0,0,0,0," << (finite_all ? 1 : 0) << "\n";
+        trajectory << time << ",body3," << body3->GetPos().x() << "," << body3->GetPos().y() << ","
+                   << body3->GetPos().z() << "," << q3.e0() << "," << q3.e1() << "," << q3.e2() << "," << q3.e3()
+                   << "," << body3->GetPosDt().x() << "," << body3->GetPosDt().y() << "," << body3->GetPosDt().z()
+                   << "," << w3.x() << "," << w3.y() << "," << w3.z()
+                   << ",-1,0,0,0,0,0,0,0,0,0," << (finite_all ? 1 : 0) << "\n";
+        timeseries << time << "," << ref.pos.x() << "," << ref.pos.y() << "," << ref.pos.z() << ","
+                   << body2->GetPos().x() << "," << body2->GetPos().y() << "," << body2->GetPos().z() << ","
+                   << body2_y_errors.back() << "," << body2_z_errors.back() << "," << body3->GetPos().x() << ","
+                   << body3->GetPos().y() << "," << body3->GetPos().z() << "," << q3.e0() << "," << q3.e1() << ","
+                   << q3.e2() << "," << q3.e3() << "," << w3.x() << "," << reaction1_force_world.x() << ","
+                   << reaction1_force_world.y() << "," << reaction1_force_world.z() << ","
+                   << reaction1_force_world.Length() << "," << reaction1_torque_about_body3_world.x() << ","
+                   << reaction1_torque_about_body3_world.y() << "," << reaction1_torque_about_body3_world.z() << ","
+                   << reaction1_torque_about_body3_world.Length() << "," << (finite_all ? 1 : 0) << "\n";
+        joint_wrench << time << ",body3,frame1," << reaction1_force_world.x() << "," << reaction1_force_world.y()
+                     << "," << reaction1_force_world.z() << "," << reaction1_force_world.Length() << ","
+                     << reaction1_torque_at_joint_world.x() << "," << reaction1_torque_at_joint_world.y() << ","
+                     << reaction1_torque_at_joint_world.z() << "," << reaction1_torque_at_joint_world.Length() << ","
+                     << reaction1_torque_about_body3_world.x() << "," << reaction1_torque_about_body3_world.y()
+                     << "," << reaction1_torque_about_body3_world.z() << ","
+                     << reaction1_torque_about_body3_world.Length() << "," << joint_pos_body3.x() << ","
+                     << joint_pos_body3.y() << "," << joint_pos_body3.z() << "," << body3->GetPos().x() << ","
+                     << body3->GetPos().y() << "," << body3->GetPos().z() << "," << (finite_all ? 1 : 0) << "\n";
+        joint_wrench << time << ",body1,frame2," << reaction2_force_world.x() << "," << reaction2_force_world.y()
+                     << "," << reaction2_force_world.z() << "," << reaction2_force_world.Length() << ","
+                     << reaction2_torque_at_joint_world.x() << "," << reaction2_torque_at_joint_world.y() << ","
+                     << reaction2_torque_at_joint_world.z() << "," << reaction2_torque_at_joint_world.Length() << ","
+                     << reaction2_torque_about_body1_world.x() << "," << reaction2_torque_about_body1_world.y()
+                     << "," << reaction2_torque_about_body1_world.z() << ","
+                     << reaction2_torque_about_body1_world.Length() << "," << joint_pos_body1.x() << ","
+                     << joint_pos_body1.y() << "," << joint_pos_body1.z() << "," << body1->GetPos().x() << ","
+                     << body1->GetPos().y() << "," << body1->GetPos().z() << "," << (finite_all ? 1 : 0) << "\n";
+    }
+
+    const double body2_y_rmse = RmsError(body2_y_errors);
+    const double body2_z_rmse = RmsError(body2_z_errors);
+    comparison << output_case_name << ",body2_y_rmse_vs_recurdyn_ideal,0," << body2_y_rmse << "," << body2_y_rmse
+               << ",0,reference assets/rev_joint_clearance/data/body2_ideal.csv Y:Pos_TY\n";
+    comparison << output_case_name << ",body2_z_rmse_vs_recurdyn_ideal,0," << body2_z_rmse << "," << body2_z_rmse
+               << ",0,reference assets/rev_joint_clearance/data/body2_ideal.csv Y:Pos_TZ\n";
+    comparison << output_case_name << ",joint_axis,0,0,0,0,Chrono ChLinkRevolute z-axis aligned with global X using "
+                  "RotY(pi/2) joint frame\n";
+
+    stats.samples = steps + 1;
+    stats.sum_success = finite_all ? static_cast<double>(steps + 1) : 0.0;
+    stats.runtime_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    WriteSummary(out_dir / "summary.csv", stats);
+
+    std::cout << "Wrote " << (out_dir / "trajectory.csv").string() << std::endl;
+    std::cout << "Wrote " << (out_dir / "ideal_revolute_comparison_timeseries.csv").string() << std::endl;
+    std::cout << "Wrote " << (out_dir / "joint_reaction_wrench.csv").string() << std::endl;
+    return finite_all && body2_y_rmse < 1.0e-2 && body2_z_rmse < 1.0e-2 ? 0 : 1;
+}
+
+struct RevClearanceIdealFrame {
+    double time = 0.0;
+    ChVector3d body3_pos = ChVector3d(0, 0, 0);
+    chrono::ChQuaternion<> body3_rot = chrono::ChQuaternion<>(1, 0, 0, 0);
+    ChVector3d body3_vel = ChVector3d(0, 0, 0);
+    ChVector3d body3_omega = ChVector3d(0, 0, 0);
+};
+
+std::vector<RevClearanceIdealFrame> LoadRevClearanceIdealFrames(const std::filesystem::path& path) {
+    std::ifstream in(path);
+    if (!in) {
+        return {};
+    }
+    std::string header;
+    if (!std::getline(in, header)) {
+        return {};
+    }
+
+    std::vector<RevClearanceIdealFrame> frames;
+    std::string line;
+    double last_time = std::numeric_limits<double>::quiet_NaN();
+    while (std::getline(in, line)) {
+        if (line.empty()) {
+            continue;
+        }
+        const auto cols = SplitCsvLine(line);
+        if (cols.size() < 15 || cols[1] != "body3") {
+            continue;
+        }
+        const double time = std::stod(cols[0]);
+        if (std::isfinite(last_time) && std::abs(time - last_time) < 1.0e-12) {
+            continue;
+        }
+        last_time = time;
+        RevClearanceIdealFrame frame;
+        frame.time = time;
+        frame.body3_pos = ChVector3d(std::stod(cols[2]), std::stod(cols[3]), std::stod(cols[4]));
+        frame.body3_rot =
+            chrono::ChQuaternion<>(std::stod(cols[5]), std::stod(cols[6]), std::stod(cols[7]), std::stod(cols[8]));
+        frame.body3_vel = ChVector3d(std::stod(cols[9]), std::stod(cols[10]), std::stod(cols[11]));
+        frame.body3_omega = ChVector3d(std::stod(cols[12]), std::stod(cols[13]), std::stod(cols[14]));
+        frames.push_back(frame);
+    }
+    return frames;
+}
+
+double RevClearanceContactForceScale(const ChSdfNcpDescriptorContact& sample) {
+    if (sample.area > 1.0e-30 && std::isfinite(sample.area)) {
+        return sample.area;
+    }
+    if (sample.weight > 1.0e-30 && std::isfinite(sample.weight)) {
+        return sample.weight;
+    }
+    return 1.0;
+}
+
+ChVector3d RevClearancePointVelocityAbs(const ChBody& body, const ChVector3d& point_abs) {
+    return body.GetPosDt() + body.GetAngVelParent().Cross(point_abs - body.GetPos());
+}
+
+struct RevClearancePressureColumn {
+    ChVector3d force = ChVector3d(0, 0, 0);
+    ChVector3d torque = ChVector3d(0, 0, 0);
+    double scale = 1.0;
+};
+
+RevClearancePressureColumn RevClearanceBody3PressureColumn(const ChSdfNcpDescriptorContact& sample,
+                                                           const std::shared_ptr<ChBodyAuxRef>& body3) {
+    RevClearancePressureColumn column;
+    column.scale = RevClearanceContactForceScale(sample);
+    if (sample.use_custom_wrench && sample.body_a == body3) {
+        column.force = sample.force_on_body_a_per_lambda_abs;
+        column.torque = sample.torque_on_body_a_per_lambda_abs;
+    } else if (sample.use_custom_wrench && sample.body_b == body3) {
+        column.force = sample.force_on_body_b_per_lambda_abs;
+        column.torque = sample.torque_on_body_b_per_lambda_abs;
+    } else if (sample.body_a == body3) {
+        column.force = sample.normal_abs * column.scale;
+        column.torque = (sample.point_abs - body3->GetPos()).Cross(column.force);
+    } else if (sample.body_b == body3) {
+        column.force = sample.normal_abs * (-column.scale);
+        column.torque = (sample.point_abs - body3->GetPos()).Cross(column.force);
+    }
+    return column;
+}
+
+std::vector<ChSdfNcpDescriptorContactState> MakeRevClearanceStatesFromPressures(
+    const std::vector<ChSdfNcpDescriptorContact>& contacts,
+    const std::vector<double>& pressures) {
+    std::vector<ChSdfNcpDescriptorContactState> states;
+    states.reserve(contacts.size());
+    for (size_t i = 0; i < contacts.size(); i++) {
+        const double pressure = i < pressures.size() && std::isfinite(pressures[i]) ? std::max(0.0, pressures[i]) : 0.0;
+        const double scale = RevClearanceContactForceScale(contacts[i]);
+        ChSdfNcpDescriptorContactState state;
+        state.sample = contacts[i];
+        state.lambda_n = pressure;
+        state.lambda_force = pressure * scale;
+        state.penetration = std::max(0.0, -contacts[i].gap);
+        state.ncp_residual = SmoothFischerBurmeister(contacts[i].gap, pressure, 1.0e-7);
+        state.complementarity_error = ComplementarityError(contacts[i].gap, pressure);
+        state.active = pressure > 0.0 || contacts[i].gap <= 0.0;
+        states.push_back(state);
+    }
+    return states;
+}
+
+std::vector<double> SolveProjectedWrenchNnls(const std::vector<RevClearancePressureColumn>& columns,
+                                             const RevClearanceIdealWrenchRow& target,
+                                             double force_weight,
+                                             double torque_weight,
+                                             double regularization,
+                                             int iterations) {
+    const int n = static_cast<int>(columns.size());
+    std::vector<double> pressures(n, 0.0);
+    if (n == 0) {
+        return pressures;
+    }
+
+    const std::array<double, 6> y = {force_weight * target.force.x(),
+                                    force_weight * target.force.y(),
+                                    force_weight * target.force.z(),
+                                    torque_weight * target.torque_about_body_ref.x(),
+                                    torque_weight * target.torque_about_body_ref.y(),
+                                    torque_weight * target.torque_about_body_ref.z()};
+    std::vector<std::array<double, 6>> a(static_cast<size_t>(n));
+    std::vector<double> denom(static_cast<size_t>(n), regularization);
+    for (int i = 0; i < n; i++) {
+        a[static_cast<size_t>(i)] = {force_weight * columns[static_cast<size_t>(i)].force.x(),
+                                    force_weight * columns[static_cast<size_t>(i)].force.y(),
+                                    force_weight * columns[static_cast<size_t>(i)].force.z(),
+                                    torque_weight * columns[static_cast<size_t>(i)].torque.x(),
+                                    torque_weight * columns[static_cast<size_t>(i)].torque.y(),
+                                    torque_weight * columns[static_cast<size_t>(i)].torque.z()};
+        for (double value : a[static_cast<size_t>(i)]) {
+            denom[static_cast<size_t>(i)] += value * value;
+        }
+        denom[static_cast<size_t>(i)] = std::max(denom[static_cast<size_t>(i)], 1.0e-30);
+    }
+
+    std::array<double, 6> residual = {-y[0], -y[1], -y[2], -y[3], -y[4], -y[5]};
+    for (int iter = 0; iter < iterations; iter++) {
+        double max_delta = 0.0;
+        for (int i = 0; i < n; i++) {
+            const auto& col = a[static_cast<size_t>(i)];
+            double gradient = regularization * pressures[static_cast<size_t>(i)];
+            for (int row = 0; row < 6; row++) {
+                gradient += col[static_cast<size_t>(row)] * residual[static_cast<size_t>(row)];
+            }
+            const double next =
+                std::max(0.0, pressures[static_cast<size_t>(i)] - gradient / denom[static_cast<size_t>(i)]);
+            const double delta = next - pressures[static_cast<size_t>(i)];
+            if (delta != 0.0) {
+                pressures[static_cast<size_t>(i)] = next;
+                for (int row = 0; row < 6; row++) {
+                    residual[static_cast<size_t>(row)] += col[static_cast<size_t>(row)] * delta;
+                }
+                max_delta = std::max(max_delta, std::abs(delta));
+            }
+        }
+        if (max_delta < 1.0e-12) {
+            break;
+        }
+    }
+    return pressures;
+}
+
+std::vector<double> RevClearancePenetrationPressures(const std::vector<ChSdfNcpDescriptorContact>& contacts,
+                                                     double stiffness,
+                                                     double max_pressure) {
+    double active_area = 0.0;
+    for (const auto& contact : contacts) {
+        if (contact.gap < 0.0) {
+            active_area += RevClearanceContactForceScale(contact);
+        }
+    }
+    std::vector<double> pressures(contacts.size(), 0.0);
+    if (!(active_area > 1.0e-30)) {
+        return pressures;
+    }
+    for (size_t i = 0; i < contacts.size(); i++) {
+        const double penetration = std::max(0.0, -contacts[i].gap);
+        pressures[i] = std::min(max_pressure, std::max(0.0, stiffness * penetration / active_area));
+    }
+    return pressures;
+}
+
+std::vector<double> RevClearanceVelocityPressures(const std::vector<ChSdfNcpDescriptorContact>& contacts,
+                                                  double dt,
+                                                  double compliance,
+                                                  double baumgarte,
+                                                  double max_pressure) {
+    std::vector<double> pressures(contacts.size(), 0.0);
+    const double denom = std::max(compliance, 1.0e-14);
+    for (size_t i = 0; i < contacts.size(); i++) {
+        const auto& contact = contacts[i];
+        if (!contact.body_a || !contact.body_b) {
+            continue;
+        }
+        const ChVector3d va = RevClearancePointVelocityAbs(*contact.body_a, contact.point_abs);
+        const ChVector3d vb = RevClearancePointVelocityAbs(*contact.body_b, contact.point_abs);
+        const double gap_rate = contact.normal_abs.Dot(va - vb);
+        const double rhs = -(gap_rate + baumgarte * std::min(0.0, contact.gap) / std::max(dt, 1.0e-12));
+        pressures[i] = std::min(max_pressure, std::max(0.0, rhs / denom));
+    }
+    return pressures;
+}
+
+struct RevClearanceFrameSweepResult {
+    std::string method;
+    int contact_count = 0;
+    int patch_count = 0;
+    int active_pressure_count = 0;
+    double min_gap = 0.0;
+    double max_penetration = 0.0;
+    double pressure_sum = 0.0;
+    double pressure_max = 0.0;
+    RevClearanceContactWrench wrench;
+    double force_error_norm = 0.0;
+    double torque_error_norm = 0.0;
+    double weighted_wrench_error = 0.0;
+    std::string notes;
+};
+
+RevClearanceFrameSweepResult EvaluateRevClearanceFramePressures(
+    const std::string& method,
+    const std::vector<ChSdfNcpDescriptorContact>& contacts,
+    const std::vector<double>& pressures,
+    const std::shared_ptr<ChBodyAuxRef>& body3,
+    const RevClearanceIdealWrenchRow& ideal,
+    double force_weight,
+    double torque_weight,
+    const std::string& notes) {
+    RevClearanceFrameSweepResult out;
+    out.method = method;
+    out.contact_count = static_cast<int>(contacts.size());
+    out.notes = notes;
+    out.min_gap = contacts.empty() ? 0.0 : std::numeric_limits<double>::max();
+    std::set<int> patch_ids;
+    for (size_t i = 0; i < contacts.size(); i++) {
+        out.min_gap = std::min(out.min_gap, contacts[i].gap);
+        out.max_penetration = std::max(out.max_penetration, std::max(0.0, -contacts[i].gap));
+        if (contacts[i].patch_id >= 0) {
+            patch_ids.insert(contacts[i].patch_id);
+        }
+        const double pressure = i < pressures.size() ? std::max(0.0, pressures[i]) : 0.0;
+        out.pressure_sum += pressure;
+        out.pressure_max = std::max(out.pressure_max, pressure);
+        if (pressure > 0.0) {
+            out.active_pressure_count++;
+        }
+    }
+    out.patch_count = static_cast<int>(patch_ids.size());
+    const auto states = MakeRevClearanceStatesFromPressures(contacts, pressures);
+    out.wrench = ComputeRevClearanceContactWrench(states, body3, false);
+    const ChVector3d force_error = out.wrench.force_world - ideal.force;
+    const ChVector3d torque_error = out.wrench.torque_world - ideal.torque_about_body_ref;
+    out.force_error_norm = force_error.Length();
+    out.torque_error_norm = torque_error.Length();
+    out.weighted_wrench_error =
+        std::sqrt(std::pow(force_weight * force_error.x(), 2.0) + std::pow(force_weight * force_error.y(), 2.0) +
+                  std::pow(force_weight * force_error.z(), 2.0) + std::pow(torque_weight * torque_error.x(), 2.0) +
+                  std::pow(torque_weight * torque_error.y(), 2.0) + std::pow(torque_weight * torque_error.z(), 2.0));
+    return out;
+}
+
+int RunRevJointClearanceFrameSolverSweepCase(
+    const std::string& output_case_name = "rev_joint_clearance_frame_solver_sweep",
+    double voxel_size_override = -1.0) {
+    const auto start = std::chrono::steady_clock::now();
+    const auto root = GetProjectRoot();
+    const auto asset_dir = root / "assets" / "rev_joint_clearance";
+    const auto ideal_dir = root / "results" / "sdf_ncp_benchmarks" / "rev_joint_clearance_ideal_revolute";
+    const auto ideal_trajectory_path = ideal_dir / "trajectory.csv";
+    const auto ideal_wrench_path = ideal_dir / "joint_reaction_wrench.csv";
+    if (!std::filesystem::exists(ideal_trajectory_path) || !std::filesystem::exists(ideal_wrench_path)) {
+        const int status = RunRevJointClearanceIdealRevoluteCase();
+        if (status != 0) {
+            std::cerr << "Cannot generate ideal revolute reference for frame solver sweep." << std::endl;
+            return status;
+        }
+    }
+
+    const std::string source_case_name = "rev_joint_clearance_local_patch_delassus";
+    const auto source_dir = root / "results" / "sdf_ncp_benchmarks" / source_case_name;
+    const auto source_trajectory_path = source_dir / "trajectory.csv";
+    if (!std::filesystem::exists(source_trajectory_path)) {
+        RevClearanceRunOptions options;
+        options.case_name = source_case_name;
+        options.t_end_override = 3.0;
+        options.dt_override = 0.001;
+        options.local_patch_pressure_solve = true;
+        options.local_patch_delassus = true;
+        options.local_patch_pressure_compliance_scale = 0.03;
+        const int status = RunRevJointClearanceCase(options);
+        if (status != 0) {
+            std::cerr << "Cannot generate source contact trajectory for frame solver sweep: " << source_case_name
+                      << std::endl;
+            return status;
+        }
+    }
+
+    const auto source_frames = LoadRevClearanceIdealFrames(source_trajectory_path);
+    const auto ideal_wrenches = LoadRevClearanceIdealWrench(ideal_wrench_path);
+    if (source_frames.empty() || ideal_wrenches.empty()) {
+        std::cerr << "Source contact trajectory or ideal wrench reference is empty for frame solver sweep."
+                  << std::endl;
+        return 1;
+    }
+
+    const auto out_dir = root / "results" / "sdf_ncp_benchmarks" / output_case_name;
+    std::filesystem::create_directories(out_dir);
+
+    RevClearanceConfig config;
+    const std::string model_json = ReadTextFile(asset_dir / "rev_joint_clearance_model.json");
+    config.dt = ExtractJsonDouble(model_json, "step_size", config.dt);
+    config.t_end = ExtractJsonDouble(model_json, "total_time", config.t_end);
+    config.max_activation_band = ExtractJsonDouble(model_json, "collision_envelope", config.max_activation_band);
+    config.pressure_compliance = ExtractJsonDouble(model_json, "contact_compliance", config.pressure_compliance);
+    if (voxel_size_override > 0.0) {
+        config.voxel_size = voxel_size_override;
+    }
+
+    openvdb::initialize();
+    const RmdModel rmd = LoadRecurDynRmdModel(asset_dir / "rev_clearance_joint.rmd");
+    const RmdPart& body1_part = RequirePartByName(rmd, "Body1");
+    const RmdPart& body3_part = RequirePartByName(rmd, "Body3");
+    const RmdMarker& body1_cm = RequireMarkerById(rmd, body1_part.cm_marker_id);
+    const RmdMarker& body3_cm = RequireMarkerById(rmd, body3_part.cm_marker_id);
+    const RmdSolidContact& contact_law = RequireSolidContactByName(rmd, "GeoSurContact1");
+    WriteRmdMappingAudit(out_dir / "rmd_mapping.csv", rmd);
+
+    ChSdfTriangleMeshData bore_mesh =
+        LoadWavefrontMeshForSdf(asset_dir / "models" / "body1_subtract1_centered.obj");
+    ChSdfTriangleMeshData pin_mesh =
+        LoadWavefrontMeshForSdf(asset_dir / "models" / "body3_cylinder1_centered.obj");
+    ChOpenVdbSdfGrid bore_sdf = BuildOpenVdbLevelSetFromMesh(
+        bore_mesh, config.voxel_size, config.half_width_voxels);
+    ChSdfContactSurfaceGraph pin_graph = MakeSurfaceGraphFromMeshForSdf(pin_mesh);
+    ChSdfContactSampleBvh pin_bvh(pin_graph);
+
+    auto body1 = chrono_types::make_shared<ChBodyAuxRef>();
+    ConfigureAuxRefBodyFromRmdPart(rmd, body1_part, body1_cm, body1);
+    body1->SetFixed(true);
+    body1->SetPosDt(ChVector3d(0, 0, 0));
+    body1->SetAngVelParent(ChVector3d(0, 0, 0));
+
+    auto body3 = chrono_types::make_shared<ChBodyAuxRef>();
+    ConfigureAuxRefBodyFromRmdPart(rmd, body3_part, body3_cm, body3);
+
+    std::ofstream sweep(out_dir / "frame_solver_sweep.csv");
+    std::ofstream best(out_dir / "best_backend_by_frame.csv");
+    std::ofstream summary(out_dir / "summary.csv");
+    std::ofstream comparison(out_dir / "comparison.csv");
+    sweep << std::setprecision(17);
+    best << std::setprecision(17);
+    summary << std::setprecision(17);
+    comparison << std::setprecision(17);
+    sweep << "time,method,contact_count,patch_count,min_gap,max_penetration,ideal_force_norm,ideal_torque_norm,"
+             "force_x,force_y,force_z,force_norm,torque_x,torque_y,torque_z,torque_norm,force_error_norm,"
+             "torque_error_norm,weighted_wrench_error,pressure_sum,pressure_max,active_pressure_count,notes\n";
+    best << "time,best_method,weighted_wrench_error,force_error_norm,torque_error_norm,contact_count,patch_count,"
+            "active_pressure_count\n";
+    summary << "method,num_frames,mean_force_error,max_force_error,mean_torque_error,max_torque_error,"
+               "mean_weighted_wrench_error,max_weighted_wrench_error,mean_contact_count,mean_active_pressure_count,"
+               "best_frame_count,runtime_seconds,notes\n";
+    comparison << "case_name,metric,field_contact_value,sdf_ncp_value,absolute_difference,relative_difference,notes\n";
+
+    struct MethodStats {
+        int frames = 0;
+        int best_count = 0;
+        double force_error_sum = 0.0;
+        double force_error_max = 0.0;
+        double torque_error_sum = 0.0;
+        double torque_error_max = 0.0;
+        double weighted_error_sum = 0.0;
+        double weighted_error_max = 0.0;
+        double contact_count_sum = 0.0;
+        double active_pressure_count_sum = 0.0;
+        std::string notes;
+    };
+    std::map<std::string, MethodStats> stats;
+
+    bool finite_all = true;
+    for (const auto& frame : source_frames) {
+        body3->SetFrameRefToAbs(ChFrame<>(frame.body3_pos, frame.body3_rot));
+        body3->SetPosDt(frame.body3_vel);
+        body3->SetAngVelParent(frame.body3_omega);
+
+        const auto contacts = BuildRevClearanceDescriptorContacts(body1, body3, bore_sdf, pin_graph, pin_bvh, config);
+        std::vector<RevClearancePressureColumn> columns;
+        columns.reserve(contacts.size());
+        for (const auto& contact : contacts) {
+            columns.push_back(RevClearanceBody3PressureColumn(contact, body3));
+        }
+
+        const auto ideal = InterpolateRevClearanceIdealWrench(ideal_wrenches, frame.time);
+        const double force_scale = std::max(1.0, ideal.force.Length());
+        const double torque_scale = std::max(1.0, ideal.torque_about_body_ref.Length());
+        const double force_weight = 1.0 / force_scale;
+        const double torque_weight = 1.0 / torque_scale;
+        double lever_sum = 0.0;
+        int lever_count = 0;
+        for (const auto& column : columns) {
+            const double force_norm = column.force.Length();
+            if (force_norm > 1.0e-30) {
+                lever_sum += column.torque.Length() / force_norm;
+                lever_count++;
+            }
+        }
+        const double lever_scale = lever_count > 0 ? std::max(1.0e-4, lever_sum / static_cast<double>(lever_count)) :
+                                                     1.0e-2;
+        const double lever_torque_weight = 1.0 / std::max(1.0, force_scale * lever_scale);
+        double total_contact_area = 0.0;
+        for (const auto& contact : contacts) {
+            total_contact_area += RevClearanceContactForceScale(contact);
+        }
+        const double max_pressure =
+            std::max(1.0e8, 10.0 * std::abs(contact_law.stiffness) *
+                                  std::max(config.max_activation_band, contact_law.bpen) /
+                                  std::max(total_contact_area, 1.0e-12));
+
+        std::vector<RevClearanceFrameSweepResult> results;
+        results.push_back(EvaluateRevClearanceFramePressures(
+            "zero_pressure",
+            contacts,
+            std::vector<double>(contacts.size(), 0.0),
+            body3,
+            ideal,
+            force_weight,
+            torque_weight,
+            "diagnostic lower bound: same geometry with no contact pressure"));
+        results.push_back(EvaluateRevClearanceFramePressures(
+            "penetration_pressure",
+            contacts,
+            RevClearancePenetrationPressures(contacts, contact_law.stiffness, max_pressure),
+            body3,
+            ideal,
+            force_weight,
+            torque_weight,
+            "frame-local RecurDyn stiffness-style penetration pressure; no dynamics solve"));
+        results.push_back(EvaluateRevClearanceFramePressures(
+            "velocity_baumgarte_pressure",
+            contacts,
+            RevClearanceVelocityPressures(contacts, config.dt, config.pressure_compliance, 0.2, max_pressure),
+            body3,
+            ideal,
+            force_weight,
+            torque_weight,
+            "frame-local velocity/baumgarte pressure estimate; no global descriptor coupling"));
+        results.push_back(EvaluateRevClearanceFramePressures(
+            "oracle_force_nnls",
+            contacts,
+            SolveProjectedWrenchNnls(columns, ideal, force_weight, 0.0, 1.0e-18, 80),
+            body3,
+            ideal,
+            force_weight,
+            torque_weight,
+            "diagnostic upper bound: nonnegative sample pressures fitted to ideal force only"));
+        results.push_back(EvaluateRevClearanceFramePressures(
+            "oracle_wrench_nnls",
+            contacts,
+            SolveProjectedWrenchNnls(columns, ideal, force_weight, torque_weight, 1.0e-18, 160),
+            body3,
+            ideal,
+            force_weight,
+            torque_weight,
+            "diagnostic upper bound: nonnegative sample pressures fitted to ideal force and torque"));
+        results.push_back(EvaluateRevClearanceFramePressures(
+            "oracle_wrench_lever_scaled_nnls",
+            contacts,
+            SolveProjectedWrenchNnls(columns, ideal, force_weight, lever_torque_weight, 1.0e-18, 160),
+            body3,
+            ideal,
+            force_weight,
+            lever_torque_weight,
+            "diagnostic upper bound: torque scaled by ideal force times mean contact lever arm"));
+
+        const auto best_it = std::min_element(results.begin(), results.end(), [](const auto& a, const auto& b) {
+            return a.weighted_wrench_error < b.weighted_wrench_error;
+        });
+        if (best_it != results.end()) {
+            best << frame.time << "," << best_it->method << "," << best_it->weighted_wrench_error << ","
+                 << best_it->force_error_norm << "," << best_it->torque_error_norm << "," << best_it->contact_count
+                 << "," << best_it->patch_count << "," << best_it->active_pressure_count << "\n";
+        }
+
+        for (const auto& result : results) {
+            sweep << frame.time << "," << result.method << "," << result.contact_count << "," << result.patch_count
+                  << "," << result.min_gap << "," << result.max_penetration << "," << ideal.force.Length() << ","
+                  << ideal.torque_about_body_ref.Length() << "," << result.wrench.force_world.x() << ","
+                  << result.wrench.force_world.y() << "," << result.wrench.force_world.z() << ","
+                  << result.wrench.force_norm << "," << result.wrench.torque_world.x() << ","
+                  << result.wrench.torque_world.y() << "," << result.wrench.torque_world.z() << ","
+                  << result.wrench.torque_norm << "," << result.force_error_norm << "," << result.torque_error_norm
+                  << "," << result.weighted_wrench_error << "," << result.pressure_sum << ","
+                  << result.pressure_max << "," << result.active_pressure_count << "," << result.notes << "\n";
+            finite_all = finite_all && std::isfinite(result.weighted_wrench_error) &&
+                         std::isfinite(result.force_error_norm) && std::isfinite(result.torque_error_norm);
+            auto& method_stats = stats[result.method];
+            method_stats.frames++;
+            method_stats.force_error_sum += result.force_error_norm;
+            method_stats.force_error_max = std::max(method_stats.force_error_max, result.force_error_norm);
+            method_stats.torque_error_sum += result.torque_error_norm;
+            method_stats.torque_error_max = std::max(method_stats.torque_error_max, result.torque_error_norm);
+            method_stats.weighted_error_sum += result.weighted_wrench_error;
+            method_stats.weighted_error_max = std::max(method_stats.weighted_error_max, result.weighted_wrench_error);
+            method_stats.contact_count_sum += static_cast<double>(result.contact_count);
+            method_stats.active_pressure_count_sum += static_cast<double>(result.active_pressure_count);
+            method_stats.notes = result.notes;
+        }
+        if (best_it != results.end()) {
+            stats[best_it->method].best_count++;
+        }
+    }
+
+    const double runtime = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    for (const auto& [method, method_stats] : stats) {
+        const double denom = static_cast<double>(std::max(1, method_stats.frames));
+        summary << method << "," << method_stats.frames << "," << method_stats.force_error_sum / denom << ","
+                << method_stats.force_error_max << "," << method_stats.torque_error_sum / denom << ","
+                << method_stats.torque_error_max << "," << method_stats.weighted_error_sum / denom << ","
+                << method_stats.weighted_error_max << "," << method_stats.contact_count_sum / denom << ","
+                << method_stats.active_pressure_count_sum / denom << "," << method_stats.best_count << ","
+                << runtime << "," << method_stats.notes << "\n";
+        comparison << "rev_joint_clearance_frame_solver_sweep," << method << "_mean_weighted_wrench_error,0,"
+                   << method_stats.weighted_error_sum / denom << "," << method_stats.weighted_error_sum / denom
+                   << ",0," << method_stats.notes << "\n";
+    }
+    comparison << output_case_name << ",num_frames,0," << source_frames.size() << ","
+               << source_frames.size()
+               << ",0,frame-frozen diagnostic using source contact trajectory " << source_case_name
+               << " and ideal revolute wrench\n";
+    comparison << output_case_name << ",source_case,0,0,0,0," << source_case_name << "\n";
+    comparison << output_case_name << ",voxel_size,0," << config.voxel_size << "," << config.voxel_size
+               << ",0,OpenVDB voxel size used only for frozen-frame geometry query\n";
+
+    std::cout << "Wrote " << (out_dir / "frame_solver_sweep.csv").string() << std::endl;
+    std::cout << "Wrote " << (out_dir / "best_backend_by_frame.csv").string() << std::endl;
+    std::cout << "Wrote " << (out_dir / "summary.csv").string() << std::endl;
+    return finite_all ? 0 : 1;
 }
 
 int RunMode(const std::string& mode) {
@@ -4840,12 +8363,506 @@ int RunMode(const std::string& mode) {
                                              0.001,
                                              SimpleGearBackendMode::RecurDynGGeomContactLaw);
     }
+    if (mode == "rev_joint_clearance") {
+        return RunRevJointClearanceCase();
+    }
+    if (mode == "rev_joint_clearance_patch_pressure") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_patch_pressure";
+        options.t_end_override = 3.0;
+        options.dt_override = 0.001;
+        options.patch_pressure_aggregation = true;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_descriptor_patch_projection") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_descriptor_patch_projection";
+        options.t_end_override = 3.0;
+        options.dt_override = 0.001;
+        options.descriptor_patch_projection = true;
+        options.descriptor_patch_projection_strength = 0.15;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_descriptor_patch_projection_strong") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_descriptor_patch_projection_strong";
+        options.t_end_override = 3.0;
+        options.dt_override = 0.001;
+        options.descriptor_patch_projection = true;
+        options.descriptor_patch_projection_strength = 0.35;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_descriptor_patch_lcp") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_descriptor_patch_lcp";
+        options.t_end_override = 3.0;
+        options.dt_override = 0.001;
+        options.descriptor_patch_projection = true;
+        options.descriptor_patch_projection_strength = 1.0;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_descriptor_patch_delassus") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_descriptor_patch_delassus";
+        options.t_end_override = 3.0;
+        options.dt_override = 0.001;
+        options.descriptor_patch_delassus_solve = true;
+        options.descriptor_patch_laplacian_compliance_scale = 0.0;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_descriptor_patch_delassus_laplacian") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_descriptor_patch_delassus_laplacian";
+        options.t_end_override = 3.0;
+        options.dt_override = 0.001;
+        options.descriptor_patch_delassus_solve = true;
+        options.descriptor_patch_laplacian_compliance_scale = 0.25;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_descriptor_patch_velocity_delassus") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_descriptor_patch_velocity_delassus";
+        options.t_end_override = 3.0;
+        options.dt_override = 0.001;
+        options.descriptor_patch_delassus_solve = true;
+        options.descriptor_velocity_level_ncp = true;
+        options.descriptor_velocity_baumgarte = 0.2;
+        options.descriptor_patch_laplacian_compliance_scale = 0.0;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_descriptor_patch_velocity_delassus_laplacian") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_descriptor_patch_velocity_delassus_laplacian";
+        options.t_end_override = 3.0;
+        options.dt_override = 0.001;
+        options.descriptor_patch_delassus_solve = true;
+        options.descriptor_velocity_level_ncp = true;
+        options.descriptor_velocity_baumgarte = 0.2;
+        options.descriptor_patch_laplacian_compliance_scale = 0.25;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_descriptor_patch_velocity_delassus_soft") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_descriptor_patch_velocity_delassus_soft";
+        options.t_end_override = 3.0;
+        options.dt_override = 0.001;
+        options.descriptor_patch_delassus_solve = true;
+        options.descriptor_velocity_level_ncp = true;
+        options.descriptor_velocity_baumgarte = 0.1;
+        options.descriptor_patch_laplacian_compliance_scale = 0.0;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_descriptor_patch_velocity_wrench_closure") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_descriptor_patch_velocity_wrench_closure";
+        options.t_end_override = 3.0;
+        options.dt_override = 0.001;
+        options.descriptor_patch_delassus_solve = true;
+        options.descriptor_velocity_level_ncp = true;
+        options.descriptor_velocity_baumgarte = 0.2;
+        options.descriptor_patch_laplacian_compliance_scale = 0.0;
+        options.descriptor_patch_wrench_closure_strength = 0.05;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_descriptor_patch_velocity_wrench_closure_laplacian") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_descriptor_patch_velocity_wrench_closure_laplacian";
+        options.t_end_override = 3.0;
+        options.dt_override = 0.001;
+        options.descriptor_patch_delassus_solve = true;
+        options.descriptor_velocity_level_ncp = true;
+        options.descriptor_velocity_baumgarte = 0.2;
+        options.descriptor_patch_laplacian_compliance_scale = 0.25;
+        options.descriptor_patch_wrench_closure_strength = 0.05;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_descriptor_patch_velocity_wrench_closure_strong") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_descriptor_patch_velocity_wrench_closure_strong";
+        options.t_end_override = 3.0;
+        options.dt_override = 0.001;
+        options.descriptor_patch_delassus_solve = true;
+        options.descriptor_velocity_level_ncp = true;
+        options.descriptor_velocity_baumgarte = 0.2;
+        options.descriptor_patch_laplacian_compliance_scale = 0.25;
+        options.descriptor_patch_wrench_closure_strength = 0.2;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_manifold_no_prediction") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_manifold_no_prediction";
+        options.t_end_override = 3.0;
+        options.dt_override = 0.001;
+        options.manifold_use_prediction = false;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_bidirectional") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_bidirectional";
+        options.t_end_override = 3.0;
+        options.dt_override = 0.001;
+        options.bidirectional_contact = true;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_bidirectional_no_prediction") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_bidirectional_no_prediction";
+        options.t_end_override = 3.0;
+        options.dt_override = 0.001;
+        options.bidirectional_contact = true;
+        options.manifold_use_prediction = false;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_bidirectional_patch_lcp") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_bidirectional_patch_lcp";
+        options.t_end_override = 3.0;
+        options.dt_override = 0.001;
+        options.bidirectional_contact = true;
+        options.descriptor_patch_projection = true;
+        options.descriptor_patch_projection_strength = 1.0;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_local_patch_pressure") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_local_patch_pressure";
+        options.t_end_override = 3.0;
+        options.dt_override = 0.001;
+        options.local_patch_pressure_solve = true;
+        options.local_patch_pressure_compliance_scale = 0.1;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_local_patch_pressure_balanced") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_local_patch_pressure_balanced";
+        options.t_end_override = 3.0;
+        options.dt_override = 0.001;
+        options.local_patch_pressure_solve = true;
+        options.local_patch_pressure_compliance_scale = 0.03;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_local_patch_pressure_stiff") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_local_patch_pressure_stiff";
+        options.t_end_override = 3.0;
+        options.dt_override = 0.001;
+        options.local_patch_pressure_solve = true;
+        options.local_patch_pressure_compliance_scale = 0.01;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_local_patch_delassus") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_local_patch_delassus";
+        options.t_end_override = 3.0;
+        options.dt_override = 0.001;
+        options.local_patch_pressure_solve = true;
+        options.local_patch_delassus = true;
+        options.local_patch_pressure_compliance_scale = 0.03;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_local_patch_wrench_closure") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_local_patch_wrench_closure";
+        options.t_end_override = 3.0;
+        options.dt_override = 0.001;
+        options.local_patch_pressure_solve = true;
+        options.local_patch_delassus = true;
+        options.local_patch_wrench_closure = true;
+        options.local_patch_pressure_compliance_scale = 0.03;
+        options.local_patch_wrench_force_weight = 1.0;
+        options.local_patch_wrench_torque_weight = 1.0;
+        options.local_patch_wrench_regularization = 1.0e-18;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_local_patch_wrench_closure_torque") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_local_patch_wrench_closure_torque";
+        options.t_end_override = 3.0;
+        options.dt_override = 0.001;
+        options.local_patch_pressure_solve = true;
+        options.local_patch_delassus = true;
+        options.local_patch_wrench_closure = true;
+        options.local_patch_pressure_compliance_scale = 0.03;
+        options.local_patch_wrench_force_weight = 1.0;
+        options.local_patch_wrench_torque_weight = 25.0;
+        options.local_patch_wrench_regularization = 1.0e-18;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_local_patch_wrench_closure_torque100") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_local_patch_wrench_closure_torque100";
+        options.t_end_override = 3.0;
+        options.dt_override = 0.001;
+        options.local_patch_pressure_solve = true;
+        options.local_patch_delassus = true;
+        options.local_patch_wrench_closure = true;
+        options.local_patch_pressure_compliance_scale = 0.03;
+        options.local_patch_wrench_force_weight = 1.0;
+        options.local_patch_wrench_torque_weight = 100.0;
+        options.local_patch_wrench_regularization = 1.0e-18;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_local_patch_wrench_closure_torque250") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_local_patch_wrench_closure_torque250";
+        options.t_end_override = 3.0;
+        options.dt_override = 0.001;
+        options.local_patch_pressure_solve = true;
+        options.local_patch_delassus = true;
+        options.local_patch_wrench_closure = true;
+        options.local_patch_pressure_compliance_scale = 0.03;
+        options.local_patch_wrench_force_weight = 1.0;
+        options.local_patch_wrench_torque_weight = 250.0;
+        options.local_patch_wrench_regularization = 1.0e-18;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_local_patch_wrench_closure_torque500") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_local_patch_wrench_closure_torque500";
+        options.t_end_override = 3.0;
+        options.dt_override = 0.001;
+        options.local_patch_pressure_solve = true;
+        options.local_patch_delassus = true;
+        options.local_patch_wrench_closure = true;
+        options.local_patch_pressure_compliance_scale = 0.03;
+        options.local_patch_wrench_force_weight = 1.0;
+        options.local_patch_wrench_torque_weight = 500.0;
+        options.local_patch_wrench_regularization = 1.0e-18;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_local_patch_wrench_closure_torque1000") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_local_patch_wrench_closure_torque1000";
+        options.t_end_override = 3.0;
+        options.dt_override = 0.001;
+        options.local_patch_pressure_solve = true;
+        options.local_patch_delassus = true;
+        options.local_patch_wrench_closure = true;
+        options.local_patch_pressure_compliance_scale = 0.03;
+        options.local_patch_wrench_force_weight = 1.0;
+        options.local_patch_wrench_torque_weight = 1000.0;
+        options.local_patch_wrench_regularization = 1.0e-18;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_local_patch_global_wrench_demand") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_local_patch_global_wrench_demand";
+        options.t_end_override = 3.0;
+        options.dt_override = 0.001;
+        options.local_patch_pressure_solve = true;
+        options.local_patch_delassus = true;
+        options.local_patch_wrench_closure = true;
+        options.local_patch_global_wrench_demand = true;
+        options.local_patch_pressure_compliance_scale = 0.03;
+        options.local_patch_wrench_force_weight = 1.0;
+        options.local_patch_wrench_torque_weight = 1.0;
+        options.local_patch_wrench_regularization = 1.0e-18;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_local_patch_global_wrench_demand_torque1000") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_local_patch_global_wrench_demand_torque1000";
+        options.t_end_override = 3.0;
+        options.dt_override = 0.001;
+        options.local_patch_pressure_solve = true;
+        options.local_patch_delassus = true;
+        options.local_patch_wrench_closure = true;
+        options.local_patch_global_wrench_demand = true;
+        options.local_patch_pressure_compliance_scale = 0.03;
+        options.local_patch_wrench_force_weight = 1.0;
+        options.local_patch_wrench_torque_weight = 1000.0;
+        options.local_patch_wrench_regularization = 1.0e-18;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_local_patch_global_wrench_demand_short") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_local_patch_global_wrench_demand_short";
+        options.t_end_override = 0.5;
+        options.dt_override = 0.001;
+        options.local_patch_pressure_solve = true;
+        options.local_patch_delassus = true;
+        options.local_patch_wrench_closure = true;
+        options.local_patch_global_wrench_demand = true;
+        options.local_patch_pressure_compliance_scale = 0.03;
+        options.local_patch_wrench_force_weight = 1.0;
+        options.local_patch_wrench_torque_weight = 1.0;
+        options.local_patch_wrench_regularization = 1.0e-18;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_local_patch_global_wrench_demand_torque1000_short") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_local_patch_global_wrench_demand_torque1000_short";
+        options.t_end_override = 0.5;
+        options.dt_override = 0.001;
+        options.local_patch_pressure_solve = true;
+        options.local_patch_delassus = true;
+        options.local_patch_wrench_closure = true;
+        options.local_patch_global_wrench_demand = true;
+        options.local_patch_pressure_compliance_scale = 0.03;
+        options.local_patch_wrench_force_weight = 1.0;
+        options.local_patch_wrench_torque_weight = 1000.0;
+        options.local_patch_wrench_regularization = 1.0e-18;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_local_patch_augmented_wrench_closure_torque1000") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_local_patch_augmented_wrench_closure_torque1000";
+        options.t_end_override = 3.0;
+        options.dt_override = 0.001;
+        options.local_patch_pressure_solve = true;
+        options.local_patch_delassus = true;
+        options.local_patch_wrench_closure = true;
+        options.local_patch_integrated_wrench_closure = true;
+        options.local_patch_pressure_compliance_scale = 0.03;
+        options.local_patch_wrench_force_weight = 1.0;
+        options.local_patch_wrench_torque_weight = 1000.0;
+        options.local_patch_wrench_regularization = 1.0e-18;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_local_patch_augmented_wrench_closure_torque500") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_local_patch_augmented_wrench_closure_torque500";
+        options.t_end_override = 3.0;
+        options.dt_override = 0.001;
+        options.local_patch_pressure_solve = true;
+        options.local_patch_delassus = true;
+        options.local_patch_wrench_closure = true;
+        options.local_patch_integrated_wrench_closure = true;
+        options.local_patch_pressure_compliance_scale = 0.03;
+        options.local_patch_wrench_force_weight = 1.0;
+        options.local_patch_wrench_torque_weight = 500.0;
+        options.local_patch_wrench_regularization = 1.0e-18;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_local_patch_wrench_closure_torque2000") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_local_patch_wrench_closure_torque2000";
+        options.t_end_override = 3.0;
+        options.dt_override = 0.001;
+        options.local_patch_pressure_solve = true;
+        options.local_patch_delassus = true;
+        options.local_patch_wrench_closure = true;
+        options.local_patch_pressure_compliance_scale = 0.03;
+        options.local_patch_wrench_force_weight = 1.0;
+        options.local_patch_wrench_torque_weight = 2000.0;
+        options.local_patch_wrench_regularization = 1.0e-18;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_bidirectional_local_patch_wrench_closure") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_bidirectional_local_patch_wrench_closure";
+        options.t_end_override = 3.0;
+        options.dt_override = 0.001;
+        options.bidirectional_contact = true;
+        options.local_patch_pressure_solve = true;
+        options.local_patch_delassus = true;
+        options.local_patch_wrench_closure = true;
+        options.local_patch_pressure_compliance_scale = 0.03;
+        options.local_patch_wrench_force_weight = 1.0;
+        options.local_patch_wrench_torque_weight = 1.0;
+        options.local_patch_wrench_regularization = 1.0e-8;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_local_patch_delassus_soft") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_local_patch_delassus_soft";
+        options.t_end_override = 3.0;
+        options.dt_override = 0.001;
+        options.local_patch_pressure_solve = true;
+        options.local_patch_delassus = true;
+        options.local_patch_pressure_compliance_scale = 0.1;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_local_patch_delassus_stiff") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_local_patch_delassus_stiff";
+        options.t_end_override = 3.0;
+        options.dt_override = 0.001;
+        options.local_patch_pressure_solve = true;
+        options.local_patch_delassus = true;
+        options.local_patch_pressure_compliance_scale = 0.01;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_ideal_revolute") {
+        return RunRevJointClearanceIdealRevoluteCase();
+    }
+    if (mode == "rev_joint_clearance_frame_solver_sweep") {
+        return RunRevJointClearanceFrameSolverSweepCase();
+    }
+    if (mode == "rev_joint_clearance_frame_solver_sweep_voxel_001") {
+        return RunRevJointClearanceFrameSolverSweepCase("rev_joint_clearance_frame_solver_sweep_voxel_001", 0.001);
+    }
+    if (mode == "rev_joint_clearance_frame_solver_sweep_voxel_0005") {
+        return RunRevJointClearanceFrameSolverSweepCase("rev_joint_clearance_frame_solver_sweep_voxel_0005", 0.0005);
+    }
+    if (mode == "rev_joint_clearance_ggeomcontact_calibration" ||
+        mode == "rev_joint_clearance_recurdyn_ggeomcontact") {
+        return RunRevJointClearanceCase("rev_joint_clearance_ggeomcontact_calibration", 3.0, 0.001, true);
+    }
+    if (mode == "rev_joint_clearance_ggeomcontact_hht") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_ggeomcontact_hht";
+        options.t_end_override = 3.0;
+        options.dt_override = 0.001;
+        options.use_recurdyn_ggeomcontact_law = true;
+        options.timestepper_type = ChTimestepper::Type::HHT;
+        options.timestepper_label = "hht_alpha_minus_0p2_fixed_step";
+        options.use_step_control = false;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_ggeomcontact_euler_substep") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_ggeomcontact_euler_substep";
+        options.t_end_override = 3.0;
+        options.dt_override = 0.001;
+        options.use_recurdyn_ggeomcontact_law = true;
+        options.contact_substepping = true;
+        options.startup_substepping = true;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_ggeomcontact_hht_substep") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_ggeomcontact_hht_substep";
+        options.t_end_override = 3.0;
+        options.dt_override = 0.001;
+        options.use_recurdyn_ggeomcontact_law = true;
+        options.timestepper_type = ChTimestepper::Type::HHT;
+        options.timestepper_label = "hht_alpha_minus_0p2_fixed_step";
+        options.use_step_control = false;
+        options.contact_substepping = true;
+        options.startup_substepping = true;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_hht_substep") {
+        RevClearanceRunOptions options;
+        options.case_name = "rev_joint_clearance_hht_substep";
+        options.t_end_override = 3.0;
+        options.dt_override = 0.001;
+        options.timestepper_type = ChTimestepper::Type::HHT;
+        options.timestepper_label = "hht_alpha_minus_0p2_fixed_step";
+        options.use_step_control = false;
+        options.contact_substepping = true;
+        options.startup_substepping = true;
+        return RunRevJointClearanceCase(options);
+    }
+    if (mode == "rev_joint_clearance_integrator_sweep") {
+        int status = 0;
+        status |= RunRevJointClearanceCase("rev_joint_clearance_ggeomcontact_calibration", 3.0, 0.001, true);
+        status |= RunMode("rev_joint_clearance_ggeomcontact_hht");
+        status |= RunMode("rev_joint_clearance_ggeomcontact_euler_substep");
+        status |= RunMode("rev_joint_clearance_ggeomcontact_hht_substep");
+        return status;
+    }
+    if (mode == "rev_joint_clearance_short") {
+        return RunRevJointClearanceCase("rev_joint_clearance_short", 0.2, 0.001);
+    }
     if (mode == "all") {
         int status = 0;
         status |= RunCamChronoMbdCase();
         status |= RunCamLikeFullGeometryCase("eccentric_roller");
         status |= RunCamLikeFullGeometryCase("onset_stress");
         status |= RunSimpleGearFullGeometryCase();
+        status |= RunRevJointClearanceCase();
         return status;
     }
     std::cerr << "Unknown OpenVDB SDF-NCP benchmark mode: " << mode << std::endl;

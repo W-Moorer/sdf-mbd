@@ -383,6 +383,12 @@ if(OpenVDB_FOUND)
       set_tests_properties(sdf_ncp_benchmark_simple_gear_full_geometry PROPERTIES
                            LABELS "collision;field_contact;sdf_ncp;sdf_ncp_benchmark"
                            TIMEOUT 120)
+
+      add_test(NAME sdf_ncp_benchmark_rev_joint_clearance_short
+               COMMAND "$<TARGET_FILE:demo_CH_sdf_ncp_benchmarks_openvdb>" rev_joint_clearance_short)
+      set_tests_properties(sdf_ncp_benchmark_rev_joint_clearance_short PROPERTIES
+                           LABELS "collision;field_contact;sdf_ncp;sdf_ncp_benchmark"
+                           TIMEOUT 120)
     else()
       message(STATUS "Python3 interpreter not found - skipping OpenVDB field-contact regression tests")
     endif()

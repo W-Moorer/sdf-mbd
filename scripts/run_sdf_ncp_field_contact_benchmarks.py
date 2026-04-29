@@ -24,22 +24,31 @@ DEFAULT_CASES = [
     "eccentric_roller",
     "onset_stress",
     "simple_gear",
+    "rev_joint_clearance",
 ]
 REFERENCE_CASES = [
     "cam_recurdyn_solid_contact",
+    "rev_joint_clearance_ggeomcontact_calibration",
+    "rev_joint_clearance_ggeomcontact_hht",
+    "rev_joint_clearance_ggeomcontact_euler_substep",
+    "rev_joint_clearance_ggeomcontact_hht_substep",
+]
+MANUAL_CASES = [
+    "rev_joint_clearance_hht_substep",
 ]
 SIMPLE_GEAR_DT_SWEEP_CASES = [
     "simple_gear_dt_001",
     "simple_gear_dt_0005",
     "simple_gear_dt_0001",
 ]
-MANUAL_CASES: list[str] = []
 OPENVDB_CASES = {
     "cam",
     "eccentric_roller",
     "onset_stress",
     "simple_gear",
+    "rev_joint_clearance",
     *REFERENCE_CASES,
+    *MANUAL_CASES,
     *SIMPLE_GEAR_DT_SWEEP_CASES,
 }
 

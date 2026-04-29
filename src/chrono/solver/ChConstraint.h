@@ -204,6 +204,20 @@ class ChApi ChConstraint {
     /// - a 'boxed constraint': l_i= std::min(std::max(min., l_i), max)
     virtual void Project();
 
+    /// Optional grouped projection hook.
+    ///
+    /// Standard constraints return false. Specialized unilateral constraints can
+    /// override this to project a group of coupled multipliers and increment the
+    /// associated variable states consistently for all changed multipliers.
+    /// The argument old_lambda_current is the value of this row before the
+    /// solver's tentative update.
+    virtual bool ProjectGroupAndIncrementState(double old_lambda_current,
+                                               double sharpness,
+                                               bool record_violation_history,
+                                               double& max_delta_lambda) {
+        return false;
+    }
+
     /// Return the constraint violation.
     /// The function receives as input the linear map
     /// <pre>

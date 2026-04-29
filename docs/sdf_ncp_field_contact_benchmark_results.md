@@ -939,3 +939,66 @@ python scripts\validate_sdf_ncp_simple_gear_dt_sweep.py
 1. BVH 仍是静态 local-space sample BVH，每步通过 transformed AABB 查询，不是连续碰撞检测。
 2. broad phase 只保证不会改变 active patch 的 intended band；极端高速运动仍需要后续 swept AABB 或时间连续 active set。
 3. 真正的 SDF-NCP 收敛精度仍由 active patch、SDF 离散化、接触律和 Newton/AD Jacobian 决定；BVH 只解决候选搜索效率。
+
+## 2026-04-29 更新：rev_joint_clearance SDF-NCP benchmark
+
+`rev_joint_clearance` 已接入完整几何 SDF-NCP benchmark。该算例使用：
+
+```text
+assets/rev_joint_clearance/rev_clearance_joint.rmd
+assets/rev_joint_clearance/models/body1_subtract1_centered.obj
+assets/rev_joint_clearance/models/body3_cylinder1_centered.obj
+assets/rev_joint_clearance/data/body2.csv
+assets/rev_joint_clearance/data/body3.csv
+```
+
+建模路径：
+
+```text
+RMD Body1/Body2/Body3 + Fixed1/Fixed2
+Body1.Subtract1 OBJ -> OpenVDB SDF
+Body3.Cylinder1 OBJ -> surface graph + AABB BVH
+Body3 samples -> Body1 SDF query
+ChSdfNcpConstraintContactSet descriptor path
+RecurDyn body2/body3 CSV comparison
+```
+
+当前完整 3 秒运行命令：
+
+```text
+build\bin\Release\demo_CH_sdf_ncp_benchmarks_openvdb.exe rev_joint_clearance
+python scripts\plot_sdf_ncp_field_contact_benchmarks.py
+```
+
+输出：
+
+```text
+results/sdf_ncp_benchmarks/rev_joint_clearance/trajectory.csv
+results/sdf_ncp_benchmarks/rev_joint_clearance/summary.csv
+results/sdf_ncp_benchmarks/rev_joint_clearance/comparison.csv
+results/sdf_ncp_benchmarks/rev_joint_clearance/recurdyn_reference_comparison_timeseries.csv
+results/sdf_ncp_benchmarks/rev_joint_clearance/recurdyn_reference_comparison_summary.csv
+results/sdf_ncp_benchmarks/figures/rev_joint_clearance/
+```
+
+当前统计：
+
+| quantity | value |
+|---|---:|
+| `success_rate` | `1` |
+| `max_penetration` | `0` |
+| `max_lambda_n` | `46292.474861248957` |
+| `max_ncp_residual` | `0.012568139367502403` |
+| `max_complementarity_error` | `90.07090329970265` |
+| `runtime_seconds` | `15.4644972` |
+| `body2_y_rmse_vs_recurdyn` | `0.67076679030986863` |
+| `body2_z_rmse_vs_recurdyn` | `0.45840028100800234` |
+| `body3_y_rmse_vs_recurdyn` | `0.019253805588352407` |
+| `body3_z_rmse_vs_recurdyn` | `0.00456934007894573` |
+
+解释：
+
+1. `Body3` 的位置曲线已经能给出稳定、有限的 SDF-NCP descriptor rollout。
+2. `Body2` 的误差仍明显偏大，需要继续核对 RecurDyn 输出坐标是否是 CM、marker 还是 joint frame 坐标。
+3. 当前 hard SDF-NCP 与 RecurDyn `GGEOMCONTACT K/C/KORDER/BPEN` penalty/damping 接触律不同，因此不能把曲线差异全部归因于 SDF query。
+4. 当前已经进入完整 Chrono MBD 约束路径，不是 reduced local residual。

@@ -137,18 +137,21 @@ double ChSolverPSOR::Solve(ChSystemDescriptor& sysd) {
                     constraints[ic]->SetLagrangeMultiplier(old_lambda_friction[0] + deltal);
 
                     candidate_violation = fabs(std::min(0.0, mresidual));
-                    constraints[ic]->Project();
-                    double new_lambda_0 = constraints[ic]->GetLagrangeMultiplier();
-                    if (m_shlambda != 1.0) {
-                        new_lambda_0 = m_shlambda * new_lambda_0 + (1.0 - m_shlambda) * old_lambda_friction[0];
-                        constraints[ic]->SetLagrangeMultiplier(new_lambda_0);
-                    }
+                    if (!constraints[ic]->ProjectGroupAndIncrementState(
+                            old_lambda_friction[0], m_shlambda, this->record_violation_history, maxdeltalambda)) {
+                        constraints[ic]->Project();
+                        double new_lambda_0 = constraints[ic]->GetLagrangeMultiplier();
+                        if (m_shlambda != 1.0) {
+                            new_lambda_0 = m_shlambda * new_lambda_0 + (1.0 - m_shlambda) * old_lambda_friction[0];
+                            constraints[ic]->SetLagrangeMultiplier(new_lambda_0);
+                        }
 
-                    double true_delta_0 = new_lambda_0 - old_lambda_friction[0];
-                    constraints[ic]->IncrementState(true_delta_0);
+                        double true_delta_0 = new_lambda_0 - old_lambda_friction[0];
+                        constraints[ic]->IncrementState(true_delta_0);
 
-                    if (this->record_violation_history) {
-                        maxdeltalambda = std::max(maxdeltalambda, fabs(true_delta_0));
+                        if (this->record_violation_history) {
+                            maxdeltalambda = std::max(maxdeltalambda, fabs(true_delta_0));
+                        }
                     }
 
                 } else {

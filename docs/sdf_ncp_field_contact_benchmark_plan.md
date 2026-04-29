@@ -281,6 +281,45 @@ GEAR21 surface -> GEAR22 SDF
 
 `rev_joint_clearance` 仍未实现 SDF-NCP benchmark，原因是它需要将间隙关节约束与 3D 刚体自由度一起映射到同一 generalized residual；这应作为下一批完整 RecurDyn 映射任务处理，而不是再写 reduced toy model。
 
+## 2026-04-29 更新：rev_joint_clearance 接入计划状态
+
+`rev_joint_clearance` 已进入 SDF-NCP benchmark 实现路径，不再作为暂缓项处理。当前采用的建模路线是：
+
+```text
+assets/rev_joint_clearance/rev_clearance_joint.rmd
+assets/rev_joint_clearance/models/body1_subtract1_centered.obj
+assets/rev_joint_clearance/models/body3_cylinder1_centered.obj
+assets/rev_joint_clearance/data/body2.csv
+assets/rev_joint_clearance/data/body3.csv
+```
+
+前端映射：
+
+1. `Body1` 通过 `Fixed1` 固定到 ground。
+2. `Body2` 和 `Body3` 通过 `Fixed2` 固定为同一刚体组合。
+3. `Body3.Cylinder1` surface samples 查询 `Body1.Subtract1` OpenVDB SDF。
+4. 接触候选使用 AABB BVH broad phase，再进入 active-band patch。
+5. 后端使用通用 `ChSdfNcpConstraintContactSet` descriptor path，不新增 case-specific NCP residual。
+
+输出路径：
+
+```text
+results/sdf_ncp_benchmarks/rev_joint_clearance/
+results/sdf_ncp_benchmarks/figures/rev_joint_clearance/
+```
+
+短 CTest 使用：
+
+```text
+demo_CH_sdf_ncp_benchmarks_openvdb.exe rev_joint_clearance_short
+```
+
+完整 3 秒对比使用：
+
+```text
+demo_CH_sdf_ncp_benchmarks_openvdb.exe rev_joint_clearance
+```
+
 ### 参考类型与一致性要求
 
 benchmark 必须先按参考来源分类，再决定一致性检查内容：
