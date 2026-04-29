@@ -1023,7 +1023,7 @@ w_i = J_i v_next + b_i + beta g_i / dt + cfm p_i
 
 ### 阶段 3：自动微分 Jacobian
 
-mixed 后端的 residual/Jacobian 使用轻量前向自动微分 `ChSdfNcpAdScalar` 计算，不再对该代数块使用黑箱有限差分。OpenVDB/SDF 查询仍作为前端 oracle 提供 `gap`、`J` 和 active samples；OpenVDB 几何 Hessian / active-set 半光滑导数仍是后续工作。
+mixed 后端的 residual/Jacobian 使用轻量前向自动微分 `ChSdfNcpAdScalar` 计算，不再对该代数块使用黑箱有限差分。OpenVDB/SDF 查询作为前端 oracle 提供 `gap`、`J`、active samples，并在 simple gear 路径中提供 OpenVDB 插值 Hessian，用于 `d normal / d q` 和 `dJ_phi / dq` 的链式法则。
 
 ### 阶段 4：driver gap-rate offset
 
@@ -1096,3 +1096,80 @@ results/sdf_ncp_benchmarks/simple_gear_dt_sweep_summary.csv
 | simple_gear_dt_0001 | 0.0001 | 1 | 1.0003219585996703e-07 | 0.055549608448871655 | 0.11795684023219731 | -0.96901542949800457 |
 
 结论：`dt=0.001` 未比当前基线变差；`dt=0.0005` 和 `dt=0.0001` 不再发散；三组 `success_rate = 1`；穿透量有界；MAE/RMSE 没有随时间步减小而爆炸。
+
+## 2026-04-29 更新：OpenVDB 几何导数与 active-set 半光滑 Jacobian
+
+本轮将 simple gear 路径中原先用于 `dJ/dtheta22` 的角度有限差分替换为 OpenVDB 插值几何导数。前端仍然只负责几何查询，通用 NCP 后端不读取 OBJ、RMD 或 OpenVDB 数据结构。
+
+### OpenVDB 查询输出
+
+`ChSdfContactSampleQuery` 现在除 `phi` 和单位 `grad` 外，还包含：
+
+```text
+raw_grad
+raw_grad_norm
+hessian_x, hessian_y, hessian_z
+has_hessian
+```
+
+其中 Hessian 是 OpenVDB 插值标量场 `phi(x)` 的局部二阶导数列。单位法向导数通过投影公式计算：
+
+```text
+dn = (I - n n^T) H dx / ||raw_grad||
+```
+
+这给前端提供了 `d normal / dq`，避免在 generalized coordinate 上对整个 SDF query 做黑箱有限差分。
+
+### simple gear 的链式法则
+
+对于 `GEAR22 -> GEAR21 SDF` 方向：
+
+```text
+x = c22 + R22 r22
+g = phi21(R21^T (x - c21))
+J22 = (R22 r22 x n)^T e_x
+dJ22/dtheta22 = (dr/dtheta22 x n + r x dn/dtheta22)^T e_x
+```
+
+对于 `GEAR21 -> GEAR22 SDF` 方向：
+
+```text
+x = c21 + R21 r21
+g = phi22(R22^T (x - c22))
+J22 = -(x - c22 x n)^T e_x
+dJ22/dtheta22 = -((x - c22) x dn/dtheta22)^T e_x
+```
+
+`dn/dtheta22` 由 OpenVDB Hessian、body-frame/world-frame 旋转导数和单位法向归一化导数共同给出。
+
+### active-set 半光滑处理
+
+当前 active patch 仍由 connected component 和 hysteresis 生成。Newton 内层固定 `sample_refs`，因此 residual/Jacobian 对固定 active set 求解；外层半光滑 active-set 迭代在 trial solve 后重新生成 patch，若 persistent sample id 稳定则接受，否则用 warm start 继续下一轮。这样 active patch 切换不会被混入单次 Newton Jacobian。
+
+### mixed NCP Jacobian
+
+`ComputeSdfNcpGeneralizedImpulseMixedAd` 现在消费 `contact.jacobian_velocity_derivative`。在 AD 代数中使用一阶线性化：
+
+```text
+J(v) ~= J0 + dJ/dv (v - v0)
+```
+
+因此 velocity-level normal velocity 和 generalized impulse residual 同时包含几何导数项。对 simple gear，小时间步 mixed backend 默认使用该导数；`dt = 0.001` 的 force-level 基线仍保持不变。诊断中试过对 `dt = 0.001` 的 force-level 路径强制打开 analytic geometry Jacobian，结果会降低 success rate 并放大误差，因此该 force-level 开关已删除，不再暴露为可选 benchmark 路径。
+
+### 最新 dt sweep
+
+运行：
+
+```text
+python scripts\validate_sdf_ncp_simple_gear_dt_sweep.py
+```
+
+得到：
+
+| case | dt | success_rate | max_penetration | MAE | RMSE | final omega22 |
+|---|---:|---:|---:|---:|---:|---:|
+| simple_gear_dt_001 | 0.001 | 1 | 8.2869746620417573e-09 | 0.065929736198861666 | 0.10246898597734395 | -1.0511661888263963 |
+| simple_gear_dt_0005 | 0.0005 | 1 | 1.0006613138102693e-07 | 0.063319570651797885 | 0.13101056370576455 | -0.96574456900269146 |
+| simple_gear_dt_0001 | 0.0001 | 1 | 1.0003219585996703e-07 | 0.055550703486665146 | 0.11795585683594351 | -0.96901368213534234 |
+
+验收结论保持成立：`dt=0.001` 不比基线差；`dt=0.0005` 和 `dt=0.0001` 不发散；`success_rate = 1`；最大穿透有界；MAE/RMSE 未随时间步减小而爆炸。

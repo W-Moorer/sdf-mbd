@@ -63,7 +63,7 @@ struct ChOpenVdbSdfGrid {
         return static_cast<double>(sampler.wsSample(openvdb::Vec3d(local_pos.x(), local_pos.y(), local_pos.z())));
     }
 
-    ChVector3d SampleGradient(const ChVector3d& local_pos) const {
+    ChVector3d SampleRawGradient(const ChVector3d& local_pos) const {
         if (voxel_size <= 0.0) {
             throw std::runtime_error("ChOpenVdbSdfGrid voxel_size must be positive.");
         }
@@ -78,14 +78,65 @@ struct ChOpenVdbSdfGrid {
                         (SamplePhi(local_pos + ChVector3d(0, 0, h)) -
                              SamplePhi(local_pos - ChVector3d(0, 0, h))) /
                             (2.0 * h));
+        return grad;
+    }
+
+    ChVector3d SampleGradient(const ChVector3d& local_pos) const {
+        const ChVector3d grad = SampleRawGradient(local_pos);
         return NormalizeOrFallback(grad, ChVector3d(0, 1, 0));
+    }
+
+    void SampleHessian(const ChVector3d& local_pos,
+                       ChVector3d& hessian_x,
+                       ChVector3d& hessian_y,
+                       ChVector3d& hessian_z) const {
+        if (voxel_size <= 0.0) {
+            throw std::runtime_error("ChOpenVdbSdfGrid voxel_size must be positive.");
+        }
+
+        const double h = voxel_size;
+        const double inv_h2 = 1.0 / (h * h);
+        const double inv_4h2 = 0.25 * inv_h2;
+        const double c = SamplePhi(local_pos);
+
+        const ChVector3d ex(h, 0, 0);
+        const ChVector3d ey(0, h, 0);
+        const ChVector3d ez(0, 0, h);
+
+        const double xp = SamplePhi(local_pos + ex);
+        const double xm = SamplePhi(local_pos - ex);
+        const double yp = SamplePhi(local_pos + ey);
+        const double ym = SamplePhi(local_pos - ey);
+        const double zp = SamplePhi(local_pos + ez);
+        const double zm = SamplePhi(local_pos - ez);
+
+        const double hxx = (xp - 2.0 * c + xm) * inv_h2;
+        const double hyy = (yp - 2.0 * c + ym) * inv_h2;
+        const double hzz = (zp - 2.0 * c + zm) * inv_h2;
+        const double hxy = (SamplePhi(local_pos + ex + ey) - SamplePhi(local_pos + ex - ey) -
+                            SamplePhi(local_pos - ex + ey) + SamplePhi(local_pos - ex - ey)) *
+                           inv_4h2;
+        const double hxz = (SamplePhi(local_pos + ex + ez) - SamplePhi(local_pos + ex - ez) -
+                            SamplePhi(local_pos - ex + ez) + SamplePhi(local_pos - ex - ez)) *
+                           inv_4h2;
+        const double hyz = (SamplePhi(local_pos + ey + ez) - SamplePhi(local_pos + ey - ez) -
+                            SamplePhi(local_pos - ey + ez) + SamplePhi(local_pos - ey - ez)) *
+                           inv_4h2;
+
+        hessian_x = ChVector3d(hxx, hxy, hxz);
+        hessian_y = ChVector3d(hxy, hyy, hyz);
+        hessian_z = ChVector3d(hxz, hyz, hzz);
     }
 
     ChSdfContactSampleQuery QueryLocal(const ChVector3d& local_pos,
                                        const ChVector3d& local_vel = ChVector3d(0, 0, 0)) const {
         ChSdfContactSampleQuery query;
         query.phi = SamplePhi(local_pos);
-        query.grad = SampleGradient(local_pos);
+        query.raw_grad = SampleRawGradient(local_pos);
+        query.raw_grad_norm = query.raw_grad.Length();
+        query.grad = NormalizeOrFallback(query.raw_grad, ChVector3d(0, 1, 0));
+        SampleHessian(local_pos, query.hessian_x, query.hessian_y, query.hessian_z);
+        query.has_hessian = true;
         query.world_pos = local_pos;
         query.world_vel = local_vel;
         return query;

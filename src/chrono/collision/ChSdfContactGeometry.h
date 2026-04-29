@@ -108,8 +108,31 @@ struct ChSdfContactSurfaceGraph {
 struct ChSdfContactSampleQuery {
     double phi = 0.0;
     ChVector3d grad = ChVector3d(0, 1, 0);
+    ChVector3d raw_grad = ChVector3d(0, 1, 0);
+    double raw_grad_norm = 1.0;
+    bool has_hessian = false;
+    // Columns of the local SDF Hessian d(raw_grad)/d(local_pos).
+    ChVector3d hessian_x = ChVector3d(0, 0, 0);
+    ChVector3d hessian_y = ChVector3d(0, 0, 0);
+    ChVector3d hessian_z = ChVector3d(0, 0, 0);
     ChVector3d world_pos = ChVector3d(0, 0, 0);
     ChVector3d world_vel = ChVector3d(0, 0, 0);
+
+    ChVector3d HessianTimes(const ChVector3d& local_direction) const {
+        return hessian_x * local_direction.x() + hessian_y * local_direction.y() +
+               hessian_z * local_direction.z();
+    }
+
+    ChVector3d UnitGradDirectionalDerivative(const ChVector3d& local_direction) const {
+        if (!has_hessian) {
+            return ChVector3d(0, 0, 0);
+        }
+
+        const double grad_len = raw_grad_norm > 1.0e-14 && std::isfinite(raw_grad_norm) ? raw_grad_norm : 1.0;
+        const ChVector3d unit_grad = NormalizeOrFallback(raw_grad, grad);
+        const ChVector3d d_raw_grad = HessianTimes(local_direction);
+        return (d_raw_grad - unit_grad * unit_grad.Dot(d_raw_grad)) / grad_len;
+    }
 };
 
 inline void AddUniqueNeighbor(std::vector<int>& neighbors, int value) {

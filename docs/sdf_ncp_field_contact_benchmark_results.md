@@ -613,6 +613,29 @@ python scripts/validate_sdf_ncp_simple_gear_dt_sweep.py --no-run
 
 这说明当前实现满足本轮验收标准：`dt=0.001` 不比当前基线差，`dt=0.0005` 与 `dt=0.0001` 不发散，`success_rate = 1`，最大穿透有界，MAE/RMSE 没有因减小时间步而爆炸。
 
+### 2026-04-29 补充：OpenVDB 几何导数与半光滑 active set
+
+simple gear 小时间步路径现在不再用角度有限差分估计 `dJ/dtheta22`。OpenVDB 前端在 `ChSdfContactSampleQuery` 中输出 raw gradient 和 Hessian；gear 前端通过链式法则计算：
+
+```text
+dn = (I - n n^T) H dx / ||raw_grad||
+dJ/dtheta22 = d(r x n)/dtheta22
+```
+
+双向 patch 的两种查询方向都使用同一套几何导数。mixed SDF-NCP 后端继续用轻量前向 AD 组装代数 Jacobian，并把 `contact.jacobian_velocity_derivative` 纳入 normal velocity 和 generalized impulse residual。active samples 在 Newton 内层固定，在外层通过 persistent id、hysteresis 和 warm start 做半光滑 active-set 更新。
+
+重新运行 `python scripts\validate_sdf_ncp_simple_gear_dt_sweep.py` 后得到：
+
+| case | dt | success_rate | max_penetration | MAE vs analytic | RMSE vs analytic | final omega22 |
+|---|---:|---:|---:|---:|---:|---:|
+| `simple_gear_dt_001` | `0.001` | `1` | `8.2869746620417573e-09` | `0.065929736198861666` | `0.10246898597734395` | `-1.0511661888263963` |
+| `simple_gear_dt_0005` | `0.0005` | `1` | `1.0006613138102693e-07` | `0.063319570651797885` | `0.13101056370576455` | `-0.96574456900269146` |
+| `simple_gear_dt_0001` | `0.0001` | `1` | `1.0003219585996703e-07` | `0.055550703486665146` | `0.11795585683594351` | `-0.96901368213534234` |
+
+这些数值说明几何导数接入后没有破坏既有验收：`dt=0.001` 保持基线结果；小时间步仍不发散；`success_rate = 1`；误差没有随 `dt` 减小而爆炸。
+
+补充说明：`dt=0.001` 的 force-level hard SDF-NCP 路径不再支持 analytic geometry Jacobian 开关。诊断中强制打开该选项会使该基线的 success rate 和误差显著变差，因此已删除该入口；当前只让小时间步 mixed backend 默认消费 OpenVDB 几何导数，避免破坏既有 benchmark。
+
 ### 已对齐项
 
 1. `cam` 的驱动速度不再使用 `cam_model.json` 中的 `3.1415926`，而是解析 `assets/cam/simple_cam.rmd` 中 `RevJoint1.RMotion` 的 `FUNCTION = 3\`，当前 `cam_rmotion_velocity_constant = 3`。

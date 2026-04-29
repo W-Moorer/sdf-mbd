@@ -236,6 +236,10 @@ ChVector3d AngularVelocityXCross(double omega, const ChVector3d& r) {
     return ChVector3d(0.0, -omega * r.z(), omega * r.y());
 }
 
+ChVector3d UnitXCross(const ChVector3d& r) {
+    return ChVector3d(0.0, -r.z(), r.y());
+}
+
 double NormDynamic(const std::vector<double>& values) {
     double sum = 0.0;
     for (double value : values) {
@@ -1086,6 +1090,7 @@ struct MultiContactCandidate {
     ChVector3d normal = ChVector3d(0, 1, 0);
     ChVector3d world_pos = ChVector3d(0, 0, 0);
     double jacobian = 0.0;
+    double jacobian_theta22_derivative = 0.0;
 };
 
 struct MultiStepDiagnostics {
@@ -2320,10 +2325,8 @@ struct SimpleGearConfig {
     double impulse_mixed_cfm = 1.0e-3;
     double impulse_mixed_velocity_scale = 1.0;
     double impulse_mixed_impulse_scale = 1.0;
-    bool use_analytic_jacobian = false;
     bool use_semismooth_active_set = true;
     int max_active_set_iterations = 3;
-    double geometry_derivative_angle_step = 2.5e-4;
     double voxel_size = 2.5e-5;
     float half_width_voxels = 20.0f;
 };
@@ -2399,6 +2402,11 @@ MultiContactCandidate QueryGear22SampleAgainstGear21(const ChOpenVdbSdfGrid& gea
     candidate.normal = normal_world;
     candidate.world_pos = world_pos;
     candidate.jacobian = r22_world.Cross(normal_world).x();
+    const ChVector3d dr22_world_dtheta = UnitXCross(r22_world);
+    const ChVector3d dgear21_local_dtheta = r21_t * dr22_world_dtheta;
+    const ChVector3d dnormal_world_dtheta = r21 * query.UnitGradDirectionalDerivative(dgear21_local_dtheta);
+    candidate.jacobian_theta22_derivative =
+        dr22_world_dtheta.Cross(normal_world).x() + r22_world.Cross(dnormal_world_dtheta).x();
     return candidate;
 }
 
@@ -2427,6 +2435,11 @@ MultiContactCandidate QueryGear21SampleAgainstGear22(const ChOpenVdbSdfGrid& gea
     candidate.normal = normal_world;
     candidate.world_pos = world_pos;
     candidate.jacobian = -r22_contact_world.Cross(normal_world).x();
+    const ChVector3d omega22_local = r22_t * ChVector3d(1, 0, 0);
+    const ChVector3d dgear22_local_dtheta = omega22_local.Cross(gear22_local) * -1.0;
+    const ChVector3d dnormal_local_dtheta = query.UnitGradDirectionalDerivative(dgear22_local_dtheta);
+    const ChVector3d dnormal_world_dtheta = UnitXCross(normal_world) + r22 * dnormal_local_dtheta;
+    candidate.jacobian_theta22_derivative = -r22_contact_world.Cross(dnormal_world_dtheta).x();
     return candidate;
 }
 
@@ -2438,20 +2451,13 @@ double SimpleGearJacobianTheta22Derivative(const ChOpenVdbSdfGrid& gear21_sdf,
                                            const GearPose& pose22,
                                            const GearContactSampleRef& ref,
                                            double theta21,
-                                           double theta22,
-                                           double h_theta) {
-    const double h = std::max(1.0e-8, h_theta);
-    const auto plus = ref.direction == 0 ?
-                          QueryGear22SampleAgainstGear21(
-                              gear21_sdf, gear22_graph, pose21, pose22, ref.sample_id, theta21, theta22 + h) :
-                          QueryGear21SampleAgainstGear22(
-                              gear22_sdf, gear21_graph, pose21, pose22, ref.sample_id, theta21, theta22 + h);
-    const auto minus = ref.direction == 0 ?
-                           QueryGear22SampleAgainstGear21(
-                               gear21_sdf, gear22_graph, pose21, pose22, ref.sample_id, theta21, theta22 - h) :
-                           QueryGear21SampleAgainstGear22(
-                               gear22_sdf, gear21_graph, pose21, pose22, ref.sample_id, theta21, theta22 - h);
-    return (plus.jacobian - minus.jacobian) / (2.0 * h);
+                                           double theta22) {
+    const auto candidate = ref.direction == 0 ?
+                               QueryGear22SampleAgainstGear21(
+                                   gear21_sdf, gear22_graph, pose21, pose22, ref.sample_id, theta21, theta22) :
+                               QueryGear21SampleAgainstGear22(
+                                   gear22_sdf, gear21_graph, pose21, pose22, ref.sample_id, theta21, theta22);
+    return candidate.jacobian_theta22_derivative;
 }
 
 std::vector<int> BuildGearPatchSamples(const ChOpenVdbSdfGrid& gear21_sdf,
@@ -2920,7 +2926,7 @@ ChSdfNcpGeneralizedProblem MakeSimpleGearGeneralizedProblem(const ChOpenVdbSdfGr
     problem.relaxed_tolerance = config.relaxed_tolerance;
     problem.negative_lambda_tolerance = 1.0e-8;
     problem.max_iterations = config.max_iterations;
-    problem.use_analytic_jacobian = config.use_analytic_jacobian;
+    problem.use_analytic_jacobian = false;
     problem.current_velocity = {state.omega22};
     problem.mass_diagonal = {inertia22};
     problem.external_force = {0.0};
@@ -2954,7 +2960,7 @@ ChSdfNcpGeneralizedProblem MakeSimpleGearGeneralizedProblem(const ChOpenVdbSdfGr
             contact.jacobian = {candidate.jacobian};
             contact.normal_velocity_offset = -SimpleGearDriverGapJacobian(candidate, pose21, ref.direction) *
                                              config.omega21;
-            if (config.use_analytic_jacobian) {
+            if (config.use_impulse_mixed_ncp) {
                 const double dJ_dtheta22 = SimpleGearJacobianTheta22Derivative(gear21_sdf,
                                                                                gear22_sdf,
                                                                                gear21_graph,
@@ -2963,8 +2969,7 @@ ChSdfNcpGeneralizedProblem MakeSimpleGearGeneralizedProblem(const ChOpenVdbSdfGr
                                                                                pose22,
                                                                                ref,
                                                                                theta21_next,
-                                                                               theta22_next,
-                                                                               config.geometry_derivative_angle_step);
+                                                                               theta22_next);
                 contact.jacobian_velocity_derivative = {config.dt * dJ_dtheta22};
             }
             contact.weight = ref.area * (config.use_impulse_mixed_ncp ? config.dt * pressure_scale : pressure_scale);
@@ -3473,13 +3478,6 @@ int RunSimpleGearFullGeometryCase(const std::string& result_case_name = "simple_
             throw std::runtime_error("Invalid SDF_NCP_SIMPLE_GEAR_IMPULSE_SCALE value.");
         }
     }
-    if (const char* analytic_jacobian_env = std::getenv("SDF_NCP_SIMPLE_GEAR_ANALYTIC_JACOBIAN")) {
-        try {
-            config.use_analytic_jacobian = std::stoi(analytic_jacobian_env) != 0;
-        } catch (...) {
-            throw std::runtime_error("Invalid SDF_NCP_SIMPLE_GEAR_ANALYTIC_JACOBIAN value.");
-        }
-    }
     if (const char* semismooth_env = std::getenv("SDF_NCP_SIMPLE_GEAR_SEMISMOOTH_ACTIVE_SET")) {
         try {
             config.use_semismooth_active_set = std::stoi(semismooth_env) != 0;
@@ -3492,13 +3490,6 @@ int RunSimpleGearFullGeometryCase(const std::string& result_case_name = "simple_
             config.max_active_set_iterations = std::stoi(active_iter_env);
         } catch (...) {
             throw std::runtime_error("Invalid SDF_NCP_SIMPLE_GEAR_MAX_ACTIVE_SET_ITERATIONS value.");
-        }
-    }
-    if (const char* geometry_step_env = std::getenv("SDF_NCP_SIMPLE_GEAR_GEOMETRY_DERIVATIVE_ANGLE_STEP")) {
-        try {
-            config.geometry_derivative_angle_step = std::stod(geometry_step_env);
-        } catch (...) {
-            throw std::runtime_error("Invalid SDF_NCP_SIMPLE_GEAR_GEOMETRY_DERIVATIVE_ANGLE_STEP value.");
         }
     }
     if (!impulse_mixed_env_set && config.dt < 1.0e-3) {
@@ -3786,9 +3777,9 @@ int RunSimpleGearFullGeometryCase(const std::string& result_case_name = "simple_
                << config.max_activation_band << ",0,maximum active patch band used to satisfy min patch samples\n";
     comparison << config.case_name << ",sdf_ncp_min_patch_samples,0," << config.min_patch_samples << ","
                << config.min_patch_samples << ",0,minimum active samples per connected direction before band cap\n";
-    comparison << config.case_name << ",sdf_ncp_analytic_jacobian_enabled,0,"
-               << (config.use_analytic_jacobian ? 1 : 0) << "," << (config.use_analytic_jacobian ? 1 : 0)
-               << ",0,uses OpenVDB geometry derivative blocks for generalized SDF-NCP Jacobian when enabled\n";
+    comparison << config.case_name << ",sdf_ncp_openvdb_geometry_derivatives_enabled,0,"
+               << (config.use_impulse_mixed_ncp ? 1 : 0) << "," << (config.use_impulse_mixed_ncp ? 1 : 0)
+               << ",0,uses OpenVDB-interpolated grad/Hessian chain-rule dJ/dtheta only in the impulse mixed backend\n";
     comparison << config.case_name << ",sdf_ncp_semismooth_active_set_enabled,0,"
                << (config.use_semismooth_active_set ? 1 : 0) << ","
                << (config.use_semismooth_active_set ? 1 : 0)
@@ -3796,9 +3787,6 @@ int RunSimpleGearFullGeometryCase(const std::string& result_case_name = "simple_
                   "is reached\n";
     comparison << config.case_name << ",sdf_ncp_max_active_set_iterations,0," << config.max_active_set_iterations
                << "," << config.max_active_set_iterations << ",0,semismooth active patch iteration cap\n";
-    comparison << config.case_name << ",sdf_ncp_geometry_derivative_angle_step_rad,0,"
-               << config.geometry_derivative_angle_step << "," << config.geometry_derivative_angle_step
-               << ",0,angle step for OpenVDB dJ/dtheta finite-difference geometry derivative\n";
     if (analytic_stats.samples > 0) {
         const double denom = static_cast<double>(analytic_stats.samples);
         const double analytic_rmse = std::sqrt(analytic_stats.sum_sq_omega / denom);

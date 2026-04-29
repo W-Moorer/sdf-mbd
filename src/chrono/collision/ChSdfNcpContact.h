@@ -1346,12 +1346,25 @@ inline ChSdfNcpAdResidualJacobian ComputeSdfNcpGeneralizedImpulseMixedAd(
         contact.lambda_n = z[n_v + i];
         contact.penetration = std::max(0.0, -contact.gap);
 
+        std::vector<ChSdfNcpAdScalar> jacobian_ad(n_v, ChSdfNcpAdScalar(0.0, n));
+        const bool has_jacobian_derivative = contact.jacobian_velocity_derivative.size() == n_v * n_v;
+        for (size_t row = 0; row < n_v; row++) {
+            jacobian_ad[row] = ChSdfNcpAdScalar(contact.jacobian[row], n);
+            if (has_jacobian_derivative) {
+                for (size_t col = 0; col < n_v; col++) {
+                    jacobian_ad[row] =
+                        jacobian_ad[row] +
+                        contact.jacobian_velocity_derivative[row * n_v + col] * (v_ad[col] - v_next[col]);
+                }
+            }
+        }
+
         ChSdfNcpAdScalar normal_velocity(contact.normal_velocity_offset, n);
         ChSdfNcpAdScalar linearized_gap(contact.gap, n);
         for (size_t j = 0; j < n_v; j++) {
-            normal_velocity = normal_velocity + contact.jacobian[j] * v_ad[j];
+            normal_velocity = normal_velocity + jacobian_ad[j] * v_ad[j];
             linearized_gap = linearized_gap + problem.dt * contact.jacobian[j] * (v_ad[j] - v_next[j]);
-            residual_ad[j] = residual_ad[j] - contact.jacobian[j] * p_ad[i] * contact.weight;
+            residual_ad[j] = residual_ad[j] - jacobian_ad[j] * p_ad[i] * contact.weight;
         }
 
         const ChSdfNcpAdScalar mixed_velocity =
