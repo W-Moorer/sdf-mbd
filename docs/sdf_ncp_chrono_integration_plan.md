@@ -980,3 +980,119 @@ smooth-FB 应作用在无量纲变量上，避免不同 benchmark 的 lambda、p
 5. 时间积分器、步长和求解器容差。
 
 只有在这些项逐项对齐后，剩余误差才应归因于 SDF-NCP 后端理论或数值算法。
+
+## 2026-04-29 更新：simple_gear 时间步稳定性阶段 1-7 落地
+
+本轮围绕 simple_gear 的小时间步发散问题，按后端通用化原则完成以下七个阶段：
+
+### 阶段 1：基线冻结
+
+保留 `dt = 0.001 s` 下已有 hard SDF-NCP force-level 后端作为当前基线，不让新算法在默认步长下变差。当前基线为：
+
+```text
+case: simple_gear_dt_001
+dt: 0.001
+success_rate: 1
+max_penetration: 8.2869746620417573e-09
+MAE: 0.065929736198861666
+RMSE: 0.10246898597734395
+final omega22: -1.0511661888263963
+```
+
+### 阶段 2：通用 impulse / velocity-level NCP 后端
+
+新增通用后端：
+
+```text
+SolveSdfNcpGeneralizedImpulseMixedProblem
+ComputeSdfNcpGeneralizedImpulseMixedAd
+ChSdfNcpImpulseMixedSettings
+```
+
+该后端使用速度层 mixed complementarity：
+
+```text
+R_v = M(v_next - v_current) - dt Q - sum_i J_i^T p_i weight_i
+
+w_i = J_i v_next + b_i + beta g_i / dt + cfm p_i
+
+0 <= w_i ⟂ p_i >= 0
+```
+
+其中 `b_i` 是 prescribed/driver 自由度造成的 affine normal velocity offset，例如 simple_gear 中主动轮 GEAR21 的驱动角速度。
+
+### 阶段 3：自动微分 Jacobian
+
+mixed 后端的 residual/Jacobian 使用轻量前向自动微分 `ChSdfNcpAdScalar` 计算，不再对该代数块使用黑箱有限差分。OpenVDB/SDF 查询仍作为前端 oracle 提供 `gap`、`J` 和 active samples；OpenVDB 几何 Hessian / active-set 半光滑导数仍是后续工作。
+
+### 阶段 4：driver gap-rate offset
+
+simple_gear 前端为每个 contact sample 提供：
+
+```text
+normal_velocity_offset = -J_driver omega21
+```
+
+后端只消费该 offset，不知道具体是齿轮、cam 还是其他机构。这避免在 velocity-level NCP 中漏掉 prescribed motion。
+
+### 阶段 5：dt-scaled impulse weight
+
+旧 force-level 后端使用 `force_weight`。mixed 后端使用冲量未知量，因此统一转换为：
+
+```text
+impulse_weight = dt * force_weight
+```
+
+由于原自动 force scale 随 `1/dt` 变化，该转换使小时间步下的 impulse scale 近似保持有界，避免 `dt -> 0` 时接触块病态放大。
+
+### 阶段 6：dt-adaptive backend selection
+
+默认规则：
+
+```text
+dt >= 0.001  : 保留当前 force-level hard SDF-NCP 基线
+dt <  0.001  : 启用 impulse / velocity-level mixed SDF-NCP + AD Jacobian
+```
+
+也可通过环境变量覆盖：
+
+```text
+SDF_NCP_SIMPLE_GEAR_IMPULSE_MIXED
+SDF_NCP_SIMPLE_GEAR_IMPULSE_BETA
+SDF_NCP_SIMPLE_GEAR_IMPULSE_CFM
+SDF_NCP_SIMPLE_GEAR_VELOCITY_SCALE
+SDF_NCP_SIMPLE_GEAR_IMPULSE_SCALE
+```
+
+当前 mixed 默认参数：
+
+```text
+beta = 0.3
+cfm = 1.0e-3
+velocity_scale = 1.0
+impulse_scale = 1.0
+```
+
+### 阶段 7：验收脚本和结果
+
+新增验收脚本：
+
+```text
+scripts/validate_sdf_ncp_simple_gear_dt_sweep.py
+```
+
+输出：
+
+```text
+results/sdf_ncp_benchmarks/simple_gear_dt_sweep_summary.csv
+```
+
+当前验收结果：
+
+| case | dt | success_rate | max_penetration | MAE | RMSE | final omega22 |
+|---|---:|---:|---:|---:|---:|---:|
+| simple_gear_dt_001 | 0.001 | 1 | 8.2869746620417573e-09 | 0.065929736198861666 | 0.10246898597734395 | -1.0511661888263963 |
+| simple_gear_dt_0005 | 0.0005 | 1 | 1.0006613138102693e-07 | 0.063336256860321918 | 0.13101143283368741 | -0.96575938464339262 |
+| simple_gear_dt_0001 | 0.0001 | 1 | 1.0003219585996703e-07 | 0.055549608448871655 | 0.11795684023219731 | -0.96901542949800457 |
+
+结论：`dt=0.001` 未比当前基线变差；`dt=0.0005` 和 `dt=0.0001` 不再发散；三组 `success_rate = 1`；穿透量有界；MAE/RMSE 没有随时间步减小而爆炸。

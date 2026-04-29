@@ -28,8 +28,20 @@ DEFAULT_CASES = [
 REFERENCE_CASES = [
     "cam_recurdyn_solid_contact",
 ]
+SIMPLE_GEAR_DT_SWEEP_CASES = [
+    "simple_gear_dt_001",
+    "simple_gear_dt_0005",
+    "simple_gear_dt_0001",
+]
 MANUAL_CASES: list[str] = []
-OPENVDB_CASES = {"cam", "eccentric_roller", "onset_stress", "simple_gear", *REFERENCE_CASES}
+OPENVDB_CASES = {
+    "cam",
+    "eccentric_roller",
+    "onset_stress",
+    "simple_gear",
+    *REFERENCE_CASES,
+    *SIMPLE_GEAR_DT_SWEEP_CASES,
+}
 
 
 def run_case(case_name: str) -> None:
@@ -54,16 +66,29 @@ def read_csv(path: Path) -> list[dict[str, str]]:
     if not path.exists():
         return []
     with path.open(newline="", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
+        rows = []
+        for row in csv.DictReader(f):
+            extras = row.pop(None, None)
+            if extras:
+                if "notes" in row:
+                    row["notes"] = ",".join([row.get("notes", ""), *extras]).strip(",")
+                else:
+                    row["extra"] = ",".join(extras)
+            rows.append(row)
+        return rows
 
 
 def write_merged(path: Path, rows: list[dict[str, str]]) -> None:
     if not rows:
         return
-    fieldnames = list(rows[0].keys())
+    fieldnames: list[str] = []
+    for row in rows:
+        for key in row.keys():
+            if key not in fieldnames:
+                fieldnames.append(key)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
 
@@ -99,6 +124,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Include long-form RecurDyn reference-alignment benchmarks such as cam_recurdyn_solid_contact.",
     )
+    parser.add_argument(
+        "--include-simple-gear-dt-sweep",
+        action="store_true",
+        help="Include simple_gear dt stability cases: 0.001, 0.0005, and 0.0001 seconds.",
+    )
     return parser.parse_args()
 
 
@@ -111,6 +141,10 @@ def main() -> None:
                 cases.append(case_name)
     if args.include_reference:
         for case_name in REFERENCE_CASES:
+            if case_name not in cases:
+                cases.append(case_name)
+    if args.include_simple_gear_dt_sweep:
+        for case_name in SIMPLE_GEAR_DT_SWEEP_CASES:
             if case_name not in cases:
                 cases.append(case_name)
 

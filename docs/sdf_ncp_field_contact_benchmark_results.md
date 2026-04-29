@@ -584,6 +584,35 @@ ctest --test-dir build -C Release -L sdf_ncp_benchmark --output-on-failure
 
 本轮按 RecurDyn 前端建模逐项核对了 `cam` 和 `simple_gear` 的 RMD 信息，并将明确的映射错误修正到 SDF-NCP benchmark 前端。
 
+## 2026-04-29 更新：simple_gear 小时间步稳定性验收
+
+simple_gear 当前不再把 `dt=0.0001` 的发散结果作为有效 benchmark。已新增 dt sweep 验收路径：
+
+```text
+demo_CH_sdf_ncp_benchmarks_openvdb.exe simple_gear_dt_001
+demo_CH_sdf_ncp_benchmarks_openvdb.exe simple_gear_dt_0005
+demo_CH_sdf_ncp_benchmarks_openvdb.exe simple_gear_dt_0001
+python scripts/validate_sdf_ncp_simple_gear_dt_sweep.py --no-run
+```
+
+新增的后端策略是通用的，不是 simple_gear 曲线拟合：
+
+1. `dt >= 0.001` 保留当前 force-level hard SDF-NCP 基线，保证默认结果不变差。
+2. `dt < 0.001` 启用 impulse / velocity-level mixed SDF-NCP。
+3. mixed residual/Jacobian 使用前向自动微分计算。
+4. 前端向通用后端提供 `normal_velocity_offset`，用于表达 prescribed driver 对 gap-rate 的贡献。
+5. force 权重转换为 `dt * force_weight` 的 impulse 权重，避免小时间步下尺度爆炸。
+
+当前验收摘要：
+
+| case | dt | success_rate | max_penetration | MAE vs analytic | RMSE vs analytic | final omega22 |
+|---|---:|---:|---:|---:|---:|---:|
+| `simple_gear_dt_001` | `0.001` | `1` | `8.2869746620417573e-09` | `0.065929736198861666` | `0.10246898597734395` | `-1.0511661888263963` |
+| `simple_gear_dt_0005` | `0.0005` | `1` | `1.0006613138102693e-07` | `0.063336256860321918` | `0.13101143283368741` | `-0.96575938464339262` |
+| `simple_gear_dt_0001` | `0.0001` | `1` | `1.0003219585996703e-07` | `0.055549608448871655` | `0.11795684023219731` | `-0.96901542949800457` |
+
+这说明当前实现满足本轮验收标准：`dt=0.001` 不比当前基线差，`dt=0.0005` 与 `dt=0.0001` 不发散，`success_rate = 1`，最大穿透有界，MAE/RMSE 没有因减小时间步而爆炸。
+
 ### 已对齐项
 
 1. `cam` 的驱动速度不再使用 `cam_model.json` 中的 `3.1415926`，而是解析 `assets/cam/simple_cam.rmd` 中 `RevJoint1.RMotion` 的 `FUNCTION = 3\`，当前 `cam_rmotion_velocity_constant = 3`。

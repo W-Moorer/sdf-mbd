@@ -958,6 +958,7 @@ struct ChSdfNcpGeneralizedContact {
     double gap = 0.0;
     std::vector<double> jacobian;
     std::vector<double> jacobian_velocity_derivative;
+    double normal_velocity_offset = 0.0;
     double weight = 1.0;
     double lambda_n = 0.0;
     double penetration = 0.0;
@@ -1345,7 +1346,7 @@ inline ChSdfNcpAdResidualJacobian ComputeSdfNcpGeneralizedImpulseMixedAd(
         contact.lambda_n = z[n_v + i];
         contact.penetration = std::max(0.0, -contact.gap);
 
-        ChSdfNcpAdScalar normal_velocity(0.0, n);
+        ChSdfNcpAdScalar normal_velocity(contact.normal_velocity_offset, n);
         ChSdfNcpAdScalar linearized_gap(contact.gap, n);
         for (size_t j = 0; j < n_v; j++) {
             normal_velocity = normal_velocity + contact.jacobian[j] * v_ad[j];
@@ -1374,6 +1375,142 @@ inline ChSdfNcpAdResidualJacobian ComputeSdfNcpGeneralizedImpulseMixedAd(
     }
     out.contacts = std::move(contacts);
     return out;
+}
+
+inline ChSdfNcpGeneralizedDiagnostics MakeSdfNcpGeneralizedImpulseMixedDiagnostics(
+    const ChSdfNcpGeneralizedProblem& problem,
+    const std::vector<double>& z,
+    const ChSdfNcpImpulseMixedSettings& settings,
+    bool success,
+    int iterations,
+    const std::string& message) {
+    const auto residual = ComputeSdfNcpGeneralizedImpulseMixedAd(problem, z, settings);
+    ChSdfNcpGeneralizedDiagnostics diagnostics;
+    diagnostics.success = success;
+    diagnostics.iterations = iterations;
+    diagnostics.message = message;
+    diagnostics.residual_norm = NormDynamic(residual.value);
+    diagnostics.min_lambda_n = residual.contacts.empty() ? 0.0 : std::numeric_limits<double>::max();
+    double sum_comp = 0.0;
+    for (const auto& contact : residual.contacts) {
+        diagnostics.max_penetration = std::max(diagnostics.max_penetration, contact.penetration);
+        diagnostics.min_lambda_n = std::min(diagnostics.min_lambda_n, contact.lambda_n);
+        diagnostics.max_lambda_n = std::max(diagnostics.max_lambda_n, std::abs(contact.lambda_n));
+        diagnostics.max_complementarity_error =
+            std::max(diagnostics.max_complementarity_error, contact.complementarity_error);
+        diagnostics.ncp_residual_norm += contact.ncp_residual * contact.ncp_residual;
+        sum_comp += contact.complementarity_error;
+    }
+    diagnostics.ncp_residual_norm = std::sqrt(diagnostics.ncp_residual_norm);
+    if (!residual.contacts.empty()) {
+        diagnostics.mean_complementarity_error = sum_comp / static_cast<double>(residual.contacts.size());
+    }
+    return diagnostics;
+}
+
+inline ChSdfNcpGeneralizedStepResult SolveSdfNcpGeneralizedImpulseMixedProblem(
+    const ChSdfNcpGeneralizedProblem& problem,
+    std::vector<double> z,
+    const ChSdfNcpImpulseMixedSettings& settings = ChSdfNcpImpulseMixedSettings()) {
+    ValidateSdfNcpGeneralizedProblem(problem);
+    const size_t n_v = problem.current_velocity.size();
+    const size_t n_c = problem.contact_count;
+    if (z.empty()) {
+        z.assign(n_v + n_c, 0.0);
+        for (size_t j = 0; j < n_v; j++) {
+            z[j] = problem.current_velocity[j] + problem.dt * problem.external_force[j] / problem.mass_diagonal[j];
+        }
+    }
+    if (z.size() != n_v + n_c) {
+        throw std::invalid_argument("Generalized impulse mixed SDF-NCP initial guess has inconsistent size.");
+    }
+    for (size_t i = 0; i < n_c; i++) {
+        if (z[n_v + i] < 0.0) {
+            z[n_v + i] = 0.0;
+        }
+    }
+
+    double residual_norm = NormDynamic(ComputeSdfNcpGeneralizedImpulseMixedAd(problem, z, settings).value);
+    bool success = residual_norm <= problem.tolerance;
+    int iterations = 0;
+    std::string message = success ? "Initial guess satisfies impulse mixed residual tolerance." : "Newton did not run.";
+
+    for (iterations = 0; !success && iterations < problem.max_iterations; iterations++) {
+        const auto residual_jacobian = ComputeSdfNcpGeneralizedImpulseMixedAd(problem, z, settings);
+        std::vector<double> rhs(residual_jacobian.value.size(), 0.0);
+        for (size_t i = 0; i < residual_jacobian.value.size(); i++) {
+            rhs[i] = -residual_jacobian.value[i];
+        }
+
+        std::vector<double> dz(z.size(), 0.0);
+        if (!SolveLinearDynamic(residual_jacobian.jacobian, rhs, dz)) {
+            message = "Newton impulse mixed AD Jacobian was singular.";
+            break;
+        }
+
+        double alpha = 1.0;
+        std::vector<double> candidate = z;
+        double candidate_norm = residual_norm;
+        bool accepted = false;
+        for (int ls = 0; ls < 18; ls++) {
+            for (size_t i = 0; i < z.size(); i++) {
+                candidate[i] = z[i] + alpha * dz[i];
+            }
+            for (size_t i = 0; i < n_c; i++) {
+                double& impulse = candidate[n_v + i];
+                if (impulse < 0.0) {
+                    impulse = 0.0;
+                }
+            }
+
+            candidate_norm = NormDynamic(ComputeSdfNcpGeneralizedImpulseMixedAd(problem, candidate, settings).value);
+            if (std::isfinite(candidate_norm) && (candidate_norm <= residual_norm || alpha <= 1.0e-5)) {
+                accepted = true;
+                break;
+            }
+            alpha *= 0.5;
+        }
+        if (!accepted) {
+            message = "Newton impulse mixed line search failed.";
+            break;
+        }
+
+        z = candidate;
+        residual_norm = candidate_norm;
+        if (residual_norm <= problem.tolerance) {
+            success = true;
+            iterations++;
+            message = "Newton impulse mixed converged.";
+            break;
+        }
+        if (NormDynamic(dz) * alpha <= 1.0e-12 * std::max(1.0, NormDynamic(z))) {
+            message = "Newton impulse mixed step reached small update tolerance.";
+            break;
+        }
+    }
+
+    if (!success && residual_norm <= std::max(problem.tolerance, problem.relaxed_tolerance)) {
+        success = true;
+        message = "Newton impulse mixed reached relaxed residual tolerance.";
+    }
+    for (size_t i = 0; i < n_c; i++) {
+        double& impulse = z[n_v + i];
+        if (impulse < -problem.negative_lambda_tolerance) {
+            success = false;
+            message = "Newton impulse mixed returned a significantly negative normal impulse.";
+        } else if (impulse < 0.0) {
+            impulse = 0.0;
+        }
+    }
+
+    const auto final_residual = ComputeSdfNcpGeneralizedImpulseMixedAd(problem, z, settings);
+    ChSdfNcpGeneralizedStepResult result;
+    result.next_velocity.assign(z.begin(), z.begin() + static_cast<std::ptrdiff_t>(n_v));
+    result.lambdas.assign(z.begin() + static_cast<std::ptrdiff_t>(n_v), z.end());
+    result.contacts = final_residual.contacts;
+    result.diagnostics =
+        MakeSdfNcpGeneralizedImpulseMixedDiagnostics(problem, z, settings, success, iterations, message);
+    return result;
 }
 
 inline ChSdfNcpGeneralizedDiagnostics MakeSdfNcpGeneralizedDiagnostics(

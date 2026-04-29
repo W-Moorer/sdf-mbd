@@ -2241,6 +2241,7 @@ struct GearReferenceComparisonStats {
 struct GearAnalyticComparisonStats {
     int samples = 0;
     double sum_sq_omega = 0.0;
+    double sum_abs_omega = 0.0;
     double max_abs_omega = 0.0;
     double target_omega = 0.0;
     double final_omega = 0.0;
@@ -2314,6 +2315,11 @@ struct SimpleGearConfig {
     double sdf_ncp_pressure_scale_override = 0.0;
     double sdf_ncp_pressure_scale_band_factor = 4.8;
     double active_band_hysteresis = 1.0e-5;
+    bool use_impulse_mixed_ncp = false;
+    double impulse_mixed_beta = 0.3;
+    double impulse_mixed_cfm = 1.0e-3;
+    double impulse_mixed_velocity_scale = 1.0;
+    double impulse_mixed_impulse_scale = 1.0;
     bool use_analytic_jacobian = false;
     bool use_semismooth_active_set = true;
     int max_active_set_iterations = 3;
@@ -2781,6 +2787,8 @@ double MinGearGapBidirectional(const ChOpenVdbSdfGrid& gear21_sdf,
                     MinGearGapReverse(gear22_sdf, gear21_graph, pose21, pose22, theta21, theta22));
 }
 
+double SimpleGearDriverGapJacobian(const MultiContactCandidate& candidate, const GearPose& pose21, int direction);
+
 double EstimateSimpleGearPressureScale(const ChOpenVdbSdfGrid& gear21_sdf,
                                        const ChOpenVdbSdfGrid& gear22_sdf,
                                        const ChSdfContactSurfaceGraph& gear21_graph,
@@ -2828,6 +2836,52 @@ double EstimateSimpleGearPressureScale(const ChOpenVdbSdfGrid& gear21_sdf,
     return std::min(1.0e9, std::max(1.0, pressure_scale));
 }
 
+double EstimateSimpleGearImpulseIntensityScale(const ChOpenVdbSdfGrid& gear21_sdf,
+                                               const ChOpenVdbSdfGrid& gear22_sdf,
+                                               const ChSdfContactSurfaceGraph& gear21_graph,
+                                               const ChSdfContactSurfaceGraph& gear22_graph,
+                                               const GearPose& pose21,
+                                               const GearPose& pose22,
+                                               const SimpleGearConfig& config,
+                                               double inertia22,
+                                               const GearState& state,
+                                               const std::vector<GearContactSampleRef>& sample_refs) {
+    const double theta21_next = state.theta21 + config.dt * config.omega21;
+    const double theta22_next = state.theta22 + config.dt * state.omega22;
+    double area_moment = 0.0;
+    for (const auto& ref : sample_refs) {
+        const auto candidate = ref.direction == 0 ?
+                                   QueryGear22SampleAgainstGear21(gear21_sdf,
+                                                                  gear22_graph,
+                                                                  pose21,
+                                                                  pose22,
+                                                                  ref.sample_id,
+                                                                  theta21_next,
+                                                                  theta22_next) :
+                                   QueryGear21SampleAgainstGear22(gear22_sdf,
+                                                                  gear21_graph,
+                                                                  pose21,
+                                                                  pose22,
+                                                                  ref.sample_id,
+                                                                  theta21_next,
+                                                                  theta22_next);
+        area_moment += std::max(0.0, ref.area) * std::abs(candidate.jacobian);
+    }
+
+    if (!(area_moment > 1.0e-18) || !std::isfinite(area_moment)) {
+        return 1.0;
+    }
+
+    const double velocity_scale = std::max({config.impulse_mixed_velocity_scale,
+                                            std::abs(config.omega21),
+                                            std::abs(state.omega22),
+                                            std::abs(config.omega21 - state.omega22),
+                                            1.0});
+    const double angular_momentum_scale = inertia22 * velocity_scale;
+    const double intensity_scale = angular_momentum_scale / area_moment;
+    return std::min(1.0e8, std::max(1.0e-8, intensity_scale));
+}
+
 ChSdfNcpGeneralizedProblem MakeSimpleGearGeneralizedProblem(const ChOpenVdbSdfGrid& gear21_sdf,
                                                             const ChOpenVdbSdfGrid& gear22_sdf,
                                                             const ChSdfContactSurfaceGraph& gear21_graph,
@@ -2861,7 +2915,7 @@ ChSdfNcpGeneralizedProblem MakeSimpleGearGeneralizedProblem(const ChOpenVdbSdfGr
                                                                   state,
                                                                   sample_refs);
     problem.gap_scale = config.sdf_ncp_gap_scale > 0.0 ? config.sdf_ncp_gap_scale : 1.0;
-    problem.lambda_scale = 1.0;
+    problem.lambda_scale = config.use_impulse_mixed_ncp ? config.impulse_mixed_impulse_scale : 1.0;
     problem.tolerance = config.tolerance;
     problem.relaxed_tolerance = config.relaxed_tolerance;
     problem.negative_lambda_tolerance = 1.0e-8;
@@ -2898,6 +2952,8 @@ ChSdfNcpGeneralizedProblem MakeSimpleGearGeneralizedProblem(const ChOpenVdbSdfGr
             ChSdfNcpGeneralizedContact contact;
             contact.gap = candidate.gap - config.sdf_ncp_contact_offset;
             contact.jacobian = {candidate.jacobian};
+            contact.normal_velocity_offset = -SimpleGearDriverGapJacobian(candidate, pose21, ref.direction) *
+                                             config.omega21;
             if (config.use_analytic_jacobian) {
                 const double dJ_dtheta22 = SimpleGearJacobianTheta22Derivative(gear21_sdf,
                                                                                gear22_sdf,
@@ -2911,7 +2967,7 @@ ChSdfNcpGeneralizedProblem MakeSimpleGearGeneralizedProblem(const ChOpenVdbSdfGr
                                                                                config.geometry_derivative_angle_step);
                 contact.jacobian_velocity_derivative = {config.dt * dJ_dtheta22};
             }
-            contact.weight = ref.area * pressure_scale;
+            contact.weight = ref.area * (config.use_impulse_mixed_ncp ? config.dt * pressure_scale : pressure_scale);
             contact.contact_id = ref.persistent_id;
             contact.patch_id = ref.patch_id;
             contacts.push_back(contact);
@@ -2949,10 +3005,30 @@ std::vector<double> ComputeSimpleGearResidual(const ChOpenVdbSdfGrid& gear21_sdf
                                                           state,
                                                           sample_refs,
                                                           &patch_count);
-    const auto residual = ComputeSdfNcpGeneralizedResidual(problem, z);
-    if (diag) {
-        const auto generalized_diag =
+    ChSdfNcpGeneralizedResidual residual;
+    ChSdfNcpGeneralizedDiagnostics generalized_diag;
+    if (config.use_impulse_mixed_ncp) {
+        ChSdfNcpImpulseMixedSettings mixed_settings;
+        mixed_settings.beta = config.impulse_mixed_beta;
+        mixed_settings.cfm = config.impulse_mixed_cfm;
+        mixed_settings.velocity_scale = config.impulse_mixed_velocity_scale;
+        mixed_settings.impulse_scale = config.impulse_mixed_impulse_scale;
+        const auto mixed = ComputeSdfNcpGeneralizedImpulseMixedAd(problem, z, mixed_settings);
+        residual.value = mixed.value;
+        residual.contacts = mixed.contacts;
+        generalized_diag =
+            MakeSdfNcpGeneralizedImpulseMixedDiagnostics(problem,
+                                                         z,
+                                                         mixed_settings,
+                                                         true,
+                                                         0,
+                                                         "evaluated through generalized impulse mixed SDF-NCP backend");
+    } else {
+        residual = ComputeSdfNcpGeneralizedResidual(problem, z);
+        generalized_diag =
             MakeSdfNcpGeneralizedDiagnostics(problem, z, true, 0, "evaluated through generalized SDF-NCP backend");
+    }
+    if (diag) {
         PopulateMultiStepDiagnostics(residual.contacts, generalized_diag, *diag);
         diag->patch_count = patch_count;
     }
@@ -3017,7 +3093,16 @@ GearStepResult SolveSimpleGearStep(const ChOpenVdbSdfGrid& gear21_sdf,
                                                               state,
                                                               sample_refs,
                                                               &patch_count);
-        solved = SolveSdfNcpGeneralizedProblem(problem, z);
+        if (config.use_impulse_mixed_ncp) {
+            ChSdfNcpImpulseMixedSettings mixed_settings;
+            mixed_settings.beta = config.impulse_mixed_beta;
+            mixed_settings.cfm = config.impulse_mixed_cfm;
+            mixed_settings.velocity_scale = config.impulse_mixed_velocity_scale;
+            mixed_settings.impulse_scale = config.impulse_mixed_impulse_scale;
+            solved = SolveSdfNcpGeneralizedImpulseMixedProblem(problem, z, mixed_settings);
+        } else {
+            solved = SolveSdfNcpGeneralizedProblem(problem, z);
+        }
 
         std::map<int, double> solved_warm_start;
         for (size_t i = 0; i < sample_refs.size() && i < solved.lambdas.size(); i++) {
@@ -3288,6 +3373,7 @@ int RunSimpleGearFullGeometryCase(const std::string& result_case_name = "simple_
     if (dt_override > 0.0) {
         config.dt = dt_override;
     }
+    bool impulse_mixed_env_set = false;
     if (const char* dt_env = std::getenv("SDF_NCP_SIMPLE_GEAR_DT")) {
         try {
             config.dt = std::stod(dt_env);
@@ -3351,6 +3437,42 @@ int RunSimpleGearFullGeometryCase(const std::string& result_case_name = "simple_
             throw std::runtime_error("Invalid SDF_NCP_SIMPLE_GEAR_ACTIVE_BAND_HYSTERESIS value.");
         }
     }
+    if (const char* mixed_env = std::getenv("SDF_NCP_SIMPLE_GEAR_IMPULSE_MIXED")) {
+        try {
+            impulse_mixed_env_set = true;
+            config.use_impulse_mixed_ncp = std::stoi(mixed_env) != 0;
+        } catch (...) {
+            throw std::runtime_error("Invalid SDF_NCP_SIMPLE_GEAR_IMPULSE_MIXED value.");
+        }
+    }
+    if (const char* beta_env = std::getenv("SDF_NCP_SIMPLE_GEAR_IMPULSE_BETA")) {
+        try {
+            config.impulse_mixed_beta = std::stod(beta_env);
+        } catch (...) {
+            throw std::runtime_error("Invalid SDF_NCP_SIMPLE_GEAR_IMPULSE_BETA value.");
+        }
+    }
+    if (const char* cfm_env = std::getenv("SDF_NCP_SIMPLE_GEAR_IMPULSE_CFM")) {
+        try {
+            config.impulse_mixed_cfm = std::stod(cfm_env);
+        } catch (...) {
+            throw std::runtime_error("Invalid SDF_NCP_SIMPLE_GEAR_IMPULSE_CFM value.");
+        }
+    }
+    if (const char* velocity_scale_env = std::getenv("SDF_NCP_SIMPLE_GEAR_VELOCITY_SCALE")) {
+        try {
+            config.impulse_mixed_velocity_scale = std::stod(velocity_scale_env);
+        } catch (...) {
+            throw std::runtime_error("Invalid SDF_NCP_SIMPLE_GEAR_VELOCITY_SCALE value.");
+        }
+    }
+    if (const char* impulse_scale_env = std::getenv("SDF_NCP_SIMPLE_GEAR_IMPULSE_SCALE")) {
+        try {
+            config.impulse_mixed_impulse_scale = std::stod(impulse_scale_env);
+        } catch (...) {
+            throw std::runtime_error("Invalid SDF_NCP_SIMPLE_GEAR_IMPULSE_SCALE value.");
+        }
+    }
     if (const char* analytic_jacobian_env = std::getenv("SDF_NCP_SIMPLE_GEAR_ANALYTIC_JACOBIAN")) {
         try {
             config.use_analytic_jacobian = std::stoi(analytic_jacobian_env) != 0;
@@ -3378,6 +3500,9 @@ int RunSimpleGearFullGeometryCase(const std::string& result_case_name = "simple_
         } catch (...) {
             throw std::runtime_error("Invalid SDF_NCP_SIMPLE_GEAR_GEOMETRY_DERIVATIVE_ANGLE_STEP value.");
         }
+    }
+    if (!impulse_mixed_env_set && config.dt < 1.0e-3) {
+        config.use_impulse_mixed_ncp = true;
     }
     const SimpleGearRmd rmd = LoadSimpleGearRmdForNcp(asset_dir / "simple gear.rmd");
     config.omega21 = rmd.rev_joint1_motion.has_function ?
@@ -3450,6 +3575,10 @@ int RunSimpleGearFullGeometryCase(const std::string& result_case_name = "simple_
                       "area-integrated local contact intensity SDF-NCP assembly; RecurDyn RevJoint1.RMotion driver "
                       "and GGEOMCONTACT metadata parsed from simple gear.rmd; hard frictionless NCP does not apply "
                       "RMD K/C/KORDER";
+    if (backend_mode == SimpleGearBackendMode::SdfNcp && config.use_impulse_mixed_ncp) {
+        stats.notes +=
+            "; dt-adaptive impulse/velocity-level mixed NCP enabled with AD Jacobian and dt-scaled impulse weights";
+    }
 
     GearState state;
     GearPatchMemory patch_memory;
@@ -3596,6 +3725,7 @@ int RunSimpleGearFullGeometryCase(const std::string& result_case_name = "simple_
                             << std::abs(analytic_error) << "\n";
         analytic_stats.samples++;
         analytic_stats.sum_sq_omega += analytic_error * analytic_error;
+        analytic_stats.sum_abs_omega += std::abs(analytic_error);
         analytic_stats.max_abs_omega = std::max(analytic_stats.max_abs_omega, std::abs(analytic_error));
         analytic_stats.final_omega = state.omega22;
         analytic_stats.final_abs_error = std::abs(analytic_error);
@@ -3640,6 +3770,16 @@ int RunSimpleGearFullGeometryCase(const std::string& result_case_name = "simple_
     comparison << config.case_name << ",sdf_ncp_active_band_hysteresis_m,0," << config.active_band_hysteresis
                << "," << config.active_band_hysteresis
                << ",0,hysteresis used to retain persistent active patch samples between steps\n";
+    comparison << config.case_name << ",sdf_ncp_impulse_mixed_enabled,0,"
+               << (config.use_impulse_mixed_ncp ? 1 : 0) << "," << (config.use_impulse_mixed_ncp ? 1 : 0)
+               << ",0,dt-adaptive velocity-level impulse NCP backend; can be overridden by "
+                  "SDF_NCP_SIMPLE_GEAR_IMPULSE_MIXED\n";
+    comparison << config.case_name << ",sdf_ncp_impulse_mixed_beta,0," << config.impulse_mixed_beta << ","
+               << config.impulse_mixed_beta
+               << ",0,Baumgarte gap stabilization used by impulse mixed NCP when enabled\n";
+    comparison << config.case_name << ",sdf_ncp_impulse_mixed_cfm,0," << config.impulse_mixed_cfm << ","
+               << config.impulse_mixed_cfm
+               << ",0,velocity-level contact force mixing regularization used by impulse mixed NCP when enabled\n";
     comparison << config.case_name << ",sdf_ncp_activation_band_m,0," << config.activation_band << ","
                << config.activation_band << ",0,initial active patch band around the minimum signed distance\n";
     comparison << config.case_name << ",sdf_ncp_max_activation_band_m,0," << config.max_activation_band << ","
@@ -3662,6 +3802,7 @@ int RunSimpleGearFullGeometryCase(const std::string& result_case_name = "simple_
     if (analytic_stats.samples > 0) {
         const double denom = static_cast<double>(analytic_stats.samples);
         const double analytic_rmse = std::sqrt(analytic_stats.sum_sq_omega / denom);
+        const double analytic_mae = analytic_stats.sum_abs_omega / denom;
         const double analytic_rel = std::abs(analytic_stats.target_omega) > 1.0e-14 ?
                                         analytic_rmse / std::abs(analytic_stats.target_omega) :
                                         0.0;
@@ -3674,16 +3815,22 @@ int RunSimpleGearFullGeometryCase(const std::string& result_case_name = "simple_
         comparison << config.case_name << ",gear22_omega_rx_analytic_rmse,0," << analytic_rmse << ","
                    << analytic_rmse << "," << analytic_rel
                    << ",RMSE against analytic omega22=-omega21 over simulated one-second window\n";
+        comparison << config.case_name << ",gear22_omega_rx_analytic_mae,0," << analytic_mae << ","
+                   << analytic_mae << ","
+                   << (std::abs(analytic_stats.target_omega) > 1.0e-14 ?
+                           analytic_mae / std::abs(analytic_stats.target_omega) :
+                           0.0)
+                   << ",MAE against analytic omega22=-omega21 over simulated one-second window\n";
 
         std::ofstream analytic_summary(out_dir / "gear22_analytic_comparison_summary.csv");
         analytic_summary << std::setprecision(17);
         analytic_summary
-            << "case_name,quantity,time_start,time_end,num_samples,target_value,rmse,max_abs_error,final_value,"
+            << "case_name,quantity,time_start,time_end,num_samples,target_value,rmse,mae,max_abs_error,final_value,"
                "final_abs_error,relative_rmse_target_scale,notes\n";
         analytic_summary << config.case_name << ",gear22_omega_rx,0," << config.t_end << ","
                          << analytic_stats.samples << "," << analytic_stats.target_omega << "," << analytic_rmse
-                         << "," << analytic_stats.max_abs_omega << "," << analytic_stats.final_omega << ","
-                         << analytic_stats.final_abs_error << "," << analytic_rel
+                         << "," << analytic_mae << "," << analytic_stats.max_abs_omega << ","
+                         << analytic_stats.final_omega << "," << analytic_stats.final_abs_error << "," << analytic_rel
                          << ",Analytic 1:1 gear target; time=0 target is written as 0 in the time series to match "
                             "the stored initial state\n";
     }
@@ -4385,6 +4532,15 @@ int RunMode(const std::string& mode) {
     }
     if (mode == "simple_gear_recurdyn_compare" || mode == "simple_gear_3s") {
         return RunSimpleGearFullGeometryCase("simple_gear_recurdyn_compare", 1.0, 0.001);
+    }
+    if (mode == "simple_gear_dt_001") {
+        return RunSimpleGearFullGeometryCase("simple_gear_dt_001", 1.0, 0.001);
+    }
+    if (mode == "simple_gear_dt_0005") {
+        return RunSimpleGearFullGeometryCase("simple_gear_dt_0005", 1.0, 0.0005);
+    }
+    if (mode == "simple_gear_dt_0001") {
+        return RunSimpleGearFullGeometryCase("simple_gear_dt_0001", 1.0, 0.0001);
     }
     if (mode == "simple_gear_ggeomcontact_calibration" || mode == "simple_gear_recurdyn_ggeomcontact") {
         return RunSimpleGearFullGeometryCase("simple_gear_ggeomcontact_calibration",
